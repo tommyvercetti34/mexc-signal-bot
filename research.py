@@ -149,6 +149,7 @@ sig_pullback = _shared("pullback")
 sig_reversal_filtered = _shared("reversal_f")
 sig_reversal_btc = _shared("reversal_btc")
 sig_supertrend = _shared("supertrend")
+sig_sweep = _shared("sweep")              # HTF Sweep + CISD (yapisal stop d["sweep_sl"] sutununa yazilir)
 
 
 def sig_reversal_raw(bot, d, p):
@@ -176,6 +177,11 @@ FAMILIES = [
      "max_hours": 240, "grid": {"trend": [0, 1], "sl": [2.0, 3.0], "tp": [(2.0, 4.0), (3.0, 6.0)], "be": [0.0, 1.0]}},
     {"sid": "reversal_1h", "key": "rev1h", "name": "Dönüş sinyali + BTC filtre (1 saat)", "tf": 60, "fn": sig_reversal_btc, "max_hours": 96,
      "grid": {"sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
+    # --- HTF Sweep + CISD (TradingView fikri): yapisal stop, R bazli hedefler ---
+    {"sid": "sweep_15m", "key": "sweep15", "name": "HTF Sweep + CISD (15 dk / 1 saat)", "tf": 15, "fn": sig_sweep, "max_hours": 24,
+     "grid": {"htf": [60], "tp_r": [(1.0, 2.0), (1.0, 3.0), (1.5, 3.0)], "kz": [0, 1], "be": [0.0]}},
+    {"sid": "sweep_1h", "key": "sweep1h", "name": "HTF Sweep + CISD (1 saat / 4 saat)", "tf": 60, "fn": sig_sweep, "max_hours": 72,
+     "grid": {"htf": [240], "tp_r": [(1.0, 2.0), (1.0, 3.0), (1.5, 3.0)], "kz": [0, 1], "be": [0.0]}},
 ]
 
 
@@ -195,8 +201,13 @@ def fmt_params(fam, p):
         parts.append("EMA200+BTC filtreli" if p["trend"] else "filtresiz")
     if "st" in p:
         parts.append("SuperTrend onaylı" if p["st"] else "SuperTrend'siz")
-    parts.append(f"stop {p['sl']:g} ATR")
-    parts.append(f"TP {p['tp'][0]:g}/{p['tp'][1]:g} ATR")
+    if "tp_r" in p:
+        parts.append("sadece Londra/NY seansı" if p.get("kz") else "tüm saatler")
+        parts.append("stop sweep ucunda")
+        parts.append(f"TP {p['tp_r'][0]:g}R/{p['tp_r'][1]:g}R")
+    else:
+        parts.append(f"stop {p['sl']:g} ATR")
+        parts.append(f"TP {p['tp'][0]:g}/{p['tp'][1]:g} ATR")
     parts.append(f"başa baş {p['be']:g} ATR'de" if p.get("be") else "başa baş yok")
     return ", ".join(parts)
 
@@ -209,18 +220,26 @@ def simulate(bot, symbol, d, sigs, p, max_bars):
     Canli botun islem motoru (bot.process_bar) kullanilir."""
     H, L, C, A = (d[c].to_numpy() for c in ("high", "low", "close", "atr"))
     ct = d["close_time"].to_numpy()
+    SW = d["sweep_sl"].to_numpy() if "sweep_sl" in d else None
     out = []
     for i, direction, score in sigs:
         atr, e = float(A[i]), float(C[i])
         if not (atr > 0 and e > 0):
             continue
         sign = 1 if direction == "LONG" else -1
-        sl = e - sign * p["sl"] * atr
+        if "tp_r" in p:                           # sweep: yapisal stop + R hedefleri (canli botla ayni fonksiyon)
+            lv = bot.sweep_levels(e, sign, atr, float(SW[i]), p)
+            if lv is None:
+                continue
+            sl, tp1_atr, tp2_atr = lv
+        else:
+            sl = e - sign * p["sl"] * atr
+            tp1_atr, tp2_atr = p["tp"][0], p["tp"][1]
         sl_dist = abs(e - sl) / e
         if sl_dist < 0.002 or sl_dist > 0.08:
             continue
         plan = {"direction": direction, "sign": sign, "entries": [e], "weights": [1.0], "sl": sl, "atr": atr}
-        s = bot.new_state(plan, tp1_atr=p["tp"][0], tp2_atr=p["tp"][1], tp1_frac=0.5, move_be=True, taker=RS_TAKER,
+        s = bot.new_state(plan, tp1_atr=tp1_atr, tp2_atr=tp2_atr, tp1_frac=0.5, move_be=True, taker=RS_TAKER,
                           be_atr=p.get("be", 0.0))
         j = i
         for j in range(i + 1, min(len(d), i + 1 + max_bars)):
@@ -402,7 +421,11 @@ def load_data_long4h(bot, ex, progress=None):
 
 
 def active_families():
-    return [f for f in FAMILIES if f["tf"] == 240] if RS_MODE == "long4h" else FAMILIES
+    fams = [f for f in FAMILIES if f["tf"] == 240] if RS_MODE == "long4h" else FAMILIES
+    want = [x.strip().lower() for x in os.getenv("RS_FAMILIES", "").split(",") if x.strip()]
+    if want:                                      # orn. RS_FAMILIES=sweep_15m,sweep_1h -> sadece bunlar
+        fams = [f for f in fams if (f.get("sid") or "") in want or f["key"] in want] or fams
+    return fams
 
 
 def run(bot, ex=None, progress=None):
@@ -452,6 +475,8 @@ def config_lines(winners):
         p = {k: v for k, v in w["params"].items()}
         if "tp" in p:
             p["tp"] = list(p["tp"])
+        if "tp_r" in p:
+            p["tp_r"] = list(p["tp_r"])
         params[w["family"]["sid"]] = p
     return ["Key: STRATEGIES",
             f"Value: {','.join(w['family']['sid'] for w in ws)}",

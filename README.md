@@ -238,6 +238,13 @@ Test 4 varyantı karşılaştırır: SuperTrend açık/kapalı × kademeli/tek g
 | `RS_TOP_N` | 30 | Kaç coin |
 | `RS_RISK_PCT` | 1 | İşlem başı risk (bakiyenin %'si) |
 | `RS_TRAIN_FRAC` | 0.67 | Eğitim döneminin oranı |
+| `RS_MODE` | standard | `long4h` = sadece 4 saatlik stratejiler, uzun geçmiş, sabit coin listesi · `combo` = seçilmiş stratejileri ayarlarına dokunmadan, daha önce hiç kullanılmamış bir dönemde tek tek ve birlikte test eder |
+| `RS_FAMILIES` | (boş = hepsi) | Sadece belirli stratejileri test et, örn. `sweep_15m,sweep_1h` |
+| `RS_COMBO` | breakout_1h,pullback_1h,breakout_4h | `combo` modunda test edilecek stratejiler (ayarlar `STRATEGY_PARAMS` ile değiştirilebilir) |
+| `RS_COMBO_END_DAYS_AGO` / `RS_COMBO_DAYS` | 180 / 540 | `combo` test penceresi: 180 gün önce biten 540 günlük dönem |
+| `RS_LONG_DAYS` | 730 | `long4h` modunda kaç günlük 4 saatlik veri |
+| `RS_SYMBOLS` | BTC,ETH,SOL,... | `long4h` modunda kullanılacak sabit coin listesi |
+| `RS_EXCHANGE` | mexc | Veri ve coin listesinin alınacağı borsa: `mexc` veya `binance` (USDT-M vadeli) |
 
 ## 10. Dashboard
 
@@ -267,3 +274,13 @@ Bot her işlem açılışında, kademe dolumunda ve kapanışta Gist'e yazar; a�
 - Not: Stoch RSI dipte yukarı kesişim (dönüş sinyali) ile "fiyat VWAP üstünde" (trend) şartı aynı anda nadiren oluşur. Bu da sinyal sayısını azaltır. Bu sana verdiğin kuralların bilinçli sonucudur: az ama filtrelenmiş sinyal.
 - Render'ın dosya sistemi kalıcı değildir. GitHub Gist ayarlanmadıysa işlem geçmişi ve açık işlemler her **yeni deploy**'da silinir (bkz. bölüm 10).
 - Loglarda sürekli `Ag hatasi` görürsen MEXC o bölgeden erişimi kısıtlıyor olabilir; Render'da bölgeyi Frankfurt/Singapur seç.
+
+
+## HTF Sweep + CISD (deneysel)
+
+`sweep_15m` (15 dk grafik, 1 saatlik üst zaman) ve `sweep_1h` (1 saat grafik, 4 saatlik üst zaman).
+Fiyat önceki tamamlanmış üst zaman mumunun tepesini/dibini süpürür; ardından 12 mum içinde, uç noktayı oluşturan
+mum serisinin ilk açılışının ötesinde gövdesi ≥ 0,5 ATR bir mum kapanırsa (CISD) ters yönde sinyal verilir.
+Stop süpürülen ucun 0,1 ATR ötesindedir; hedefler R cinsindendir (`tp_r`, örn. `[1,2]`). `kz: 1` sadece
+Londra (07–10 UTC) ve New York (12–16 UTC) seanslarında sinyal verir. Ayar örneği:
+`STRATEGY_PARAMS={"sweep_15m":{"tp_r":[1,3],"kz":1}}`

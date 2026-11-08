@@ -598,6 +598,11 @@ def render_chart(ex, symbol, df, sig):
         ax.hlines(sig["level"], x_lvl, n - 1, colors="#616161", linewidth=1.0, linestyles=":")
         ax.text(x_lvl, sig["level"], f" kırılım seviyesi ({lb} mum) ", fontsize=7, color="#616161",
                 va="bottom", ha="left")
+    if sig.get("family") == "sweep" and sig.get("level"):
+        x_lvl = max(0, n - 15)
+        ax.hlines(sig["level"], x_lvl, n - 1, colors="#616161", linewidth=1.0, linestyles=":")
+        ax.text(x_lvl, sig["level"], " süpürülen uç (sweep) ", fontsize=7, color="#616161",
+                va="bottom" if sig["direction"] == "SHORT" else "top", ha="left")
     # sinyal mumu isareti
     ax.annotate("▲" if sig["direction"] == "LONG" else "▼",
                 (x0, d["low"].iloc[-1] if sig["direction"] == "LONG" else d["high"].iloc[-1]),
@@ -978,6 +983,112 @@ def pullback_signal_arrays(d, rsi_th, btc_up, btc_dn):
     return np.nan_to_num(long_, nan=0).astype(bool), np.nan_to_num(short, nan=0).astype(bool)
 
 
+KILL_ZONES_UTC = ((7, 10), (12, 16))   # Londra 07-10, New York 12-16 (UTC, mum ACILIS saati)
+
+
+def _ts_ms(d):
+    """ts sutunu -> int64 milisaniye (datetime ya da sayisal olabilir)."""
+    s = d["ts"]
+    if pd.api.types.is_numeric_dtype(s):
+        return s.to_numpy().astype("int64")
+    return pd.to_datetime(s, utc=True).dt.as_unit("ms").astype("int64").to_numpy()
+
+
+def htf_prev_levels(d, htf_min):
+    """Her alt-zaman mumu icin bir ONCEKI TAMAMLANMIS ust zaman mumunun tepe/dibi.
+    Ust zaman mumu ayni veriden kurulur (15dk -> 1s, 1s -> 4s); eksik/yarim kova kullanilmaz."""
+    ts = _ts_ms(d)
+    n = len(ts)
+    hi_out, lo_out = np.full(n, np.nan), np.full(n, np.nan)
+    if n < 3:
+        return hi_out, lo_out
+    ltf_ms = int(np.median(np.diff(ts)))
+    per = max(1, int(htf_min * 60_000 // max(ltf_ms, 1)))
+    b = ts // (htf_min * 60_000)
+    g = pd.DataFrame({"b": b, "h": d["high"].to_numpy(), "l": d["low"].to_numpy()}).groupby("b").agg(
+        h=("h", "max"), l=("l", "min"), c=("h", "size"))
+    g = g[g["c"] == per]                          # sadece tam (kapanmis, eksiksiz) kovalar
+    hmap, lmap = g["h"].to_dict(), g["l"].to_dict()
+    for i in range(n):
+        pb = b[i] - 1
+        if pb in hmap:
+            hi_out[i], lo_out[i] = hmap[pb], lmap[pb]
+    return hi_out, lo_out
+
+
+def sweep_signal_arrays(d, params):
+    """HTF Sweep + CISD (tamamen nedensel durum makinesi).
+    Ayi: mum, onceki tamamlanmis HTF mumunun TEPESINI asar (sweep). Uc noktayi olusturan yesil mum serisinin
+    ilk mumunun ACILISI = CISD seviyesi. Sonraki `win` mum icinde bir mum bu seviyenin ALTINDA, govdesi >= body*ATR
+    kirmizi kapanirsa SHORT. Boga tam tersi. Stop = sweep uc noktasi +/- 0.1 ATR. Donus: (long, short, stop)."""
+    htf = int(params.get("htf", 60))
+    win = int(params.get("win", 12))
+    body_min = float(params.get("body", 0.5))
+    kz = int(params.get("kz", 0))
+    O, H, L, C, A = (d[c].to_numpy().astype(float) for c in ("open", "high", "low", "close", "atr"))
+    ts = _ts_ms(d)
+    n = len(C)
+    ph, pl = htf_prev_levels(d, htf)
+    long_, short = np.zeros(n, bool), np.zeros(n, bool)
+    stop = np.full(n, np.nan)
+    bear = None   # (uc, uc_index, cisd_seviyesi)
+    bull = None
+
+    def run_open(i, want_up):
+        k = i if ((C[i] >= O[i]) if want_up else (C[i] <= O[i])) else i - 1
+        first = None
+        while k >= 0 and i - k < 10 and ((C[k] >= O[k]) if want_up else (C[k] <= O[k])):
+            first = k
+            k -= 1
+        return O[first] if first is not None else O[i]
+
+    for i in range(n):
+        # --- once mevcut kurulumda CISD tetigi (sweep mumundan SONRAKI mumlar) ---
+        sig_s = sig_l = False
+        if bear is not None and i - bear[1] > win:
+            bear = None                           # sure doldu
+        if bull is not None and i - bull[1] > win:
+            bull = None
+        if bear is not None and H[i] <= bear[0] and C[i] < bear[2] and (O[i] - C[i]) >= body_min * A[i] > 0:
+            sig_s = True
+        if bull is not None and L[i] >= bull[0] and C[i] > bull[2] and (C[i] - O[i]) >= body_min * A[i] > 0:
+            sig_l = True
+        # --- yeni / uzayan sweep; uc asildi ama gecerli sweep degilse kurulum iptal ---
+        if not np.isnan(ph[i]) and H[i] > ph[i] and (bear is None or H[i] > bear[0]):
+            bear = (H[i], i, run_open(i, True))
+        elif bear is not None and H[i] > bear[0]:
+            bear = None
+        if not np.isnan(pl[i]) and L[i] < pl[i] and (bull is None or L[i] < bull[0]):
+            bull = (L[i], i, run_open(i, False))
+        elif bull is not None and L[i] < bull[0]:
+            bull = None
+        if sig_s and sig_l:
+            sig_s = sig_l = False
+        if kz and (sig_s or sig_l):
+            hr = (ts[i] // 3_600_000) % 24
+            if not any(a <= hr < b for a, b in KILL_ZONES_UTC):
+                sig_s = sig_l = False
+        if sig_s:
+            short[i], stop[i] = True, bear[0] + 0.1 * A[i]
+            bear = None
+        if sig_l:
+            long_[i], stop[i] = True, bull[0] - 0.1 * A[i]
+            bull = None
+    return long_, short, stop
+
+
+def sweep_levels(e, sign, atr, sw_sl, p):
+    """Yapisal stop + R bazli hedefler -> motorun ATR cinsinden hedefleri. Uygun degilse None.
+    Donus: (sl, tp1_atr, tp2_atr)."""
+    if not (atr > 0 and e > 0) or sw_sl is None or not np.isfinite(sw_sl):
+        return None
+    risk = (e - sw_sl) * sign
+    if not (0.25 * atr <= risk <= 3.0 * atr):
+        return None
+    r1, r2 = (float(x) for x in p.get("tp_r", (1.0, 2.0)))
+    return float(sw_sl), r1 * risk / atr, r2 * risk / atr
+
+
 def strategy_signal_arrays(family, d, params, btc_up, btc_dn, h1_close=None, h1_ema50=None):
     """Tum aileler icin tek giris noktasi. (long_, short, skor)."""
     adx = d["adx"].to_numpy()
@@ -1008,6 +1119,9 @@ def strategy_signal_arrays(family, d, params, btc_up, btc_dn, h1_close=None, h1_
                 l = l & (c > e200) & (up == 1)
                 s = s & (c < e200) & (dn == 1)
         l, s = np.nan_to_num(l, nan=0).astype(bool), np.nan_to_num(s, nan=0).astype(bool)
+    elif family == "sweep":
+        l, s, stop = sweep_signal_arrays(d, params)
+        d["sweep_sl"] = stop                      # yapisal stop (evaluate_strategy / research.simulate okur)
     else:
         raise ValueError(f"bilinmeyen strateji ailesi: {family}")
     if family in ("breakout", "pullback") and int(params.get("st", 0)):
@@ -1036,6 +1150,10 @@ STRAT_DEFS = {
                       "params": {"trend": 1, "sl": 2.5, "tp": [2.0, 5.0], "be": 1.0}},
     "supertrend_4h": {"family": "supertrend", "tf": 240, "name": "SuperTrend dönüşü", "max_hours": 240,
                       "params": {"trend": 1, "sl": 3.0, "tp": [3.0, 6.0], "be": 1.0}},
+    "sweep_15m": {"family": "sweep", "tf": 15, "name": "HTF Sweep + CISD (1s)", "max_hours": 24,
+                  "params": {"htf": 60, "win": 12, "body": 0.5, "kz": 0, "tp_r": [1.0, 2.0], "be": 0.0}},
+    "sweep_1h": {"family": "sweep", "tf": 60, "name": "HTF Sweep + CISD (4s)", "max_hours": 72,
+                 "params": {"htf": 240, "win": 12, "body": 0.5, "kz": 0, "tp_r": [1.0, 2.0], "be": 0.0}},
     "scalein_15m": {"family": "scalein", "tf": 15, "name": "Kademeli dönüş (eski sistem)", "max_hours": MAX_TRADE_HOURS,
                     "params": {}},
 }
@@ -1143,18 +1261,28 @@ def evaluate_strategy(sid, df, btc, h1=None, spec=None):
     e, atr = float(cur["close"]), float(cur["atr"])
     if not (atr > 0 and e > 0):
         return None
-    sl = e - sign * float(p["sl"]) * atr
+    if fam == "sweep":
+        lv = sweep_levels(e, sign, atr, float(df["sweep_sl"].iloc[-1]), p)
+        if lv is None:
+            return None
+        sl, tp1_atr, tp2_atr = lv
+    else:
+        sl = e - sign * float(p["sl"]) * atr
+        tp1_atr, tp2_atr = float(p["tp"][0]), float(p["tp"][1])
     sl_dist = abs(e - sl) / e
     if sl_dist < 0.002 or sl_dist > 0.08:
         return None
     lev = safe_leverage(sl_dist)
-    tp1_atr, tp2_atr, be_atr = float(p["tp"][0]), float(p["tp"][1]), float(p.get("be", 0.0))
+    be_atr = float(p.get("be", 0.0))
     plan = {"direction": direction, "sign": sign, "entry": e, "entries": [e], "weights": [1.0], "supports": [],
             "used_support": False, "compressed": False, "sl": sl, "atr": atr, "avg_full": e,
             "liq_full": liq_price(e, sign, lev), "sl_avg_pct": sl_dist * 100, "sl_e1_pct": sl_dist * 100,
             "sl_dist": sl_dist, "leverage": lev, "strategy": sid, "family": fam, "tf": spec["tf"],
             "tf_label": spec["tf_label"], "strategy_name": spec["name"], "max_hours": spec["max_hours"],
             "tp1_atr": tp1_atr, "tp2_atr": tp2_atr, "be_atr": be_atr, "st_confirm": bool(int(p.get("st", 0)))}
+    if fam == "sweep":
+        plan["level"] = float(sl + sign * 0.1 * atr)   # suepurulen uc nokta
+        plan["htf"], plan["tp_r"] = int(p.get("htf", 60)), [float(x) for x in p.get("tp_r", (1, 2))]
     if fam == "breakout":
         lb = int(p["lookback"])
         plan["level"] = float(df["high"].iloc[-lb - 1:-1].max() if sign == 1 else df["low"].iloc[-lb - 1:-1].min())
@@ -1217,6 +1345,11 @@ def build_message_single(ex, symbol, sig):
         reason = f"📈 Trend içinde EMA20'ye geri çekilme ve RSI dönüşü · ADX {sig['adx']:.0f}"
         if sig.get("st_confirm"):
             reason += " · SuperTrend onaylı"
+    elif fam == "sweep":
+        htf = TF_LABELS.get(int(sig.get("htf", 60)), "üst zaman")
+        side = "tepesi" if sig["direction"] == "SHORT" else "dibi"
+        reason = (f"📈 Önceki {htf} mumunun {side} süpürüldü (uç {p(sig['level'])}) ve CISD ile yön değişti"
+                  f" · TP {sig['tp_r'][0]:g}R / {sig['tp_r'][1]:g}R")
     elif fam == "supertrend":
         reason = (f"📈 SuperTrend ({ST_PERIOD},{ST_MULT:g}) {'yukarı' if sig['direction'] == 'LONG' else 'aşağı'} döndü"
                   f" · ADX {sig['adx']:.0f}")
