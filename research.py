@@ -20,6 +20,7 @@ Komisyon: limit %0, market %0.02 (BT_MAKER_FEE / BT_TAKER_FEE). Funding ve kayma
 Calistirma: Render'da RUN_RESEARCH=true  ya da bilgisayarda  python research.py
 """
 
+import gc
 import io
 import os
 import time
@@ -314,7 +315,8 @@ def load_data(bot, ex, progress=None):
     b4["btc_dn"] = (b4["close"] < b4["ema50"]).astype(int)
 
     data = {}
-    for sym, df in raw.items():
+    for sym in list(raw):
+        df = raw.pop(sym)                         # ham veriyi isledikce bellekten birak
         if sym == btc and btc not in symbols:
             continue
         d15 = prep(bot, df, 15)
@@ -322,8 +324,19 @@ def load_data(bot, ex, progress=None):
         d15 = align(align(d15, b4, ["btc_up", "btc_dn"], ""), d60, ["close", "ema50"], "h1_")
         d60 = align(d60, b4, ["btc_up", "btc_dn"], "")
         d240 = align(prep(bot, resample(df, 240), 240), b4, ["btc_up", "btc_dn"], "")
-        data[sym] = {15: d15, 60: d60, 240: d240}
+        data[sym] = {15: _slim(d15), 60: _slim(d60), 240: _slim(d240)}
+        del df, d15, d60, d240
+        gc.collect()
     return data
+
+
+KEEP_COLS = ["ts", "open", "high", "low", "close", "volume", "atr", "adx", "k", "d", "vwap", "st", "st_dir",
+             "ema20", "ema50", "ema200", "rsi", "close_time", "btc_up", "btc_dn", "h1_close", "h1_ema50"]
+
+
+def _slim(d):
+    """Sadece stratejilerin kullandigi sutunlari tut (bellek: Render ucretsiz plan 512 MB)."""
+    return d[[c for c in KEEP_COLS if c in d.columns]].copy()
 
 
 EXCHANGE_NAMES = {"mexc": "MEXC", "binance": "Binance"}
@@ -467,7 +480,7 @@ def render_test_curves(bot, results):
 def run_and_report(bot):
     try:
         bot.send_telegram(f"🔬 Strateji araştırması başladı ({EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}): {RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi. "
-                          f"Veri indirme ve testler 10-20 dakika sürebilir...")
+                          f"Veri indirme ve testler 30-60 dakika sürebilir...")
         t_start = time.time()
         results, n, t0, split, t1 = run(bot)
         report = format_report(bot, results, n, t0, split, t1)
