@@ -55,6 +55,10 @@ RS_MIN_TEST_TRADES = _env("RS_MIN_TEST_TRADES", 30, int)  # dogrulamada en az is
 RS_MIN_T = _env("RS_MIN_T", 2.5, float)                # dogrulamada islem basi getirinin t-istatistigi (sans elemesi;
                                                        # 9 strateji birlikte test edildigi icin coklu test duzeltmeli)
 RS_EXCHANGE = _env("RS_EXCHANGE", "mexc").lower()       # mexc | binance (veri ve coin listesi bu borsadan)
+RS_MODE = _env("RS_MODE", "standard").lower()          # standard | long4h (sadece 4 saatlik stratejiler, uzun gecmis)
+RS_LONG_DAYS = _env("RS_LONG_DAYS", 730, int)           # long4h modunda kac gunluk 4s veri
+RS_SYMBOLS = _env("RS_SYMBOLS", "BTC,ETH,SOL,XRP,DOGE,ADA,LINK,AVAX,LTC,BCH,DOT,TRX,NEAR,ATOM,UNI,ETC,FIL,AAVE,XLM,BNB")
+# long4h modunda sabit coin listesi (bugunku hacme gore secim yok -> hayatta kalma yanliligi azalir)
 RS_MAKER = _env("BT_MAKER_FEE", 0.0, float)
 RS_TAKER = _env("BT_TAKER_FEE", 0.0002, float)
 WARMUP = 220                                           # EMA200 isinmasi
@@ -63,13 +67,14 @@ WARMUP = 220                                           # EMA200 isinmasi
 # ============================================================================
 # VERI
 # ============================================================================
-def fetch_15m(bot, ex, symbol, days):
-    tf_ms = 15 * 60_000
+def fetch_15m(bot, ex, symbol, days, tf_min=15, min_bars=2000):
+    tf_ms = tf_min * 60_000
+    code = {15: "15m", 60: "1h", 240: "4h"}[tf_min]
     since = int((datetime.now(timezone.utc) - timedelta(days=days + 4)).timestamp() * 1000)
     now_ms = int(time.time() * 1000)
     rows = []
     while since < now_ms - tf_ms:
-        batch = bot.with_retry(ex.fetch_ohlcv, symbol, "15m", since=since, limit=1000, desc=f"rs {symbol}")
+        batch = bot.with_retry(ex.fetch_ohlcv, symbol, code, since=since, limit=1000, desc=f"rs {symbol} {code}")
         if not batch:
             break
         rows.extend(batch)
@@ -84,8 +89,8 @@ def fetch_15m(bot, ex, symbol, days):
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     for c in ("open", "high", "low", "close", "volume"):
         df[c] = df[c].astype(float)
-    df = df[df["ts"] + pd.Timedelta(minutes=15) <= pd.Timestamp.now(tz="UTC")]
-    return df.reset_index(drop=True) if len(df) > 2000 else None
+    df = df[df["ts"] + pd.Timedelta(minutes=tf_min) <= pd.Timestamp.now(tz="UTC")]
+    return df.reset_index(drop=True) if len(df) > min_bars else None
 
 
 def resample(df, minutes):
@@ -308,7 +313,14 @@ def load_data(bot, ex, progress=None):
         if progress and idx % 10 == 0:
             progress(f"{idx} coin indirildi")
     if btc not in raw:
-        raise RuntimeError(f"BTC verisi alinamadi ({btc}) - borsa gecmis veriyi vermedi veya erisim kisitli")
+        detail = ""
+        try:                                      # asil borsa hatasini gor (bolge kisitlamasi vb.)
+            since = int((datetime.now(timezone.utc) - timedelta(days=RS_DAYS + 4)).timestamp() * 1000)
+            test = ex.fetch_ohlcv(btc, "15m", since=since, limit=1000)
+            detail = f"borsa {len(test or [])} mum dondurdu (yetersiz gecmis)"
+        except Exception as e:
+            detail = f"{type(e).__name__}: {str(e)[:220]}"
+        raise RuntimeError(f"BTC verisi alinamadi ({btc}) - {detail}")
 
     b4 = prep(bot, resample(raw[btc], 240), 240)
     b4["btc_up"] = (b4["close"] > b4["ema50"]).astype(int)
@@ -349,17 +361,62 @@ def make_exchange(bot):
     return bot.create_exchange()
 
 
+def load_data_long4h(bot, ex, progress=None):
+    """Sabit coin listesi icin dogrudan 4 saatlik mumlar (uzun gecmis)."""
+    if not ex.markets:
+        if bot.with_retry(ex.load_markets, desc="load_markets") is None:
+            raise RuntimeError("piyasa listesi alinamadi")
+    btc = bot.btc_perp_symbol(ex)
+    wanted = [s.strip().upper() for s in RS_SYMBOLS.split(",") if s.strip()]
+    syms = []
+    for base in wanted:
+        cand = f"{base}/USDT:USDT"
+        if cand in ex.markets and base not in bot.EXCLUDE_SYMBOLS:
+            syms.append(cand)
+    if btc not in syms:
+        syms.insert(0, btc)
+    raw = {}
+    for idx, sym in enumerate(syms, 1):
+        try:
+            df = fetch_15m(bot, ex, sym, RS_LONG_DAYS, tf_min=240, min_bars=WARMUP + 200)
+            if df is not None:
+                raw[sym] = df
+        except Exception as e:
+            log.warning("Arastirma veri hatasi %s: %s", sym, e)
+        if progress and idx % 5 == 0:
+            progress(f"{idx}/{len(syms)} coin")
+    if btc not in raw:
+        raise RuntimeError(f"BTC 4s verisi alinamadi ({btc})")
+    b4 = prep(bot, raw[btc], 240)
+    b4["btc_up"] = (b4["close"] > b4["ema50"]).astype(int)
+    b4["btc_dn"] = (b4["close"] < b4["ema50"]).astype(int)
+    data = {}
+    for sym in list(raw):
+        df = raw.pop(sym)
+        d240 = align(prep(bot, df, 240), b4, ["btc_up", "btc_dn"], "")
+        data[sym] = {240: _slim(d240)}
+    skipped = [s.split("/")[0] for s in syms if s not in data]
+    if skipped:
+        log.info("Yeterli gecmisi olmayan coinler atlandi: %s", ", ".join(skipped))
+    return data
+
+
+def active_families():
+    return [f for f in FAMILIES if f["tf"] == 240] if RS_MODE == "long4h" else FAMILIES
+
+
 def run(bot, ex=None, progress=None):
     ex = ex or make_exchange(bot)
-    data = load_data(bot, ex, progress)
-    t_all = [d[15]["close_time"] for d in data.values()]
+    data = load_data_long4h(bot, ex, progress) if RS_MODE == "long4h" else load_data(bot, ex, progress)
+    base_tf = 240 if RS_MODE == "long4h" else 15
+    t_all = [d[base_tf]["close_time"] for d in data.values()]
     t0 = min(t.iloc[WARMUP] for t in t_all)
     t1 = max(t.iloc[-1] for t in t_all)
     split = t0 + (t1 - t0) * RS_TRAIN_FRAC
     end = t1 + pd.Timedelta(minutes=1)
 
     results = []
-    for fam in FAMILIES:
+    for fam in active_families():
         max_bars = int(fam["max_hours"] * 60 / fam["tf"])
         best = None
         tried = []
@@ -408,10 +465,12 @@ def _pf(v):
 
 def format_report(bot, results, n_coins, t0, split, t1):
     tz = bot.DISPLAY_TZ
-    f = lambda t: t.tz_convert(tz).strftime("%d.%m")
+    f = lambda t: t.tz_convert(tz).strftime("%d.%m.%y" if RS_MODE == "long4h" else "%d.%m")
     lines = [
         f"🔬 STRATEJİ ARAŞTIRMASI · {EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}",
-        f"🗓 {RS_DAYS} gün · {n_coins} coin · eğitim {f(t0)}–{f(split)} · doğrulama {f(split)}–{f(t1)}",
+        (f"🗓 Uzun vade (4 saat) · {RS_LONG_DAYS} gün · {n_coins} sabit coin · eğitim {f(t0)}–{f(split)} · doğrulama {f(split)}–{f(t1)}"
+         if RS_MODE == "long4h" else
+         f"🗓 {RS_DAYS} gün · {n_coins} coin · eğitim {f(t0)}–{f(split)} · doğrulama {f(split)}–{f(t1)}"),
         f"💼 ${RS_BALANCE:,.0f} · işlem başı risk %{RS_RISK_PCT:g} · en fazla {RS_MAX_OPEN or bot.MAX_OPEN_TRADES} işlem · kaldıraç ≤{bot.LEVERAGE}x",
         f"🧾 Komisyon: limit %{RS_MAKER * 100:g} · market %{RS_TAKER * 100:g}",
         "Ayar eğitimde seçildi, doğrulama verisini strateji hiç görmedi.",
@@ -479,7 +538,9 @@ def render_test_curves(bot, results):
 
 def run_and_report(bot):
     try:
-        bot.send_telegram(f"🔬 Strateji araştırması başladı ({EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}): {RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi. "
+        what = (f"uzun vade 4 saat, {RS_LONG_DAYS} gün, sabit coin listesi, {len(active_families())} strateji"
+                if RS_MODE == "long4h" else f"{RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi")
+        bot.send_telegram(f"🔬 Strateji araştırması başladı ({EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}): {what}. "
                           f"Veri indirme ve testler 30-60 dakika sürebilir...")
         t_start = time.time()
         results, n, t0, split, t1 = run(bot)
