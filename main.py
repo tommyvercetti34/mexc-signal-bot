@@ -7,7 +7,10 @@ Strateji (15m):
   3) Tetik  : Stoch RSI (14,14,3,3)
                - K, D'yi 20 altinda yukari keserse  -> LONG
                - K, D'yi 80 ustunde asagi keserse   -> SHORT
-  Risk     : SL = Giris -/+ ATR(14) * ATR_SL_MULT,  TP = Giris +/- Risk * RR_RATIO
+  4) SuperTrend (10,3) sinyal yonuyle ayni olmali
+  Giris    : 3 kademe limit emir (%20/%30/%50): sinyal fiyati + alttaki 2 destek (SHORT'ta direnc)
+  Stop     : son kademenin dayandigi destegin altinda; her kademe icin 15x likidasyon kontrolu
+  Kar al   : Hedef 1'de %50 kapat + stop girise, Hedef 2'de kalan (hedefler ortalama girise gore)
 
 Sadece KAPANMIS mumlar uzerinde hesap yapilir (repaint yok).
 Bu bot emir ACMAZ; sadece Telegram'a sinyal gonderir.
@@ -63,7 +66,7 @@ TIMEFRAME = _env("TIMEFRAME", "15m")
 TOP_N_SYMBOLS = _env("TOP_N_SYMBOLS", 50, int)            # 24s hacme gore ilk N USDT perpetual
 MIN_QUOTE_VOLUME_USDT = _env("MIN_QUOTE_VOLUME_USDT", 5_000_000, float)
 EXCLUDE_SYMBOLS = [s.strip().upper() for s in _env("EXCLUDE_SYMBOLS", "").split(",") if s.strip()]  # orn: "USDC,PEPE"
-OHLCV_LIMIT = _env("OHLCV_LIMIT", 300, int)               # 300 x 15m = ~3 gun (indikator isinmasi + VWAP icin)
+OHLCV_LIMIT = _env("OHLCV_LIMIT", 500, int)               # 500 x 15m = ~5 gun (indikatorler + destek seviyeleri)
 SCAN_DELAY_SEC = _env("SCAN_DELAY_SEC", 15, int)          # mum kapanisindan kac sn sonra taransin
 RUN_SCAN_ON_START = _env("RUN_SCAN_ON_START", True, bool)
 
@@ -85,17 +88,42 @@ ST_MULT = _env("ST_MULT", 3.0, float)
 # --- Risk ---
 LEVERAGE = _env("LEVERAGE", 15, int)
 MARGIN_MODE = _env("MARGIN_MODE", "Isolated")
-ATR_SL_MULT = _env("ATR_SL_MULT", 1.5, float)             # SL mesafesi = ATR * bu katsayi
-RR_RATIO = _env("RR_RATIO", 1.5, float)                   # TP = risk * RR (min 1.5 onerilir)
-MIN_SL_PCT = _env("MIN_SL_PCT", 0.25, float)              # cok dar stoplari (gurultu) ele
-# Kademeli giris: Giris1 = sinyal kapanisi, GirisN = Giris1 -/+ (N-1) * ENTRY_STEP_ATR * ATR
-# Stop ve Hedef Giris1'e gore SABIT kalir; kademeler stop ile giris arasina yerlesir.
-ENTRY_LEVELS = _env("ENTRY_LEVELS", 3, int)               # 1 = tek giris (kademesiz)
-ENTRY_STEP_ATR = _env("ENTRY_STEP_ATR", 0.5, float)       # kademeler arasi mesafe (ATR cinsinden)
-ENTRY_WEIGHTS = _env("ENTRY_WEIGHTS", "33,33,34")         # her kademenin pozisyondaki % payi
+
+# --- Kademeli alim (scale-in) ---
+# Giris 1 = sinyal mumunun kapanisi. Giris 2/3 = altindaki destek (SHORT'ta ustundeki direnc) seviyeleri.
+# Stop = son kademenin dayandigi destegin altinda. Her sinyalde 15x likidasyon kontrolu yapilir.
+ENTRY_LEVELS = _env("ENTRY_LEVELS", 3, int)               # 1 = tek giris
+ENTRY_WEIGHTS = _env("ENTRY_WEIGHTS", "20,30,50")         # her kademe, islem butcesinin % kaci (toplam <=100)
+LEVEL_MODE = _env("LEVEL_MODE", "support")                # support = pivot destek/direnc, atr = sabit ATR adimi
+PIVOT_K = _env("PIVOT_K", 5, int)                         # pivot: solunda ve saginda K mumdan daha dusuk/yuksek
+LEVEL_LOOKBACK = _env("LEVEL_LOOKBACK", 400, int)         # destek aranacak gecmis mum sayisi (400 x 15m ~ 4 gun)
+ENTRY_STEP_ATR = _env("ENTRY_STEP_ATR", 1.0, float)       # destek bulunamazsa kademe araligi (ATR)
+MIN_TIER_GAP_ATR = _env("MIN_TIER_GAP_ATR", 0.5, float)   # kademeler arasi en az mesafe (ATR)
+MIN_TIER_GAP_PCT = _env("MIN_TIER_GAP_PCT", 0.3, float)   # ... ve en az % mesafe
+MAX_LEVEL_DEPTH_ATR = _env("MAX_LEVEL_DEPTH_ATR", 4.0, float)  # en derin kademe girisin en fazla kac ATR otesinde
+SL_BUFFER_ATR = _env("SL_BUFFER_ATR", 0.5, float)         # stop, son destegin bu kadar ATR altina
+ATR_SL_MULT = _env("ATR_SL_MULT", 1.5, float)             # tek giriste stop mesafesi (ATR)
+MMR_PCT = _env("MMR_PCT", 0.6, float)                     # bakim teminati orani (likidasyon hesabi icin)
+LIQ_BUFFER_PCT = _env("LIQ_BUFFER_PCT", 0.5, float)       # kademe/stop likidasyondan en az bu kadar uzak olmali
+MAX_SL_FROM_AVG_PCT = _env("MAX_SL_FROM_AVG_PCT", 2.5, float)  # hepsi dolarsa ortalamadan stopa en fazla %
+MIN_SL_PCT = _env("MIN_SL_PCT", 0.4, float)               # ... ve en az % (cok dar stoplari ele)
+MAX_SL_PCT = MAX_SL_FROM_AVG_PCT                          # (eski ayar adi ile uyum)
+
+# --- Kademeli kar alma ---
+TP1_ATR = _env("TP1_ATR", 1.5, float)                     # Hedef 1 = ortalama giris +/- bu kadar ATR
+TP2_ATR = _env("TP2_ATR", 3.0, float)                     # Hedef 2 = ortalama giris +/- bu kadar ATR
+TP1_CLOSE_PCT = _env("TP1_CLOSE_PCT", 50.0, float)        # Hedef 1'de pozisyonun % kaci kapansin
+MOVE_SL_TO_BE = _env("MOVE_SL_TO_BE", True, bool)         # Hedef 1 sonrasi stop ortalama girise cekilsin
+RR_RATIO = TP2_ATR / ATR_SL_MULT                          # (eski ayar adi ile uyum, sadece bilgi)
+
+# --- Pozisyon buyuklugu / eszamanli islem ---
+ACCOUNT_BALANCE = _env("ACCOUNT_BALANCE", 2000.0, float)  # hesap bakiyesi ($) - mesajdaki tutarlar buna gore
+MAX_OPEN_TRADES = _env("MAX_OPEN_TRADES", 2, int)         # ayni anda en fazla kac islem
+SLOT_PCT = _env("SLOT_PCT", 0.0, float)                   # islem basina ayrilan bakiye %; 0 = 100 / MAX_OPEN_TRADES
+COMPOUND = _env("COMPOUND", True, bool)                   # kapanan islemlerin K/Z'si bakiyeye eklensin mi
+FEE_MAKER = _env("FEE_MAKER", 0.0, float)                 # limit emir komisyonu (MEXC standart %0)
+FEE_TAKER = _env("FEE_TAKER", 0.0002, float)              # market emir komisyonu (MEXC standart %0.02)
 NOTIFY_ENTRY_FILLS = _env("NOTIFY_ENTRY_FILLS", True, bool)  # 2./3. kademe dolunca mesaj at
-# 15x isolated'da tasfiye ~%6.6 civarinda; SL bunun cok altinda olmali:
-MAX_SL_PCT = _env("MAX_SL_PCT", 4.0, float)
 
 # --- Grafik ---
 SEND_CHART = _env("SEND_CHART", True, bool)               # sinyalle birlikte grafik gorseli gonder
@@ -137,7 +165,7 @@ logging.basicConfig(
 log = logging.getLogger("mexc-bot")
 
 def _parse_ladder():
-    """Kademe agirliklarini ve adimini dogrular. (agirliklar[0-1], adim_atr) dondurur."""
+    """Kademe agirliklarini dogrular. (normalize agirliklar [toplam 1], adim_atr, butcenin kullanilan orani) doner."""
     n = max(1, ENTRY_LEVELS)
     try:
         w = [float(x) for x in ENTRY_WEIGHTS.split(",") if x.strip()][:n]
@@ -148,15 +176,14 @@ def _parse_ladder():
         if n > 1:
             logging.warning("ENTRY_WEIGHTS gecersiz/eksik, esit agirlik kullaniliyor")
     total = sum(w)
-    w = [v / total for v in w]
-    step = ENTRY_STEP_ATR
-    if n > 1 and step * (n - 1) >= ATR_SL_MULT * 0.9:       # son kademe stopa cok yakin/otesinde olmasin
-        step = ATR_SL_MULT * 0.9 / (n - 1)
-        logging.warning("ENTRY_STEP_ATR stopa cok yakin, %.2f ATR'ye dusuruldu", step)
-    return w, step
+    alloc = min(1.0, total / 100.0) if total > 1.0 else 1.0   # "40,20,20" -> butcenin %80'i kullanilir
+    if total > 100.0:
+        logging.warning("ENTRY_WEIGHTS toplami %%%.0f > %%100, butcenin tamamina olceklendi", total)
+    return [v / total for v in w], ENTRY_STEP_ATR, alloc
 
 
-LADDER_WEIGHTS, LADDER_STEP_ATR = _parse_ladder()
+LADDER_WEIGHTS, LADDER_STEP_ATR, LADDER_ALLOC = _parse_ladder()
+SLOT_FRACTION = (SLOT_PCT / 100.0) if SLOT_PCT > 0 else 1.0 / max(1, MAX_OPEN_TRADES)
 
 TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}[TIMEFRAME]
 TF_LABEL = {15: "15 Dakika", 5: "5 Dakika", 30: "30 Dakika", 60: "1 Saat", 240: "4 Saat"}.get(TF_MINUTES, TIMEFRAME)
@@ -521,7 +548,11 @@ def render_chart(ex, symbol, df, sig):
     else:
         for i, ep in enumerate(entries):
             lines.append((ep, C_UP, f"GİRİŞ {i + 1}", "-" if i == 0 else "--"))
-    lines.append((tp, "#43A047", "HEDEF", "-"))
+    if sig.get("tp1") is not None and abs(sig["tp1"] - tp) > 1e-12:
+        lines.append((sig["tp1"], "#43A047", "HEDEF 1", "--"))
+        lines.append((tp, "#2E7D32", "HEDEF 2", "-"))
+    else:
+        lines.append((tp, "#43A047", "HEDEF", "-"))
 
     lo = min(d["low"].min(), sl, tp)
     hi = max(d["high"].max(), sl, tp)
@@ -593,66 +624,272 @@ def render_chart(ex, symbol, df, sig):
 # ============================================================================
 # SINYAL MANTIGI
 # ============================================================================
-def evaluate(df):
-    """Son kapanmis mum icin sinyal dondurur: dict veya None."""
-    if len(df) < 3:
-        return None
-    prev, cur = df.iloc[-2], df.iloc[-1]
+def trigger_direction(prev, cur):
+    """Tek mum icin giris tetigi: 'LONG' / 'SHORT' / None (ADX + Stoch RSI + VWAP + SuperTrend)."""
     needed = ("atr", "adx", "k", "d", "vwap")
     if any(pd.isna(cur[c]) for c in needed) or pd.isna(prev["k"]) or pd.isna(prev["d"]):
         return None
-
-    # 1) Guc filtresi
     if cur["adx"] < ADX_THRESHOLD:
         return None
-
-    # 2) Tetikleyici: Stoch RSI kesisimi (kesisim bolge icinde basliyor olmali)
     cross_up = prev["k"] <= prev["d"] and cur["k"] > cur["d"] and max(prev["k"], prev["d"]) < STOCH_OVERSOLD
     cross_dn = prev["k"] >= prev["d"] and cur["k"] < cur["d"] and min(prev["k"], prev["d"]) > STOCH_OVERBOUGHT
-
-    # 3) Trend filtresi: VWAP
     direction = None
     if cross_up and cur["close"] > cur["vwap"]:
         direction = "LONG"
     elif cross_dn and cur["close"] < cur["vwap"]:
         direction = "SHORT"
-    if not direction:
-        return None
-
-    # 4) SuperTrend filtresi: yon SuperTrend ile ayni olmali
-    if USE_SUPERTREND:
+    if direction and USE_SUPERTREND:
         if pd.isna(cur["st"]):
             return None
         if (direction == "LONG" and cur["st_dir"] != 1) or (direction == "SHORT" and cur["st_dir"] != -1):
             return None
+    return direction
 
-    entry = float(cur["close"])
-    risk = float(cur["atr"]) * ATR_SL_MULT
-    if direction == "LONG":
-        sl, tp = entry - risk, entry + risk * RR_RATIO
-    else:
-        sl, tp = entry + risk, entry - risk * RR_RATIO
 
-    sl_pct = abs(entry - sl) / entry * 100
-    if sl <= 0 or tp <= 0 or sl_pct < MIN_SL_PCT or sl_pct > MAX_SL_PCT:
-        log.debug("SL %%%.2f limit disi, sinyal elendi", sl_pct)
-        return None
+# ----------------------------------------------------------------------------
+# KADEME PLANLAYICI (destek/direnc + 15x likidasyon kontrolu)
+# ----------------------------------------------------------------------------
+def liq_price(avg, sign, leverage=None):
+    """Isolated USDT-M yaklasik likidasyon fiyati."""
+    lev = leverage or LEVERAGE
+    return avg * (1 - sign * (1.0 / lev - MMR_PCT / 100.0))
 
-    # Kademeli girisler
+
+def _pivot_levels(high, low, i, sign):
+    """i anina kadar ONAYLANMIS pivot dip (LONG) / tepe (SHORT) seviyeleri. Gelecege bakmaz."""
+    k = PIVOT_K
+    start = max(k, i - LEVEL_LOOKBACK)
+    end = i - k                                   # pivotun sagindaki k mum da kapanmis olmali
+    if end <= start:
+        return []
+    src = low if sign == 1 else high
+    out = []
+    for j in range(start, end + 1):
+        win = src[j - k:j + k + 1]
+        if (sign == 1 and src[j] <= win.min()) or (sign == -1 and src[j] >= win.max()):
+            out.append(float(src[j]))
+    return out
+
+
+def plan_trade(high, low, close, atr_arr, i, direction, weights=None, mode=None, leverage=None):
+    """Kademe fiyatlari, stop ve risk kontrolleri. Gecemezse None doner."""
     sign = 1 if direction == "LONG" else -1
-    step = float(cur["atr"]) * LADDER_STEP_ATR
-    entries = [entry - sign * i * step for i in range(len(LADDER_WEIGHTS))]
-    avg_full = sum(e * w for e, w in zip(entries, LADDER_WEIGHTS))
-    rr_full = abs(tp - avg_full) / abs(avg_full - sl)
-    avg_sl_pct = abs(avg_full - sl) / avg_full * 100
+    weights = weights or LADDER_WEIGHTS
+    mode = mode or LEVEL_MODE
+    lev = leverage or LEVERAGE
+    e1, atr = float(close[i]), float(atr_arr[i])
+    if not (atr > 0 and e1 > 0):
+        return None
+    n = len(weights)
+    liq_dist = 1.0 / lev - MMR_PCT / 100.0
+    if liq_dist <= 0:
+        return None
+    buf = LIQ_BUFFER_PCT / 100.0
+    gap = max(MIN_TIER_GAP_ATR * atr, e1 * MIN_TIER_GAP_PCT / 100.0)
+    max_depth = min(e1 * liq_dist * 0.95, MAX_LEVEL_DEPTH_ATR * atr)
 
+    # 1) Kademe fiyatlari
+    entries, supports, used_support = [e1], [], False
+    if n == 1:
+        sl = e1 - sign * ATR_SL_MULT * atr
+    else:
+        cands = []
+        if mode == "support":
+            cands = [p for p in _pivot_levels(high, low, i, sign)
+                     if 0 < sign * (e1 - p) <= max_depth]
+            cands = sorted(set(cands), key=lambda p: sign * (e1 - p))    # girise en yakindan uzaga
+        prev, last_support = e1, None
+        for _ in range(1, n):
+            pick = next((p for p in cands if sign * (prev - p) >= gap), None)
+            if pick is not None:
+                tier = pick + sign * 0.1 * atr                            # destegin biraz onune limit
+                if sign * (prev - tier) < gap:
+                    tier = prev - sign * gap
+                last_support, used_support = pick, True
+                supports.append(pick)
+            else:
+                tier = prev - sign * ENTRY_STEP_ATR * atr
+                if sign * (e1 - tier) > max_depth:
+                    tier = e1 - sign * max_depth
+                last_support = tier
+                supports.append(None)
+            entries.append(tier)
+            prev = tier
+        base = last_support if sign * (entries[-1] - last_support) >= 0 else entries[-1]
+        sl = base - sign * SL_BUFFER_ATR * atr
+
+    # 2) Kontroller (gecmezse kademeleri girise dogru sikistirmayi dene)
+    def check(ent, stop):
+        if any(sign * (ent[j - 1] - ent[j]) < gap * 0.999 for j in range(1, len(ent))):
+            return None
+        if sign * (ent[-1] - stop) <= 0:
+            return None
+        for j in range(1, len(ent)):              # her kademe dolmadan once likidasyon olmasin
+            w_sum = sum(weights[:j])
+            avg_j = sum(e * w for e, w in zip(ent[:j], weights[:j])) / w_sum
+            lq = liq_price(avg_j, sign, lev)
+            if sign * (ent[j] - lq) < lq * buf:
+                return None
+        avg = sum(e * w for e, w in zip(ent, weights))
+        lq = liq_price(avg, sign, lev)
+        if sign * (stop - lq) < lq * buf:         # stop likidasyondan once gelmeli
+            return None
+        sl_avg = sign * (avg - stop) / avg * 100
+        if sl_avg > MAX_SL_FROM_AVG_PCT or sl_avg < MIN_SL_PCT:
+            return None
+        return avg, lq, sl_avg
+
+    res, compressed = check(entries, sl), False
+    for _ in range(8):
+        if res or n == 1:
+            break
+        entries = [e1 + (e - e1) * 0.85 for e in entries]
+        sl = e1 + (sl - e1) * 0.85
+        compressed = True
+        res = check(entries, sl)
+    if not res:
+        return None
+    avg, lq, sl_avg = res
     return {
-        "direction": direction, "entry": entry, "sl": sl, "tp": tp,
-        "entries": entries, "weights": LADDER_WEIGHTS, "avg_full": avg_full,
-        "rr_full": rr_full, "avg_sl_pct": avg_sl_pct,
-        "sl_pct": sl_pct, "candle_ts": cur["ts"],
-        "adx": float(cur["adx"]), "k": float(cur["k"]), "d": float(cur["d"]), "vwap": float(cur["vwap"]),
+        "direction": direction, "sign": sign, "entry": e1, "entries": entries, "weights": list(weights),
+        "supports": supports, "used_support": used_support, "compressed": compressed,
+        "sl": sl, "atr": atr, "avg_full": avg, "liq_full": lq, "liq_e1": liq_price(e1, sign, lev),
+        "sl_avg_pct": sl_avg, "sl_e1_pct": sign * (e1 - sl) / e1 * 100,
     }
+
+
+# ----------------------------------------------------------------------------
+# ISLEM MOTORU (canli takip ve backtest ayni fonksiyonu kullanir)
+# ----------------------------------------------------------------------------
+def new_state(plan, tp1_atr=None, tp2_atr=None, tp1_frac=None, move_be=None, taker=None):
+    taker = FEE_TAKER if taker is None else taker
+    w = plan["weights"]
+    return {
+        "direction": plan["direction"], "sign": plan["sign"], "entries": plan["entries"], "weights": w,
+        "filled": [True] + [False] * (len(w) - 1), "cancelled": False,
+        "sl": plan["sl"], "sl_orig": plan["sl"], "atr": plan["atr"],
+        "tp1_atr": TP1_ATR if tp1_atr is None else tp1_atr,
+        "tp2_atr": TP2_ATR if tp2_atr is None else tp2_atr,
+        "tp1_frac": (TP1_CLOSE_PCT / 100.0) if tp1_frac is None else tp1_frac,
+        "move_be": MOVE_SL_TO_BE if move_be is None else move_be,
+        "tp1_done": False, "rem": 1.0, "ret": 0.0, "fee": w[0] * taker,
+        "closed": False, "outcome": None, "exit": None,
+    }
+
+
+def st_avg(s):
+    """Dolan kademelerin ortalamasi ve butcedeki toplam agirligi."""
+    ws = sum(w for w, f in zip(s["weights"], s["filled"]) if f)
+    avg = sum(e * w for e, w, f in zip(s["entries"], s["weights"], s["filled"]) if f) / ws
+    return avg, ws
+
+
+def st_targets(s):
+    if s.get("tp_fixed") is not None:              # eski surum kayitlari
+        return s["tp_fixed"], s["tp_fixed"]
+    avg, _ = st_avg(s)
+    return avg + s["sign"] * s["tp1_atr"] * s["atr"], avg + s["sign"] * s["tp2_atr"] * s["atr"]
+
+
+def _st_close(s, frac, px, rate):
+    """Acik pozisyonun frac kadarini px'ten kapatir; getiriyi butce notional'ina oranla biriktirir."""
+    for e, w, f in zip(s["entries"], s["weights"], s["filled"]):
+        if f:
+            part = w * s["rem"] * frac
+            s["ret"] += part * s["sign"] * (px - e) / e
+            s["fee"] += part * rate
+    s["rem"] *= (1 - frac)
+
+
+def process_bar(s, high, low, maker=None, taker=None):
+    """Bir mumu isler. Olaylar: ('FILL', i) ('TP1', px) ('TP2', px) ('SL', px) ('BE', px).
+    Ayni mumda stop ve hedef varsa temkinli davranilir: once stop."""
+    maker = FEE_MAKER if maker is None else maker
+    taker = FEE_TAKER if taker is None else taker
+    if s["closed"]:
+        return []
+    sg, ev = s["sign"], []
+    touch = (lambda p: low <= p) if sg == 1 else (lambda p: high >= p)
+    reach = (lambda p: high >= p) if sg == 1 else (lambda p: low <= p)
+
+    # 1) kademe dolumlari: hedef mumunda yeni kademe sayilmaz; ama stop da goruluyorsa fiyat kademelerden
+    #    gecmis demektir -> hepsi sayilir (zarari kucuk gostermemek icin)
+    if not s["tp1_done"] and not s["cancelled"]:
+        tp1, _ = st_targets(s)
+        if touch(s["sl"]) or not reach(tp1):
+            for j, e in enumerate(s["entries"]):
+                if not s["filled"][j] and touch(e):
+                    s["filled"][j] = True
+                    s["fee"] += s["weights"][j] * maker
+                    ev.append(("FILL", j))
+    pre_targets = st_targets(s) if not ev else None   # dolum olduysa bu mumda hedefler...
+    if ev:                                            # ...dolum ONCESI ortalamaya gore (temkinli)
+        saved = list(s["filled"])
+        for kind, j in ev:
+            s["filled"][j] = False
+        pre_targets = st_targets(s)
+        s["filled"] = saved
+    # 2) stop
+    if touch(s["sl"]):
+        _st_close(s, 1.0, s["sl"], taker)
+        s.update(closed=True, exit=s["sl"], outcome="TP1_BE" if s["tp1_done"] else "SL")
+        ev.append(("BE" if s["tp1_done"] else "SL", s["sl"]))
+        return ev
+    # 3) hedefler
+    tp1, tp2 = pre_targets
+    if not s["tp1_done"] and reach(tp1):
+        frac = s["tp1_frac"] if tp1 != tp2 else 1.0
+        _st_close(s, frac, tp1, maker)
+        s["tp1_done"], s["cancelled"], s["tp1_px"] = True, True, tp1   # dolmayan kademeler iptal
+        ev.append(("TP1", tp1))
+        if s["rem"] <= 1e-9:
+            s.update(closed=True, exit=tp1, outcome="TP")
+            return ev
+        if s["move_be"]:
+            s["sl"] = st_avg(s)[0]
+    if s["tp1_done"] and not s["closed"] and reach(tp2):
+        _st_close(s, 1.0, tp2, maker)
+        s.update(closed=True, exit=tp2, outcome="TP")
+        ev.append(("TP2", tp2))
+    return ev
+
+
+def close_market(s, px, outcome="EXPIRED", taker=None):
+    taker = FEE_TAKER if taker is None else taker
+    _st_close(s, 1.0, px, taker)
+    s.update(closed=True, exit=px, outcome=outcome)
+
+
+def st_result(s, fees=True):
+    """(butce notional'ina gore net getiri, dolan agirlik, dolan kademe sayisi)."""
+    net = s["ret"] - (s["fee"] if fees else 0.0)
+    _, ws = st_avg(s)
+    return net, ws, sum(s["filled"])
+
+
+def evaluate(df):
+    """Son kapanmis mum icin sinyal + kademe plani; yoksa None."""
+    if len(df) < 3:
+        return None
+    prev, cur = df.iloc[-2], df.iloc[-1]
+    direction = trigger_direction(prev, cur)
+    if not direction:
+        return None
+    i = len(df) - 1
+    plan = plan_trade(df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy(),
+                      df["atr"].to_numpy(), i, direction)
+    if not plan:
+        log.debug("Sinyal var ama kademe/likidasyon kontrolunu gecemedi")
+        return None
+    s = new_state(plan)
+    tp1_e1, tp2_e1 = st_targets(s)
+    s_full = dict(s, filled=[True] * len(plan["entries"]))
+    tp1_full, tp2_full = st_targets(s_full)
+    plan.update(
+        candle_ts=cur["ts"], adx=float(cur["adx"]), k=float(cur["k"]), d=float(cur["d"]), vwap=float(cur["vwap"]),
+        tp1=tp1_e1, tp=tp2_e1, tp1_full=tp1_full, tp2_full=tp2_full, sl_pct=plan["sl_avg_pct"],
+    )
+    return plan
 
 
 def fmt_price(ex, symbol, price):
@@ -662,42 +899,79 @@ def fmt_price(ex, symbol, price):
         return f"{price:.8f}".rstrip("0").rstrip(".") if price < 1 else f"{price:.4f}"
 
 
+def current_balance():
+    """Hesap bakiyesi: ACCOUNT_BALANCE + (COMPOUND ise) takip edilen kapanmis islemlerin $ K/Z'si."""
+    if not COMPOUND:
+        return ACCOUNT_BALANCE
+    try:
+        return ACCOUNT_BALANCE + sum(t.get("usd", 0.0) for t in TRADES["closed"]
+                                     if t.get("closed_ms", 0) >= TRADES.get("balance_since_ms", 0))
+    except NameError:
+        return ACCOUNT_BALANCE
+
+
+def plan_margin():
+    """Bu islem icin toplam teminat (tum kademeler) ve kademe bazli tutarlar."""
+    slot = current_balance() * SLOT_FRACTION
+    total = slot * LADDER_ALLOC
+    return slot, total, [total * w for w in LADDER_WEIGHTS]
+
+
+def _usd(v):
+    return f"${v:,.0f}" if abs(v) >= 100 else f"${v:,.2f}"
+
+
+def worst_case_loss(sig):
+    """Tum kademeler dolup stop olursa butce notional'ina gore kayip orani (pozitif sayi)."""
+    sg = sig["sign"]
+    return sum(w * sg * (e - sig["sl"]) / e for e, w in zip(sig["entries"], sig["weights"]))
+
+
 def build_message(ex, symbol, sig):
     base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0])
     coin = f"{base}/USDT"
     now_tr = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M")
     p = lambda v: fmt_price(ex, symbol, v)
-    entries = sig.get("entries", [sig["entry"]])
-    head = (
+    entries = sig["entries"]
+    margins = sig.get("margins")
+    n = len(entries)
+    msg = (
         "🎯 YENİ KRİPTO SİNYALİ\n"
         f"📌 Coin: {coin}\n"
         f"📊 Yön: {sig['direction']}\n"
-        f"⚙️ İşlem Türü: {MARGIN_MODE}\n"
+        f"⚙️ İşlem Türü: {MARGIN_MODE} · {LEVERAGE}x\n"
         f"🕒 Zaman Dilimi: {TF_LABEL}\n"
     )
-    tail = (
-        f"⚙️ Örnek Kaldıraç: {LEVERAGE}x\n"
-        f"📅 {now_tr} TSİ"
-    )
-    if len(entries) == 1:
-        body = (
-            f"🟢 Giriş: {p(sig['entry'])}\n"
-            f"🔴 Stop: {p(sig['sl'])} (%{sig['sl_pct']:.2f} zarar)\n"
-            f"🎯 Hedef: {p(sig['tp'])}\n"
-            f"⚖️ Risk/Reward: {RR_RATIO:g}R\n"
-        )
+    if n == 1:
+        msg += f"🟢 Giriş: {p(entries[0])}" + (f" ({_usd(margins[0])})" if margins else "") + "\n"
     else:
-        lines = "".join(
-            f"🟢 Giriş {i + 1} (%{w * 100:.0f}): {p(e)}\n" for i, (e, w) in enumerate(zip(entries, sig["weights"]))
-        )
-        body = (
-            lines
-            + f"📍 Ortalama (hepsi dolarsa): {p(sig['avg_full'])}\n"
-            f"🔴 Stop: {p(sig['sl'])} (ort.'ya göre %{sig['avg_sl_pct']:.2f} zarar)\n"
-            f"🎯 Hedef: {p(sig['tp'])}\n"
-            f"⚖️ Risk/Reward: {RR_RATIO:g}R (1 kademe) → {sig['rr_full']:.1f}R ({len(entries)} kademe)\n"
-        )
-    return head + body + tail
+        msg += "━━ Kademeli giriş (limit emir) ━━\n"
+        for i, (e, w) in enumerate(zip(entries, sig["weights"])):
+            amt = f"{_usd(margins[i])} · %{w * 100:.0f}" if margins else f"%{w * 100:.0f}"
+            src = "sinyal fiyatı" if i == 0 else ("destek" if sig["direction"] == "LONG" else "direnç") \
+                if sig["supports"][i - 1] is not None else "ATR"
+            msg += f"🟢 Giriş {i + 1} ({amt}): {p(e)} · {src}\n"
+        msg += f"📍 Ortalama (hepsi dolarsa): {p(sig['avg_full'])}\n"
+    lev_loss = sig["sl_avg_pct"] * LEVERAGE
+    msg += (
+        f"🔴 Stop: {p(sig['sl'])} (ort.'ya göre %{sig['sl_avg_pct']:.2f} · {LEVERAGE}x ile ~%{lev_loss:.0f})\n"
+        f"☠️ Tahmini likidasyon: {p(sig['liq_full'])}" + (" (hepsi dolarsa)" if n > 1 else "") + "\n"
+        "━━ Kademeli kâr al ━━\n"
+        f"🎯 Hedef 1 (%{TP1_CLOSE_PCT:.0f} kapat): {p(sig['tp1'])}"
+        + (" → stop girişe çekilir\n" if MOVE_SL_TO_BE else "\n")
+        + f"🎯 Hedef 2 (kalan): {p(sig['tp'])}\n"
+    )
+    if n > 1:
+        msg += f"ℹ️ Hedefler kademe doldukça güncellenir (hepsi dolarsa {p(sig['tp1_full'])} / {p(sig['tp2_full'])})\n"
+    rr = abs(sig["tp2_full"] - sig["avg_full"]) / abs(sig["avg_full"] - sig["sl"])
+    msg += f"⚖️ Risk/Reward (hepsi dolarsa, Hedef 2): {rr:.1f}R\n"
+    if margins:
+        total_m = sum(margins)
+        loss = total_m * LEVERAGE * worst_case_loss(sig)
+        msg += (f"💵 Bütçe: {_usd(total_m)} (bakiye {_usd(sig['balance'])}) · "
+                f"maks. zarar: -{_usd(loss)} (bakiyenin %{loss / sig['balance'] * 100:.1f} kadarı)\n")
+    msg += f"⚙️ Örnek Kaldıraç: {LEVERAGE}x\n📅 {now_tr} TSİ"
+    return msg
 
 
 def in_cooldown(symbol):
@@ -783,13 +1057,16 @@ def dashboard_data():
     with _trade_lock:
         open_rows = []
         for t in TRADES["open"]:
-            avg, w, nf, n = _avg_filled(t)
+            st_ = _ensure_state(t)
+            avg, w = st_avg(st_)
+            tp1, tp2 = st_targets(st_)
             last = t.get("last_price")
-            sign = 1 if t["direction"] == "LONG" else -1
+            sign = st_["sign"]
             open_rows.append({
-                "coin": t["coin"], "direction": t["direction"], "avg_entry": avg, "entry1": t["entry"],
-                "sl": t["sl"], "tp": t["tp"], "filled": nf, "levels": n, "filled_weight": w,
-                "last_price": last, "opened_ms": t["opened_ms"],
+                "coin": t["coin"], "direction": t["direction"], "avg_entry": avg, "entry1": st_["entries"][0],
+                "sl": st_["sl"], "tp": tp2, "tp1": tp1, "tp1_done": st_["tp1_done"],
+                "filled": sum(st_["filled"]), "levels": len(st_["entries"]), "filled_weight": w,
+                "last_price": last, "opened_ms": t["opened_ms"], "margin": t.get("margin"),
                 "pnl_pct": (sign * (last - avg) / avg * 100) if last else None,
             })
         return {
@@ -798,8 +1075,11 @@ def dashboard_data():
             "bot": {
                 "last_scan_at": STATE["last_scan_at"], "last_scan_ok": STATE["last_scan_ok"],
                 "timeframe": TF_LABEL, "leverage": LEVERAGE, "margin_mode": MARGIN_MODE,
-                "rr": RR_RATIO, "levels": len(LADDER_WEIGHTS), "supertrend": USE_SUPERTREND,
+                "rr": f"TP {TP1_ATR:g}/{TP2_ATR:g} ATR", "levels": len(LADDER_WEIGHTS), "supertrend": USE_SUPERTREND,
+                "weights": [round(x * 100) for x in LADDER_WEIGHTS], "level_mode": LEVEL_MODE,
                 "persistent": _gist_enabled(), "dry_run": DRY_RUN,
+                "account_balance": ACCOUNT_BALANCE, "balance": current_balance(),
+                "margin_pct": SLOT_FRACTION * LADDER_ALLOC * 100, "max_open": MAX_OPEN_TRADES,
             },
             "open": open_rows,
             "closed": list(TRADES["closed"]),
@@ -813,41 +1093,33 @@ def has_open_trade(symbol):
 def register_trade(ex, symbol, sig, message_id):
     opened = sig["candle_ts"] + timedelta(minutes=TF_MINUTES)   # sinyal mumunun kapanis ani = giris ani
     base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0]) if ex.markets else symbol
-    entries = sig.get("entries", [sig["entry"]])
     trade = {
         "symbol": symbol, "coin": f"{base}/USDT", "direction": sig["direction"],
-        "entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"],
-        "entries": entries, "weights": sig.get("weights", [1.0]),
-        "filled": [True] + [False] * (len(entries) - 1),       # 1. kademe sinyal aninda alinmis sayilir
+        "entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"], "liq_full": sig.get("liq_full"),
+        "state": new_state(sig),
         "opened_ms": int(opened.timestamp() * 1000),
         "last_checked_ms": int(opened.timestamp() * 1000),
         "message_id": message_id,
+        "margin": sum(sig["margins"]) if sig.get("margins") else None,   # toplam butce teminati ($)
     }
     with _trade_lock:
         TRADES["open"].append(trade)
         save_trades(remote=True)
 
 
-def _ladder(t):
-    """Eski kayitlarla uyum: kademe alanlari yoksa tek giris varsay."""
+def _ensure_state(t):
+    """Onceki surumlerden kalan acik islemleri yeni motora cevirir (tek hedef, tam kapanis)."""
+    if "state" in t:
+        return t["state"]
     entries = t.get("entries") or [t["entry"]]
-    weights = t.get("weights") or [1.0] * len(entries)
-    filled = t.get("filled") or [True] + [False] * (len(entries) - 1)
-    return entries, weights, filled
-
-
-def _avg_filled(t):
-    entries, weights, filled = _ladder(t)
-    w = sum(wi for wi, f in zip(weights, filled) if f)
-    avg = sum(e * wi for e, wi, f in zip(entries, weights, filled) if f) / w
-    return avg, w, sum(filled), len(entries)
-
-
-def _pnl(t, exit_price):
-    """Dolan kisma gore % fiyat getirisi (ortalamaya gore) ve pozisyonun dolan orani."""
-    avg, w, nf, n = _avg_filled(t)
+    weights = t.get("weights") or [1.0 / len(entries)] * len(entries)
     sign = 1 if t["direction"] == "LONG" else -1
-    return sign * (exit_price - avg) / avg * 100, avg, w, nf, n
+    s = new_state({"direction": t["direction"], "sign": sign, "entries": entries, "weights": weights,
+                   "sl": t["sl"], "atr": 0.0}, tp1_frac=1.0, move_be=False)
+    s["filled"] = t.get("filled") or [True] + [False] * (len(entries) - 1)
+    s["tp_fixed"] = t["tp"]
+    t["state"] = s
+    return s
 
 
 def _fmt_duration(ms):
@@ -862,92 +1134,127 @@ def _signed(v, nd):
     return f"{'+' if v >= 0 else '-'}%{abs(v):.{nd}f}"
 
 
-def _close_message(ex, t, outcome, exit_price, now_ms):
-    pnl, avg, w, nf, n = _pnl(t, exit_price)
-    lev = pnl * LEVERAGE
-    st = TRADES["stats"]
-    total = st["tp"] + st["sl"]
-    winrate = (st["tp"] / total * 100) if total else 0
-    now_tr = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M")
-    p = lambda v: fmt_price(ex, t["symbol"], v)
+def _money_signed(v):
+    return f"{'+' if v >= 0 else '-'}{_usd(abs(v))}"
 
-    if outcome == "TP":
-        head, line = "✅ HEDEF GERÇEKLEŞTİ", f"🎯 Hedef: {p(t['tp'])}"
-        res = f"💰 Kâr: {_signed(pnl, 2)} ({LEVERAGE}x ile ~{_signed(lev, 1)})"
-    elif outcome == "SL":
-        head, line = "❌ STOP OLDU", f"🔴 Stop: {p(t['sl'])}"
-        res = f"📉 Zarar: {_signed(pnl, 2)} ({LEVERAGE}x ile ~{_signed(lev, 1)})"
-    else:
-        head, line = "⌛ SÜRE DOLDU (TP/Stop gelmedi)", f"💲 Son fiyat: {p(exit_price)}"
-        res = f"📊 Anlık sonuç: {_signed(pnl, 2)} ({LEVERAGE}x ile ~{_signed(lev, 1)})"
 
-    entry_line = f"🟢 Giriş: {p(avg)}" if n == 1 else \
-        f"🟢 Ortalama giriş: {p(avg)} ({nf}/{n} kademe · pozisyonun %{w * 100:.0f} kadarı)"
-    msg = (
-        f"{head}\n"
-        f"📌 Coin: {t['coin']}\n"
-        f"📊 Yön: {t['direction']}\n"
-        f"{entry_line}\n"
-        f"{line}\n"
-        f"{res}\n"
-    )
-    if n > 1 and nf < n:
-        msg += f"🚫 Dolmayan {n - nf} kademe emrini iptal et\n"
-    msg += (
-        f"⏱️ Süre: {_fmt_duration(now_ms - t['opened_ms'])}\n"
-        f"📈 Toplam: {st['tp']} TP / {st['sl']} Stop (Başarı %{winrate:.0f})\n"
-        f"📅 {now_tr} TSİ"
-    )
-    return msg
+def trade_usd(t, net):
+    if not t.get("margin"):
+        return None
+    return max(t["margin"] * LEVERAGE * net, -t["margin"])
 
 
 def _fill_message(ex, t, idx):
-    avg, w, nf, n = _avg_filled(t)
+    s = t["state"]
+    avg, ws = st_avg(s)
+    tp1, tp2 = st_targets(s)
+    nf, n = sum(s["filled"]), len(s["entries"])
     p = lambda v: fmt_price(ex, t["symbol"], v)
-    sl_pct = abs(avg - t["sl"]) / avg * 100
+    amt = f" ({_usd(t['margin'] * s['weights'][idx])})" if t.get("margin") else ""
     return (
-        f"➕ {idx + 1}. KADEME ALINDI\n"
+        f"➕ {idx + 1}. KADEME ALINDI{amt}\n"
         f"📌 Coin: {t['coin']} | {t['direction']}\n"
-        f"🟢 Giriş {idx + 1}: {p(t['entries'][idx])}\n"
-        f"📍 Yeni ortalama: {p(avg)} ({nf}/{n} kademe)\n"
-        f"🔴 Stop: {p(t['sl'])} (ort.'ya göre %{sl_pct:.2f})\n"
-        f"🎯 Hedef: {p(t['tp'])}\n"
+        f"🟢 Giriş {idx + 1}: {p(s['entries'][idx])}\n"
+        f"📍 Yeni ortalama: {p(avg)} ({nf}/{n} kademe · bütçenin %{ws * 100:.0f} kadarı)\n"
+        f"🔴 Stop: {p(s['sl'])} (ort.'ya göre %{abs(avg - s['sl']) / avg * 100:.2f})\n"
+        f"☠️ Tahmini likidasyon: {p(liq_price(avg, s['sign']))}\n"
+        f"🎯 Yeni hedefler: {p(tp1)} (%{s['tp1_frac'] * 100:.0f} kapat) / {p(tp2)}\n"
+        f"✏️ TP emirlerini yeni hedeflere taşı\n"
         f"📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ"
     )
 
 
+def _tp1_message(ex, t, px):
+    s = t["state"]
+    avg, _ = st_avg(s)
+    _, tp2 = st_targets(s)
+    net, _, _ = st_result(s)
+    usd = trade_usd(t, net)
+    p = lambda v: fmt_price(ex, t["symbol"], v)
+    n, nf = len(s["entries"]), sum(s["filled"])
+    msg = (
+        f"🎯 HEDEF 1 ALINDI · pozisyonun %{s['tp1_frac'] * 100:.0f} kadarı kapandı\n"
+        f"📌 Coin: {t['coin']} | {t['direction']}\n"
+        f"📍 Ortalama giriş: {p(avg)} · Hedef 1: {p(px)}\n"
+    )
+    if usd is not None:
+        msg += f"💵 Realize kâr: {_money_signed(usd)}\n"
+    if s["move_be"]:
+        msg += f"🛡 Stop girişe çekildi: {p(s['sl'])} (kalan pozisyon artık risksiz)\n"
+    if nf < n:
+        msg += f"🚫 Dolmayan {n - nf} kademe emrini iptal et\n"
+    msg += f"🎯 Kalan için Hedef 2: {p(tp2)}\n📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ"
+    return msg
+
+
+def _close_message(ex, t, now_ms):
+    s = t["state"]
+    avg, ws = st_avg(s)
+    net, ws, nf = st_result(s)
+    n = len(s["entries"])
+    pnl = net / ws * 100                          # dolan pozisyona gore % (fiyat bazli)
+    lev = pnl * LEVERAGE
+    usd = trade_usd(t, net)
+    st = TRADES["stats"]
+    total = st["tp"] + st["sl"]
+    winrate = (st["tp"] / total * 100) if total else 0
+    p = lambda v: fmt_price(ex, t["symbol"], v)
+    head = {
+        "TP": "✅ HEDEF 2 GERÇEKLEŞTİ · işlem tamamlandı",
+        "TP1_BE": "✅ HEDEF 1 + GİRİŞTE KAPANDI (kârda)",
+        "SL": "❌ STOP OLDU",
+        "EXPIRED": "⌛ SÜRE DOLDU (piyasadan kapatıldı)",
+    }.get(s["outcome"], s["outcome"])
+    msg = (
+        f"{head}\n"
+        f"📌 Coin: {t['coin']}\n"
+        f"📊 Yön: {t['direction']}\n"
+        f"🟢 Ortalama giriş: {p(avg)} ({nf}/{n} kademe)\n"
+        f"🏁 Son çıkış: {p(s['exit'])}\n"
+        f"{'💰' if net >= 0 else '📉'} Sonuç: {_signed(pnl, 2)} ({LEVERAGE}x ile ~{_signed(lev, 1)})\n"
+    )
+    if usd is not None:
+        msg += f"💵 {_money_signed(usd)} · Bakiye: {_usd(current_balance())}\n"
+    if s["outcome"] in ("SL", "EXPIRED") and nf < n and not s["cancelled"]:
+        msg += f"🚫 Dolmayan {n - nf} kademe emrini iptal et\n"
+    msg += (
+        f"⏱️ Süre: {_fmt_duration(now_ms - t['opened_ms'])}\n"
+        f"📈 Toplam: {st['tp']} kârlı / {st['sl']} stop (Başarı %{winrate:.0f})\n"
+        f"📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ"
+    )
+    return msg
+
+
 def check_trade(ex, t):
-    """1 dakikalik mumlarla kademe dolumlarini ve TP/SL'yi kontrol eder.
-    (sonuc, fiyat, yeni_dolan_kademeler) dondurur; sonuc: 'TP' | 'SL' | 'EXPIRED' | None."""
+    """1 dakikalik mumlari motora verir. Olay listesi doner (kapanis dahil)."""
+    s = _ensure_state(t)
     raw = with_retry(ex.fetch_ohlcv, t["symbol"], "1m", since=t["last_checked_ms"], limit=500,
                      desc=f"takip {t['symbol']}")
-    now_ms = int(time.time() * 1000)
-    entries, weights, filled = _ladder(t)
-    t["entries"], t["weights"], t["filled"] = entries, weights, filled
-    new_fills = []
-    last_close = None
+    events = []
     if raw:
-        long_ = t["direction"] == "LONG"
         for ts, o, h, l, c, v in raw:
             if ts + 60_000 <= t["opened_ms"]:
                 continue                       # giristen onceki mum
-            # 1) kademe dolumlari (kademeler stopun onunde oldugu icin stoptan once dokunulmus olur)
-            for i, ep in enumerate(entries):
-                if not filled[i] and ((l <= ep) if long_ else (h >= ep)):
-                    filled[i] = True
-                    new_fills.append(i)
-            # 2) stop / hedef (ayni mumda ikisi de varsa temkinli: Stop say)
-            if (l <= t["sl"]) if long_ else (h >= t["sl"]):
-                return "SL", t["sl"], new_fills
-            if (h >= t["tp"]) if long_ else (l <= t["tp"]):
-                return "TP", t["tp"], new_fills
-        t["last_checked_ms"] = int(raw[-1][0])   # son (acik olabilir) mumu sonraki kontrolde tekrar incele
-        last_close = float(raw[-1][4])
-        t["last_price"] = last_close
-
-    if MAX_TRADE_HOURS > 0 and now_ms - t["opened_ms"] > MAX_TRADE_HOURS * 3600_000 and last_close:
-        return "EXPIRED", last_close, new_fills
-    return None, None, new_fills
+            if ts + 60_000 > int(time.time() * 1000):
+                break                          # henuz kapanmamis mum: sonraki kontrolde
+            for kind, val in process_bar(s, h, l):
+                # mesaji olay anindaki duruma gore hazirla (ayni kontrolde islem kapansa bile dogru kalsin)
+                text = None
+                if kind == "FILL" and NOTIFY_ENTRY_FILLS:
+                    text = _fill_message(ex, t, val)
+                elif kind == "TP1" and not s["closed"]:
+                    text = _tp1_message(ex, t, val)
+                events.append((kind, val, text))
+            t["last_checked_ms"] = int(ts) + 60_000
+            if s["closed"]:
+                break
+        t["last_price"] = float(raw[-1][4])
+    now_ms = int(time.time() * 1000)
+    if not s["closed"] and MAX_TRADE_HOURS > 0 and now_ms - t["opened_ms"] > MAX_TRADE_HOURS * 3600_000 \
+            and t.get("last_price"):
+        close_market(s, t["last_price"])
+        events.append(("EXPIRED", t["last_price"], None))
+    return events
 
 
 def monitor_trades(ex):
@@ -957,35 +1264,41 @@ def monitor_trades(ex):
     changed = remote = False
     for t in list(TRADES["open"]):
         try:
-            outcome, price, new_fills = check_trade(ex, t)
-            changed = True                     # last_checked_ms / filled guncellendi
-            remote = remote or bool(new_fills)
-            if new_fills and NOTIFY_ENTRY_FILLS and outcome is None:
-                for i in new_fills:
-                    send_telegram(_fill_message(ex, t, i), reply_to=t.get("message_id"))
-                    log.info("KADEME DOLDU %s %d/%d", t["symbol"], i + 1, len(t["entries"]))
-            if not outcome:
+            events = check_trade(ex, t)
+            changed = True
+            s = t["state"]
+            for kind, val, text in events:
+                if kind == "FILL":
+                    remote = True
+                    log.info("KADEME DOLDU %s %d/%d", t["symbol"], val + 1, len(s["entries"]))
+                elif kind == "TP1":
+                    remote = True
+                    log.info("HEDEF 1 %s", t["symbol"])
+                if text:
+                    send_telegram(text, reply_to=t.get("message_id"))
+            if not s["closed"]:
                 continue
-            pnl, avg, w, nf, n = _pnl(t, price)
-            entries, weights, filled = _ladder(t)
-            sign = 1 if t["direction"] == "LONG" else -1
-            # tam planlanan pozisyona gore getiri (dolmayan kademeler 0 katki) -> dashboard $ hesabi icin
-            pos_ret = sum(wi * sign * (price - e) / e for e, wi, f in zip(entries, weights, filled) if f) * 100
+            net, ws, nf = st_result(s)
+            usd = trade_usd(t, net)
+            avg, _ = st_avg(s)
             with _trade_lock:
-                st = TRADES["stats"]
-                st[{"TP": "tp", "SL": "sl", "EXPIRED": "expired"}[outcome]] += 1
-                st["pnl_pct"] = round(st.get("pnl_pct", 0.0) + pnl, 4)
+                stt = TRADES["stats"]
+                key = {"TP": "tp", "TP1_BE": "tp", "SL": "sl", "EXPIRED": "expired"}.get(s["outcome"], "expired")
+                stt[key] = stt.get(key, 0) + 1
+                stt["pnl_pct"] = round(stt.get("pnl_pct", 0.0) + net / ws * 100, 4)
                 TRADES["open"].remove(t)
                 TRADES["closed"].append({
                     "symbol": t["symbol"], "coin": t["coin"], "direction": t["direction"],
-                    "outcome": outcome, "avg_entry": avg, "exit": price, "sl": t["sl"], "tp": t["tp"],
-                    "entry1": entries[0], "filled": nf, "levels": n, "filled_weight": w,
-                    "pnl_pct": round(pnl, 4), "pos_ret_pct": round(pos_ret, 4), "leverage": LEVERAGE,
-                    "opened_ms": t["opened_ms"], "closed_ms": now_ms,
+                    "outcome": s["outcome"], "avg_entry": avg, "exit": s["exit"], "sl": s["sl_orig"],
+                    "tp": t.get("tp"), "entry1": s["entries"][0], "filled": nf, "levels": len(s["entries"]),
+                    "filled_weight": ws, "tp1_hit": s["tp1_done"],
+                    "pnl_pct": round(net / ws * 100, 4), "pos_ret_pct": round(net * 100, 4), "net": True,
+                    "leverage": LEVERAGE, "opened_ms": t["opened_ms"], "closed_ms": now_ms,
+                    "margin": t.get("margin"), "usd": round(usd, 4) if usd is not None else None,
                 })
             remote = True
-            log.info("ISLEM KAPANDI %s %s -> %s (%.2f%%)", t["symbol"], t["direction"], outcome, pnl)
-            send_telegram(_close_message(ex, t, outcome, price, now_ms), reply_to=t.get("message_id"))
+            log.info("ISLEM KAPANDI %s %s -> %s (%.2f%%)", t["symbol"], t["direction"], s["outcome"], net / ws * 100)
+            send_telegram(_close_message(ex, t, now_ms), reply_to=t.get("message_id"))
         except Exception as e:
             log.exception("Islem takibinde hata (%s): %s", t.get("symbol"), e)
     if changed:
@@ -998,12 +1311,17 @@ def monitor_trades(ex):
 # ============================================================================
 def scan(ex):
     t0 = time.time()
+    free = (MAX_OPEN_TRADES - len(TRADES["open"])) if (TRACK_TRADES and MAX_OPEN_TRADES > 0) else 10**6
+    if free <= 0:
+        log.info("Tarama atlandi: %d/%d islem slotu dolu", len(TRADES["open"]), MAX_OPEN_TRADES)
+        return
     symbols = get_top_symbols(ex)
     if not symbols:
         raise RuntimeError("Sembol listesi alinamadi (borsa erisimi?)")
-    log.info("Tarama basladi: %d sembol", len(symbols))
+    log.info("Tarama basladi: %d sembol, %s bos slot", len(symbols), free if free < 10**6 else "sinirsiz")
 
-    found = 0
+    # 1) Tum coinleri tara, sinyalleri topla
+    candidates = []
     for sym in symbols:
         try:
             if in_cooldown(sym):
@@ -1015,11 +1333,24 @@ def scan(ex):
                 continue
             dfi = add_indicators(df)
             sig = evaluate(dfi)
-            if not sig:
-                continue
+            if sig:
+                candidates.append((sym, sig, dfi))
+                log.info("ADAY %s %s | ADX=%.1f K=%.1f D=%.1f", sym, sig["direction"], sig["adx"], sig["k"], sig["d"])
+        except Exception as e:  # tek coindeki hata tum taramayi durdurmasin
+            log.exception("%s islenirken hata: %s", sym, e)
+
+    # 2) Bos slot kadarini, trendi en guclu (ADX) olandan baslayarak gonder
+    candidates.sort(key=lambda c: c[1]["adx"], reverse=True)
+    found = 0
+    for sym, sig, dfi in candidates:
+        if found >= free:
+            log.info("Slot dolu, atlanan sinyal: %s %s (ADX %.1f)", sym, sig["direction"], sig["adx"])
+            continue
+        try:
+            slot, total, margins = plan_margin()
+            sig.update(balance=current_balance(), slot=slot, margins=margins)
             msg = build_message(ex, sym, sig)
-            log.info("SINYAL %s %s | ADX=%.1f K=%.1f D=%.1f ST=%s", sym, sig["direction"], sig["adx"],
-                     sig["k"], sig["d"], "UP" if dfi["st_dir"].iloc[-1] == 1 else "DOWN")
+            log.info("SINYAL %s %s | ADX=%.1f teminat=$%.0f", sym, sig["direction"], sig["adx"], total)
 
             msg_id = None
             if SEND_CHART:
@@ -1035,10 +1366,11 @@ def scan(ex):
                 found += 1
                 if TRACK_TRADES:
                     register_trade(ex, sym, sig, msg_id)
-        except Exception as e:  # tek coindeki hata tum taramayi durdurmasin
-            log.exception("%s islenirken hata: %s", sym, e)
+        except Exception as e:
+            log.exception("%s gonderilirken hata: %s", sym, e)
 
-    log.info("Tarama bitti: %d sinyal, %.1f sn | acik islem: %d", found, time.time() - t0, len(TRADES["open"]))
+    log.info("Tarama bitti: %d aday, %d sinyal, %.1f sn | acik islem: %d/%d", len(candidates), found,
+             time.time() - t0, len(TRADES["open"]), MAX_OPEN_TRADES)
 
 
 def next_scan_time():
@@ -1049,9 +1381,10 @@ def next_scan_time():
 
 
 def main():
-    log.info("Bot basliyor | TF=%s TOP_N=%d ADX>%.0f ATRx%.2f RR=%.2f Lev=%dx ST=%s Takip=%s DRY_RUN=%s",
-             TIMEFRAME, TOP_N_SYMBOLS, ADX_THRESHOLD, ATR_SL_MULT, RR_RATIO, LEVERAGE,
-             USE_SUPERTREND, TRACK_TRADES, DRY_RUN)
+    log.info("Bot basliyor | TF=%s TOP_N=%d ADX>%.0f Lev=%dx Kademe=%s (%s) TP=%g/%g ATR Slot=%d ST=%s DRY_RUN=%s",
+             TIMEFRAME, TOP_N_SYMBOLS, ADX_THRESHOLD, LEVERAGE,
+             "/".join(f"{w * 100:.0f}" for w in LADDER_WEIGHTS), LEVEL_MODE, TP1_ATR, TP2_ATR,
+             MAX_OPEN_TRADES, USE_SUPERTREND, DRY_RUN)
     start_health_server()
     if TRACK_TRADES:
         load_trades()
@@ -1230,7 +1563,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   <div class="card">
     <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Kapanan işlemler <small id="closedCount"></small>
       <span class="spacer"></span>
-      <span class="seg" id="ofilter"><button data-o="ALL" class="on">Tümü</button><button data-o="TP">TP</button><button data-o="SL">Stop</button><button data-o="EXPIRED">Süre doldu</button></span>
+      <span class="seg" id="ofilter"><button data-o="ALL" class="on">Tümü</button><button data-o="TP">Kârlı</button><button data-o="SL">Stop</button><button data-o="EXPIRED">Süre doldu</button></span>
     </h2>
     <div class="tablewrap"><table id="closedTbl"></table></div>
   </div>
@@ -1258,7 +1591,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   const price = v => v==null ? "—" : (v>=100 ? v.toLocaleString("tr-TR",{maximumFractionDigits:2}) : v>=1 ? v.toLocaleString("tr-TR",{maximumFractionDigits:4}) : v.toPrecision(5));
   const cls = v => v>0 ? "pos" : v<0 ? "neg" : "";
   const dur = ms => { const m=Math.floor(ms/60000), d=Math.floor(m/1440), h=Math.floor(m%1440/60), mm=m%60; return (d?d+"g ":"")+(h?h+"s ":"")+mm+"dk"; };
-  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ TP</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
+  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ Hedef 2</span>' : o==="TP1_BE" ? '<span class="badge b-tp">✓ Hedef 1 + giriş</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
+  const isWin = o => o==="TP" || o==="TP1_BE";
   const dirBadge = d => d==="LONG" ? '<span class="badge b-long">▲ LONG</span>' : '<span class="badge b-short">▼ SHORT</span>';
 
   function settings(){
@@ -1271,7 +1605,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     const lev = t.leverage || (S.data?.bot.leverage ?? 15);
     const notional = st.margin * lev;
     let v = notional * (t.pos_ret_pct ?? t.pnl_pct*(t.filled_weight??1)) / 100;
-    if (st.fees) v -= notional * (t.filled_weight ?? 1) * FEE_RT;
+    if (st.fees && !t.net) v -= notional * (t.filled_weight ?? 1) * FEE_RT;   // yeni kayitlarda komisyon zaten dusulu
     return Math.max(v, -st.margin);
   }
 
@@ -1288,7 +1622,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     if (!S.data) return;
     const d = S.data, st = settings();
     const b = d.bot;
-    $("cfg").textContent = `${b.timeframe} · ${b.leverage}x ${b.margin_mode} · R:R ${b.rr} · ${b.levels} kademe · SuperTrend ${b.supertrend?"açık":"kapalı"}${b.dry_run?" · DRY_RUN":""}`;
+    $("cfg").textContent = `${b.timeframe} · ${b.leverage}x ${b.margin_mode} · ${b.levels} kademe ${(b.weights||[]).join("/")} · ${b.rr} · en fazla ${b.max_open} işlem · SuperTrend ${b.supertrend?"açık":"kapalı"}${b.dry_run?" · DRY_RUN":""}`;
     $("persistWarn").style.display = b.persistent ? "none" : "block";
     const ok = b.last_scan_ok !== false;
     $("statusDot").className = "dot " + (ok ? "ok" : "err");
@@ -1296,7 +1630,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 
     const closed = filtered().slice().sort((a,b)=>a.closed_ms-b.closed_ms);
     const rows = closed.map(t => ({...t, usd: usd(t, st)}));
-    const tp = rows.filter(t=>t.outcome==="TP").length, sl = rows.filter(t=>t.outcome==="SL").length, ex = rows.filter(t=>t.outcome==="EXPIRED").length;
+    const tp = rows.filter(t=>isWin(t.outcome)).length, sl = rows.filter(t=>t.outcome==="SL").length, ex = rows.filter(t=>t.outcome==="EXPIRED").length;
     const net = rows.reduce((s,t)=>s+t.usd,0);
     const gw = rows.filter(t=>t.usd>0).reduce((s,t)=>s+t.usd,0), gl = -rows.filter(t=>t.usd<=0).reduce((s,t)=>s+t.usd,0);
     const pf = gl>0 ? gw/gl : (gw>0 ? Infinity : 0);
@@ -1308,7 +1642,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 
     const tiles = [
       ["Net kâr / zarar", `<span class="${cls(net)}">${money(net)}</span>`, `Bakiye ${money(st.bal+net,false)} · ${pct(net/st.bal*100,1)}`],
-      ["Kazanma oranı", rows.length ? `%${wr.toFixed(0)}` : "—", `${tp} TP · ${sl} Stop · ${ex} süre doldu`],
+      ["Kazanma oranı", rows.length ? `%${wr.toFixed(0)}` : "—", `${tp} kârlı · ${sl} stop · ${ex} süre doldu`],
       ["İşlem sayısı", `${rows.length}`, `${d.open.length} açık işlem`],
       ["Profit factor", rows.length ? (pf===Infinity?"∞":pf.toFixed(2)) : "—", "Toplam kâr ÷ toplam zarar"],
       ["Maks. düşüş", rows.length ? `%${mdd.toFixed(1)}` : "—", "Zirveden en büyük geri çekilme"],
@@ -1368,21 +1702,21 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   }
 
   function renderOpen(open, st){
-    $("openCount").textContent = open.length ? `(${open.length})` : "";
+    $("openCount").textContent = `(${open.length}${S.data.bot.max_open ? " / " + S.data.bot.max_open + " slot" : ""})`;
     if (!open.length){ $("openTbl").innerHTML = '<tr><td class="empty">Şu an açık işlem yok</td></tr>'; return; }
     const lev = S.data.bot.leverage;
-    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">${lev}x</th><th class="r">Süre</th></tr></thead><tbody>` +
+    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">${lev}x</th><th class="r">Süre</th></tr></thead><tbody>` +
       open.slice().sort((a,b)=>b.opened_ms-a.opened_ms).map(t => {
         const p = t.pnl_pct;
         return `<tr><td>${fmtTime(t.opened_ms)}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td>
-          <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.last_price)}</td><td class="r">${price(t.sl)}</td><td class="r">${price(t.tp)}</td>
+          <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.last_price)}</td><td class="r">${price(t.sl)}</td><td class="r">${t.tp1_done ? "✓ alındı" : price(t.tp1)}</td><td class="r">${price(t.tp)}</td>
           <td>${t.filled}/${t.levels}</td><td class="r ${cls(p)}">${p==null?"—":pct(p)}</td><td class="r ${cls(p)}">${p==null?"—":pct(p*lev,1)}</td>
           <td class="r">${dur(S.data.now_ms - t.opened_ms)}</td></tr>`;
       }).join("") + "</tbody>";
   }
 
   function renderClosed(rows){
-    const list = rows.filter(t => S.outcome==="ALL" || t.outcome===S.outcome).sort((a,b)=>b.closed_ms-a.closed_ms);
+    const list = rows.filter(t => S.outcome==="ALL" || t.outcome===S.outcome || (S.outcome==="TP" && t.outcome==="TP1_BE")).sort((a,b)=>b.closed_ms-a.closed_ms);
     $("closedCount").textContent = `(${list.length})`;
     if (!list.length){ $("closedTbl").innerHTML = '<tr><td class="empty">Bu filtrede kapanan işlem yok</td></tr>'; return; }
     const lev = S.data.bot.leverage;
@@ -1400,6 +1734,12 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       const r = await fetch("/api/data" + (KEY ? "?key="+encodeURIComponent(KEY) : ""), {cache:"no-store"});
       if (!r.ok) throw new Error(r.status);
       S.data = await r.json();
+      if (!S.inited){
+        S.inited = true;
+        let saved = null; try{ saved = localStorage.getItem("dash_settings"); }catch(e){}
+        const b = S.data.bot;
+        if (!saved && b.account_balance){ $("bal").value = b.account_balance; $("mpct").value = (+b.margin_pct).toFixed(1); }
+      }
       render();
     }catch(e){
       $("statusDot").className = "dot err";
