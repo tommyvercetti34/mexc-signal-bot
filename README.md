@@ -293,3 +293,15 @@ Her biri 15 dk (`_15m`) ve 1 saat (`_1h`) olarak: `ha_pb` (Heikin Ashi geri çek
 Hepsi yapısal stop + R hedefleri kullanır; yazarların tanımlamadığı ayrıntılar kod içindeki açıklamalarda yazılıdır.
 Toplu araştırma için:
 `RS_FAMILIES=ha_pb_15m,ha_pb_1h,harmony_15m,harmony_1h,impulse_15m,impulse_1h,diverg_15m,diverg_1h,ribbon_15m,ribbon_1h,tdseq_15m,tdseq_1h,cprofile_15m,cprofile_1h`
+
+## Fonlama araştırması (RS_MODE=funding)
+
+Binance'te hacimce ilk 30 coin (`RS_UNIVERSE=binance`, erişilemezse `RS_SYMBOLS`), MEXC fiyat + fonlama verisi.
+Sabit kurallı 3 strateji: mum profili (referans), mum profili + fonlama filtresi (fonlama coinin son 90 ödemesinin
+%90 üstünde ve pozitifken long yok; %10 altında ve negatifken short yok), fonlama aşırılığı dönüşü (1 saat).
+Tüm veri iki yarıya bölünür, her yarı ayrı raporlanır. Ayarlar: `RS_FUND_DAYS` (365), `RS_UNIVERSE_N` (30).
+
+## Piyasa anlık görüntüsü
+
+Bot saatte bir hacimce ilk 30 coinin fiyat, 24s hacim, açık pozisyon (OI) ve anlık fonlama oranını kaydeder;
+günde bir Gist'e `snap_YYYY-MM.csv` olarak yazar. Kapatmak için `SNAPSHOT=false`.

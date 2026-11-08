@@ -1377,6 +1377,8 @@ def candle_profile_arrays(d, params):
         hema = pd.Series(Hh).ewm(span=50, adjust=False).mean().to_numpy()
         l &= (Hh > hema) & (Hh > ho)
         s &= (Hh < hema) & (Hh < ho)
+    if int(params.get("fund", 0)):              # fiyat disi veri: fonlama asiriliginda kalabaligin tarafina girme
+        l, s = fund_filter(l, s, d)
     if int(params.get("td", 0)):                # birlesim 2: son 9 mumda TERS yonde TD 9 tukenmesi varsa girme
         tl, ts_, _ = td_arrays(d, {"mode": "9"})
         recent = lambda a: pd.Series(a.astype(float)).rolling(9, min_periods=1).max().to_numpy() > 0
@@ -1396,9 +1398,140 @@ def candle_profile_arrays(d, params):
     return l, s, stop
 
 
+# ============================================================================
+# FONLAMA ORANI (fiyat disi veri) - canli bot ve arastirma AYNI fonksiyonlari kullanir
+# ============================================================================
+def fetch_funding_history(ex, symbol, since_ms=None, max_pages=40):
+    """Gecmis fonlama odemeleri -> DataFrame(ts=odeme ani ms, fund). Yoksa None.
+    MEXC: sayfa numarasiyla (en yeniden geriye); Binance: since ile ileri."""
+    out = {}
+    if (getattr(ex, "id", "") or "").startswith("binance"):
+        since = since_ms or int((time.time() - 400 * 86400) * 1000)
+        for _ in range(max_pages):
+            rows = with_retry(ex.fetch_funding_rate_history, symbol, since, 1000, desc=f"funding {symbol}")
+            if not rows:
+                break
+            new = 0
+            for r in rows:
+                ts, fr = r.get("timestamp"), r.get("fundingRate")
+                if ts is not None and fr is not None and int(ts) not in out:
+                    out[int(ts)] = float(fr)
+                    new += 1
+            if not new or len(rows) < 2:
+                break
+            since = max(out) + 1
+    else:
+        for page in range(1, max_pages + 1):
+            rows = with_retry(ex.fetch_funding_rate_history, symbol, None, 100, {"page_num": page, "page_size": 100},
+                              desc=f"funding {symbol} p{page}")
+            if not rows:
+                break
+            new = 0
+            for r in rows:
+                ts, fr = r.get("timestamp"), r.get("fundingRate")
+                if ts is not None and fr is not None and int(ts) not in out:
+                    out[int(ts)] = float(fr)
+                    new += 1
+            if not new:                           # borsa sayfa parametresini yok sayiyorsa ayni veri doner
+                break
+            oldest = min(int(r["timestamp"]) for r in rows if r.get("timestamp") is not None)
+            if (since_ms and oldest <= since_ms) or len(rows) < 100:
+                break
+    if not out:
+        return None
+    return pd.DataFrame(sorted(out.items()), columns=["ts", "fund"])
+
+
+FUND_PCT_WINDOW = 90          # son 90 odeme (8 saatlik fonlamada ~30 gun)
+
+
+def attach_funding(d, fdf, tf_min):
+    """Her mumun KAPANISINDA bilinen son fonlama odemesi + o coinin son 90 odemelik %90 / %10 yuzdeligi.
+    Sutunlar: fund, fund_p90, fund_p10, fund_ts. Veri yoksa NaN (filtreler o zaman engellemez)."""
+    d = d.copy()
+    if fdf is None or not len(fdf):
+        for c in ("fund", "fund_p90", "fund_p10", "fund_ts"):
+            d[c] = np.nan
+        return d
+    f = fdf.sort_values("ts").reset_index(drop=True).copy()
+    f["fund_p90"] = f["fund"].rolling(FUND_PCT_WINDOW, min_periods=30).quantile(0.9)
+    f["fund_p10"] = f["fund"].rolling(FUND_PCT_WINDOW, min_periods=30).quantile(0.1)
+    f["fund_ts"] = f["ts"].astype("int64")
+    close_ms = _ts_ms(d) + int(tf_min) * 60_000
+    left = pd.DataFrame({"_ck": close_ms.astype("int64"), "_i": np.arange(len(d))})
+    m = pd.merge_asof(left.sort_values("_ck"), f[["ts", "fund", "fund_p90", "fund_p10", "fund_ts"]].astype({"ts": "int64"}),
+                      left_on="_ck", right_on="ts", direction="backward").sort_values("_i")
+    for c in ("fund", "fund_p90", "fund_p10", "fund_ts"):
+        d[c] = m[c].to_numpy()
+    return d
+
+
+def _fund_cols(d):
+    n = len(d)
+    get = lambda c: d[c].to_numpy().astype(float) if c in d else np.full(n, np.nan)
+    return get("fund"), get("fund_p90"), get("fund_p10"), get("fund_ts")
+
+
+def fundrev_arrays(d, params):
+    """Fonlama asiriligi + fiyat donusu (1 saat). Fonlama coinin son 90 odemelik %90 ustunde VE >= min (kalabalik long)
+    iken, odemeden sonraki 8 saat icinde bir mum son 3 mumun dibinin ALTINDA kapanirsa SHORT; tersi LONG.
+    Her odeme icin en fazla bir sinyal. Stop = son 12 mumun tepe/dibi, risk 0.75-3 ATR."""
+    thr = float(params.get("min", 0.0002))
+    H, L, C, A = (d[c].to_numpy().astype(float) for c in ("high", "low", "close", "atr"))
+    n = len(C)
+    fund, p90, p10, fts = _fund_cols(d)
+    close_ms = _ts_ms(d) + int(params.get("tf", 60)) * 60_000
+    l, s, stop = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    used = set()
+    for i in range(3, n):
+        if not (np.isfinite(fund[i]) and np.isfinite(p90[i]) and np.isfinite(fts[i]) and A[i] > 0):
+            continue
+        if close_ms[i] - fts[i] > 8 * 3600_000 or fts[i] in used:
+            continue
+        if fund[i] >= p90[i] and fund[i] >= thr and C[i] < L[i - 3:i].min():
+            s[i] = True
+        elif fund[i] <= p10[i] and fund[i] <= -thr and C[i] > H[i - 3:i].max():
+            l[i] = True
+        if l[i] or s[i]:
+            used.add(fts[i])
+            stop[i] = _swing_stop(L, H, A, i, 1 if l[i] else -1, C=C)
+    return l, s, stop
+
+
+def fund_filter(l, s, d):
+    """Kalabaligin tarafina binme: fonlama asiri pozitifken (>= %90 yuzdelik ve > 0) yeni LONG yok,
+    asiri negatifken (<= %10 ve < 0) yeni SHORT yok. Fonlama verisi yoksa engellemez."""
+    fund, p90, p10, _ = _fund_cols(d)
+    with np.errstate(invalid="ignore"):
+        bl = (fund >= p90) & (fund > 0)
+        bs = (fund <= p10) & (fund < 0)
+    return l & ~np.nan_to_num(bl, nan=0).astype(bool), s & ~np.nan_to_num(bs, nan=0).astype(bool)
+
+
+_fund_cache = {}
+
+
+def live_funding(ex, symbol):
+    """Canli: son ~100 fonlama odemesi (yuzdelik icin yeterli), 30 dk onbellek."""
+    c = _fund_cache.get(symbol)
+    if c and time.time() - c[0] < 1800:
+        return c[1]
+    f = None
+    try:
+        f = fetch_funding_history(ex, symbol, max_pages=1)
+    except Exception as e:
+        log.warning("Fonlama verisi alinamadi %s: %s", symbol, e)
+    _fund_cache[symbol] = (time.time(), f)
+    return f
+
+
+def needs_funding(spec):
+    return spec.get("family") == "fundrev" or bool(int((spec.get("params") or {}).get("fund", 0)))
+
+
 STRUCT_FAMILIES = {"sweep": None, "ha_pb": ha_pullback_arrays, "harmony": harmony_arrays, "impulse": impulse_arrays,
                    "diverg": divergence_arrays, "ribbon": ribbon_arrays, "tdseq": td_arrays,
-                   "cprofile": candle_profile_arrays}
+                   "cprofile": candle_profile_arrays, "fundrev": fundrev_arrays}
 STRUCT_REASONS = {
     "ha_pb": "📈 Heikin Ashi trend içi geri çekilme bitti (HA EMA50 {side}, ilk {col} HA mumu)",
     "harmony": "📈 Aşırı uzamadan sonra kapanışla teyitli toparlanma (Reversal Pressure)",
@@ -1407,6 +1540,7 @@ STRUCT_REASONS = {
     "ribbon": "📈 ALMA trend şeridi yön değiştirdi (Trend Target Ribbon)",
     "tdseq": "📈 TD Sequential tükenme sayımı tamamlandı",
     "cprofile": "📈 Mum profili baskınlığı + yükselen EMA21 (Candle Profile)",
+    "fundrev": "📈 Fonlama aşırı ({side}) ve fiyat dönüşü: kalabalığın tersine",
 }
 
 
@@ -1508,6 +1642,10 @@ STRAT_DEFS = {
                         "params": {"bands": 7, "ha": 1, "tp_r": [1.5, 3.0], "be": 0.0}},
     "cprofile_td_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili + TD tükenme filtresi", "max_hours": 24,
                         "params": {"bands": 7, "td": 1, "tp_r": [1.5, 3.0], "be": 0.0}},
+    "cprofile_fund_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili + fonlama filtresi", "max_hours": 24,
+                          "params": {"bands": 7, "fund": 1, "tp_r": [1.5, 3.0], "be": 0.0}},
+    "fundrev_1h": {"family": "fundrev", "tf": 60, "name": "Fonlama aşırılığı dönüşü", "max_hours": 48,
+                   "params": {"min": 0.0002, "tf": 60, "tp_r": [1.5, 3.0], "be": 0.0}},
     "scalein_15m": {"family": "scalein", "tf": 15, "name": "Kademeli dönüş (eski sistem)", "max_hours": MAX_TRADE_HOURS,
                     "params": {}},
 }
@@ -1636,6 +1774,8 @@ def evaluate_strategy(sid, df, btc, h1=None, spec=None):
             "tp1_atr": tp1_atr, "tp2_atr": tp2_atr, "be_atr": be_atr, "st_confirm": bool(int(p.get("st", 0)))}
     if fam in STRUCT_FAMILIES:
         plan["tp_r"] = [float(x) for x in p.get("tp_r", (1, 2))]
+    if "fund" in df and np.isfinite(float(df["fund"].iloc[-1])):
+        plan["fund"] = float(df["fund"].iloc[-1])
     if fam == "sweep":
         plan["level"] = float(sl + sign * 0.1 * atr)   # suepurulen uc nokta
         plan["htf"] = int(p.get("htf", 60))
@@ -1712,7 +1852,10 @@ def build_message_single(ex, symbol, sig):
                   f" · TP {sig['tp_r'][0]:g}R / {sig['tp_r'][1]:g}R")
     elif fam in STRUCT_REASONS:
         lg = sig["direction"] == "LONG"
-        reason = STRUCT_REASONS[fam].format(side="üstünde" if lg else "altında", col="yeşil" if lg else "kırmızı")
+        side = ("negatif" if lg else "pozitif") if fam == "fundrev" else ("üstünde" if lg else "altında")
+        reason = STRUCT_REASONS[fam].format(side=side, col="yeşil" if lg else "kırmızı")
+        if sig.get("fund") is not None:
+            reason += f" · fonlama %{sig['fund'] * 100:.4f}"
         reason += f" · TP {sig['tp_r'][0]:g}R / {sig['tp_r'][1]:g}R"
         if sig.get("st_agree") is not None:
             reason += " · SuperTrend " + ("aynı yönde ✓" if sig["st_agree"] else "ters yönde ✗")
@@ -2210,9 +2353,98 @@ def due_timeframes(t=None):
     return sorted({sp["tf"] for sp in ACTIVE_STRATEGIES.values() if m % sp["tf"] == 0})
 
 
+# ============================================================================
+# PIYASA ANLIK GORUNTUSU: acik pozisyon (OI) + fonlama + fiyat, saatte bir, ilk 30 coin
+# Ileride OI / fonlama stratejilerini test edebilmek icin veri biriktirir (gecmis OI bedava alinamiyor).
+# ============================================================================
+SNAPSHOT = _env("SNAPSHOT", "true").lower() in ("1", "true", "yes", "evet")
+SNAPSHOT_TOP = _env("SNAPSHOT_TOP", 30, int)
+_snap = {"hour": None, "rows": [], "day": None}
+SNAP_HEADER = "ts,coin,last,quote_vol,open_interest,funding\n"
+
+
+def _gist_append_csv(fname, text):
+    """Gist'teki aylik CSV dosyasina satir ekler (yoksa olusturur)."""
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    r = requests.get(url, headers=_gist_headers(), timeout=30)
+    old = ""
+    if r.status_code < 300:
+        f = r.json().get("files", {}).get(fname)
+        if f:
+            old = f.get("content") or ""
+            if f.get("truncated") and f.get("raw_url"):
+                old = requests.get(f["raw_url"], headers=_gist_headers(), timeout=60).text
+    body = (old if old else SNAP_HEADER) + text
+    w = requests.patch(url, headers=_gist_headers(), json={"files": {fname: {"content": body}}}, timeout=60)
+    if w.status_code >= 300:
+        raise RuntimeError(f"Gist {w.status_code}: {w.text[:150]}")
+
+
+def _flush_snapshots():
+    rows, _snap["rows"] = _snap["rows"], []
+    if not rows:
+        return
+    by_month = {}
+    for r in rows:
+        by_month.setdefault(datetime.fromtimestamp(r[0] / 1000, timezone.utc).strftime("%Y-%m"), []).append(r)
+    for month, rs in by_month.items():
+        text = "".join(",".join("" if v is None else str(v) for v in r) + "\n" for r in rs)
+        try:
+            fn = f"snap_{month}.csv"
+            new_file = not os.path.exists(fn)
+            with open(fn, "a", encoding="utf-8") as fh:
+                fh.write((SNAP_HEADER if new_file else "") + text)
+            if _gist_enabled():
+                _gist_append_csv(f"snap_{month}.csv", text)
+            log.info("Piyasa goruntusu kaydedildi: %d satir (%s)", len(rs), month)
+        except Exception as e:
+            log.error("Piyasa goruntusu kaydedilemedi: %s", e)
+            _snap["rows"] = rs + _snap["rows"]     # sonra tekrar dene
+
+
+def market_snapshot(ex):
+    """Saatte bir: ilk N coinin fiyat, 24s hacim, acik pozisyon ve anlik fonlama orani. Gunde bir Gist'e yazilir."""
+    if not SNAPSHOT:
+        return
+    now = datetime.now(timezone.utc)
+    hour = now.strftime("%Y-%m-%d %H")
+    if _snap["hour"] == hour:
+        return
+    _snap["hour"] = hour
+    tickers = with_retry(ex.fetch_tickers, desc="snapshot tickers") or {}
+    markets = ex.markets or {}
+    rows = []
+    for sym, t in tickers.items():
+        m = markets.get(sym) or {}
+        if not (m.get("swap") and m.get("quote") == "USDT") or m.get("base", "").upper() in EXCLUDE_SYMBOLS:
+            continue
+        info = t.get("info") or {}
+        qv = t.get("quoteVolume") or info.get("amount24")
+        try:
+            qv = float(qv)
+        except (TypeError, ValueError):
+            continue
+        oi = info.get("holdVol", info.get("openInterest"))
+        fr = info.get("fundingRate")
+        rows.append((qv, m.get("base"), t.get("last"), oi, fr))
+    rows.sort(key=lambda r: -r[0])
+    ts = int(now.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
+    _snap["rows"] += [(ts, b, last, round(qv), oi, fr) for qv, b, last, oi, fr in rows[:SNAPSHOT_TOP]]
+    day = now.strftime("%Y-%m-%d")
+    if _snap["day"] is None:
+        _snap["day"] = day
+    if day != _snap["day"] or len(_snap["rows"]) >= SNAPSHOT_TOP * 24:
+        _snap["day"] = day
+        threading.Thread(target=_flush_snapshots, daemon=True).start()
+
+
 def scan(ex, due=None):
     """due: taranacak zaman dilimleri (dk). None = aktif stratejilerin hepsi."""
     t0 = time.time()
+    try:
+        market_snapshot(ex)
+    except Exception as e:
+        log.warning("Piyasa goruntusu alinamadi: %s", e)
     due = set(due) if due is not None else {sp["tf"] for sp in ACTIVE_STRATEGIES.values()}
     strategies = [sp for sp in ACTIVE_STRATEGIES.values() if sp["tf"] in due]
     if not strategies:
@@ -2257,6 +2489,8 @@ def scan(ex, due=None):
                     if d1 is None:
                         continue
                     h1 = (float(d1["close"].iloc[-1]), float(d1["close"].ewm(span=50, adjust=False).mean().iloc[-1]))
+                if needs_funding(sp):
+                    dfi = attach_funding(dfi, live_funding(ex, sym), sp["tf"])
                 sig = evaluate_strategy(sp["id"], dfi, btc, h1, spec=sp)
                 if sig:
                     sig.setdefault("strategy", sp["id"])

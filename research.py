@@ -583,7 +583,7 @@ def format_report(bot, results, n_coins, t0, split, t1):
     return "\n".join(lines)
 
 
-def render_test_curves(bot, results):
+def render_test_curves(bot, results, title=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -605,7 +605,7 @@ def render_test_curves(bot, results):
         ax.plot([], [], color="#BDBDBD", linewidth=0.8, label=f"diğer {len(ranked) - len(colors)} strateji")
     ax.axhline(RS_BALANCE, color="#555", linewidth=0.8, linestyle=":")
     ax.grid(True, color="#E8E2C8")
-    ax.set_title(f"Doğrulama dönemi (görülmemiş veri) · ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem",
+    ax.set_title(title or f"Doğrulama dönemi (görülmemiş veri) · ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem",
                  loc="left", fontweight="bold", color="#333")
     ax.set_ylabel("Bakiye ($)")
     ax.legend(fontsize=8, frameon=False, loc="upper left")
@@ -622,6 +622,8 @@ def render_test_curves(bot, results):
 def run_and_report(bot):
     if RS_MODE == "combo":
         return run_combo_and_report(bot)
+    if RS_MODE == "funding":
+        return run_funding_and_report(bot)
     try:
         what = (f"uzun vade 4 saat, {RS_LONG_DAYS} gün, sabit coin listesi, {len(active_families())} strateji"
                 if RS_MODE == "long4h" else f"{RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi")
@@ -775,7 +777,8 @@ def format_combo_report(bot, rows, combo, n_coins, start, end):
     lines = [
         f"🧩 KOMBİNASYON TESTİ · {EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}",
         f"🗓 {f(start)} → {f(end)} ({(end - start).days} gün) · {n_coins} sabit coin",
-        "Bu dönem önceki araştırmalarda HİÇ kullanılmadı; ayarlar değiştirilmeden test edildi.",
+        ("Bu dönem önceki araştırmalarda HİÇ kullanılmadı; ayarlar değiştirilmeden test edildi." if RS_COMBO_END_DAYS_AGO >= 170
+         else "⚠️ Bu dönem standart araştırmada KULLANILDI (görülmemiş değil); ayarlar sabit tutuldu."),
         f"💼 ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem · en fazla {RS_MAX_OPEN or bot.MAX_OPEN_TRADES} işlem · "
         f"komisyon %{RS_MAKER * 100:g} / %{RS_TAKER * 100:g}",
         "",
@@ -840,3 +843,172 @@ def run_combo_and_report(bot):
     except Exception as e:
         log.exception("Kombinasyon testi hatasi: %s", e)
         bot.send_telegram(f"⚠️ Kombinasyon testi çalıştırılamadı: {e}")
+
+
+# ============================================================================
+# FONLAMA MODU (RS_MODE=funding): Binance'te hacimce ilk N coin, MEXC fiyat + fonlama verisi,
+# SABIT kurallar (ayar taramasi yok), tum veri iki yariya bolunup AYRI raporlanir.
+# ============================================================================
+RS_FUND_DAYS = _env("RS_FUND_DAYS", 365, int)
+RS_UNIVERSE = _env("RS_UNIVERSE", "binance").lower()          # binance | mexc | list (RS_SYMBOLS)
+RS_UNIVERSE_N = _env("RS_UNIVERSE_N", 30, int)
+FUND_STRATS = ["cprofile_15m", "cprofile_fund_15m", "fundrev_1h"]
+_STABLE = {"USDC", "FDUSD", "TUSD", "USDE", "DAI", "BUSD", "USDP", "USD1", "RLUSD", "PYUSD"}
+FUND_KEEP = ["ts", "open", "high", "low", "close", "atr", "adx", "st_dir", "close_time",
+             "fund", "fund_p90", "fund_p10", "fund_ts"]
+
+
+def universe_symbols(bot, ex_data):
+    """Coin listesi + kaynagi. binance: Binance USDT-M sureklilerinde 24s hacme gore ilk N (erisim yoksa RS_SYMBOLS)."""
+    mk = ex_data.markets or {}
+
+    def to_data_sym(base):
+        b = base.upper()
+        for cand in (b, b[4:] if b.startswith("1000") else None, b[7:] if b.startswith("1000000") else None,
+                     b[2:] if b.startswith("1M") else None):
+            if cand and f"{cand}/USDT:USDT" in mk:
+                return f"{cand}/USDT:USDT"
+        return None
+
+    if RS_UNIVERSE in ("binance", "mexc"):
+        try:
+            if RS_UNIVERSE == "binance":
+                bx = bot.ccxt.binanceusdm({"enableRateLimit": True, "timeout": 20000})
+                bx.load_markets()
+                tick = bx.fetch_tickers()
+                bm = bx.markets
+            else:
+                tick, bm = ex_data.fetch_tickers(), mk
+            ranked = []
+            for sym, t in tick.items():
+                m = bm.get(sym) or {}
+                base = (m.get("base") or "").upper()
+                if not (m.get("swap") and m.get("linear") and m.get("quote") == "USDT") or not base:
+                    continue
+                if base in _STABLE or base in bot.EXCLUDE_SYMBOLS or not m.get("active", True):
+                    continue
+                qv = t.get("quoteVolume") or 0
+                ranked.append((float(qv), base))
+            ranked.sort(reverse=True)
+            out, miss = [], []
+            for _, base in ranked:
+                ds = to_data_sym(base)
+                (out if ds else miss).append(ds or base)
+                if len(out) >= RS_UNIVERSE_N:
+                    break
+            if len(out) >= 5:
+                src = f"{EXCHANGE_NAMES.get(RS_UNIVERSE, RS_UNIVERSE)} hacim ilk {len(out)}"
+                if miss:
+                    src += f" (veride bulunmayan: {', '.join(miss[:6])})"
+                return out, src
+        except Exception as e:
+            log.warning("Coin listesi %s'ten alinamadi: %s", RS_UNIVERSE, e)
+            fail = f"{RS_UNIVERSE} erişilemedi ({type(e).__name__}) → RS_SYMBOLS listesi"
+        else:
+            fail = f"{RS_UNIVERSE} listesi yetersiz → RS_SYMBOLS listesi"
+    else:
+        fail = "RS_SYMBOLS listesi"
+    syms = [to_data_sym(b.strip()) for b in RS_SYMBOLS.split(",") if b.strip()]
+    return [s for s in syms if s][:RS_UNIVERSE_N], fail
+
+
+def load_data_funding(bot, ex, progress=None):
+    if not ex.markets:
+        if bot.with_retry(ex.load_markets, desc="load_markets") is None:
+            raise RuntimeError("piyasa listesi alinamadi")
+    syms, src = universe_symbols(bot, ex)
+    data, cover = {}, []
+    since_ms = int((time.time() - (RS_FUND_DAYS + 45) * 86400) * 1000)
+    for idx, sym in enumerate(syms, 1):
+        try:
+            df = fetch_15m(bot, ex, sym, RS_FUND_DAYS, tf_min=15, min_bars=WARMUP + 500)
+            if df is None:
+                continue
+            f = bot.fetch_funding_history(ex, sym, since_ms=since_ms)
+            if f is not None:
+                cover.append((sym.split("/")[0], len(f), int(f["ts"].iloc[0])))
+            d15 = bot.attach_funding(prep(bot, df, 15), f, 15)
+            d60 = bot.attach_funding(prep(bot, resample(df, 60), 60), f, 60)
+            data[sym] = {15: d15[[c for c in FUND_KEEP if c in d15]].copy(),
+                         60: d60[[c for c in FUND_KEEP if c in d60]].copy()}
+            del df, d15, d60, f
+            gc.collect()
+        except Exception as e:
+            log.warning("Fonlama modu veri hatasi %s: %s", sym, e)
+        if progress and idx % 5 == 0:
+            progress(f"{idx}/{len(syms)} coin")
+    return data, src, cover
+
+
+def run_funding(bot, ex=None, progress=None):
+    ex = ex or make_exchange(bot)
+    data, src, cover = load_data_funding(bot, ex, progress)
+    if not data:
+        raise RuntimeError("Hiçbir coin için 15 dk veri alınamadı")
+    t0 = min(fr[15]["close_time"].iloc[WARMUP] for fr in data.values())
+    t1 = max(fr[15]["close_time"].iloc[-1] for fr in data.values())
+    mid = t0 + (t1 - t0) / 2
+    end = t1 + pd.Timedelta(minutes=1)
+    rows = []
+    for sid in FUND_STRATS:
+        base = bot.STRAT_DEFS[sid]
+        p = dict(base["params"])
+        max_bars = int(base["max_hours"] * 60 / base["tf"])
+        trades = []
+        for sym, fr in data.items():
+            d = fr[base["tf"]]
+            l, s, score = bot.strategy_signal_arrays(base["family"], d, p, np.ones(len(d)), np.ones(len(d)))
+            trades += simulate(bot, sym, d, _dir_list(l, s, score), p, max_bars)
+        h1, h2, full = portfolio(bot, trades, t0, mid), portfolio(bot, trades, mid, end), portfolio(bot, trades, t0, end)
+        passed = (h1["n"] >= 30 and h2["n"] >= 30 and h1["pf"] >= 1.1 and h2["pf"] >= 1.1
+                  and full["t"] >= RS_MIN_T and full["max_dd"] <= 20)
+        rows.append({"sid": sid, "name": f"{base['name']} ({bot.TF_LABELS[base['tf']]})", "h1": h1, "h2": h2,
+                     "full": full, "passed": passed})
+    return rows, src, cover, len(data), t0, mid, t1
+
+
+def format_funding_report(bot, rows, src, cover, n, t0, mid, t1):
+    tz = bot.DISPLAY_TZ
+    f = lambda t: t.tz_convert(tz).strftime("%d.%m.%y")
+    line = lambda r: (f"PF {_pf(r['pf'])} · {r['n']} işlem · %{r['ret']:+.1f} · maks. düşüş %{r['max_dd']:.1f} · "
+                      f"t = {r['t']:.2f}")
+    fc = (f"{len(cover)}/{n} coinde fonlama verisi, en eskisi "
+          f"{pd.Timestamp(min(c[2] for c in cover), unit='ms', tz='UTC').tz_convert(tz):%d.%m.%y}" if cover
+          else "⚠️ FONLAMA VERİSİ ALINAMADI (fonlama stratejileri anlamsız)")
+    out = [f"💸 FONLAMA ARAŞTIRMASI · {EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)} verisi",
+           f"🗓 {f(t0)} → {f(t1)} · {n} coin ({src})",
+           f"📊 {fc}",
+           f"💼 ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem · en fazla {RS_MAX_OPEN or bot.MAX_OPEN_TRADES} işlem · "
+           f"komisyon %{RS_MAKER * 100:g} / %{RS_TAKER * 100:g}",
+           "Kurallar önceden sabitlendi, ayar taraması yok. Her yarı ayrı bakiyeyle ($2.000) başlar.", ""]
+    for i, r in enumerate(rows, 1):
+        out += [f"{i}) {r['name']} — {'✅ GEÇTİ' if r['passed'] else '❌ geçmedi'}",
+                f"   1. yarı ({f(t0)}–{f(mid)}): {line(r['h1'])}",
+                f"   2. yarı ({f(mid)}–{f(t1)}): {line(r['h2'])}",
+                f"   Tümü: işlem başı {r['full']['avg_r']:+.2f}R · t = {r['full']['t']:.2f} · "
+                f"LONG ${r['full']['long']:+,.0f} · SHORT ${r['full']['short']:+,.0f}", ""]
+    base, filt = rows[0], rows[1]
+    out.append(f"🔎 Fonlama filtresinin etkisi (tümü): {base['full']['n']} → {filt['full']['n']} işlem, "
+               f"işlem başı {base['full']['avg_r']:+.2f}R → {filt['full']['avg_r']:+.2f}R")
+    out.append("")
+    out.append(f"Geçti şartı: iki yarıda da ≥30 işlem ve PF ≥ 1.1, tümünde t ≥ {RS_MIN_T:g} ve maks. düşüş ≤ %20.")
+    out.append("⚠️ Coin listesi BUGÜNÜN hacmine göre seçildi (geçmişte popüler olmayanlar da var olabilir). "
+               "Funding ödemeleri ve kayma işlem sonucuna dahil değil.")
+    return "\n".join(out)
+
+
+def run_funding_and_report(bot):
+    try:
+        bot.send_telegram(f"💸 Fonlama araştırması başladı: {RS_UNIVERSE} hacim ilk {RS_UNIVERSE_N} coin, "
+                          f"{RS_FUND_DAYS} güne kadar geçmiş, {len(FUND_STRATS)} sabit strateji. 10-30 dakika sürebilir...")
+        t_start = time.time()
+        rows, src, cover, n, t0, mid, t1 = run_funding(bot)
+        report = format_funding_report(bot, rows, src, cover, n, t0, mid, t1)
+        log.info("Fonlama arastirmasi bitti (%.0f sn)\n%s", time.time() - t_start, report)
+        bot.send_telegram(report)
+        res = [{"family": {"name": r["name"]}, "test": r["full"], "passed": r["passed"]} for r in rows]
+        bot.send_telegram_photo(render_test_curves(bot, res, title=f"Fonlama araştırması · tüm dönem · ${RS_BALANCE:,.0f}"),
+                                "📈 Fonlama araştırması · sermaye eğrileri (tüm dönem)")
+    except Exception as e:
+        log.exception("Fonlama arastirmasi hatasi: %s", e)
+        bot.send_telegram(f"⚠️ Fonlama araştırması çalıştırılamadı: {e}")
