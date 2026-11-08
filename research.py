@@ -53,6 +53,7 @@ RS_MIN_TRADES = _env("RS_MIN_TRADES", 25, int)         # egitimde en az islem (a
 RS_MIN_TEST_TRADES = _env("RS_MIN_TEST_TRADES", 30, int)  # dogrulamada en az islem (t-testi icin alt sinir)
 RS_MIN_T = _env("RS_MIN_T", 2.5, float)                # dogrulamada islem basi getirinin t-istatistigi (sans elemesi;
                                                        # 9 strateji birlikte test edildigi icin coklu test duzeltmeli)
+RS_EXCHANGE = _env("RS_EXCHANGE", "mexc").lower()       # mexc | binance (veri ve coin listesi bu borsadan)
 RS_MAKER = _env("BT_MAKER_FEE", 0.0, float)
 RS_TAKER = _env("BT_TAKER_FEE", 0.0002, float)
 WARMUP = 220                                           # EMA200 isinmasi
@@ -289,7 +290,8 @@ def portfolio(bot, trades, start, end):
 # ============================================================================
 def load_data(bot, ex, progress=None):
     if not ex.markets:
-        bot.with_retry(ex.load_markets, desc="load_markets")
+        if bot.with_retry(ex.load_markets, desc="load_markets") is None:
+            raise RuntimeError(f"{EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)} piyasa listesi alinamadi (bolge/erisim kisitlamasi olabilir)")
     symbols = bot.get_top_symbols(ex, top_n=RS_TOP_N)
     btc = next((s for s in ex.markets if s.startswith("BTC/USDT")), None)
     if btc is None:
@@ -324,8 +326,18 @@ def load_data(bot, ex, progress=None):
     return data
 
 
+EXCHANGE_NAMES = {"mexc": "MEXC", "binance": "Binance"}
+
+
+def make_exchange(bot):
+    """Arastirma verisinin cekilecegi borsa. binance = Binance USDT-M vadeli (binanceusdm)."""
+    if RS_EXCHANGE == "binance":
+        return bot.ccxt.binanceusdm({"enableRateLimit": True, "timeout": 20000})
+    return bot.create_exchange()
+
+
 def run(bot, ex=None, progress=None):
-    ex = ex or bot.create_exchange()
+    ex = ex or make_exchange(bot)
     data = load_data(bot, ex, progress)
     t_all = [d[15]["close_time"] for d in data.values()]
     t0 = min(t.iloc[WARMUP] for t in t_all)
@@ -385,9 +397,10 @@ def format_report(bot, results, n_coins, t0, split, t1):
     tz = bot.DISPLAY_TZ
     f = lambda t: t.tz_convert(tz).strftime("%d.%m")
     lines = [
-        "🔬 STRATEJİ ARAŞTIRMASI",
+        f"🔬 STRATEJİ ARAŞTIRMASI · {EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}",
         f"🗓 {RS_DAYS} gün · {n_coins} coin · eğitim {f(t0)}–{f(split)} · doğrulama {f(split)}–{f(t1)}",
         f"💼 ${RS_BALANCE:,.0f} · işlem başı risk %{RS_RISK_PCT:g} · en fazla {RS_MAX_OPEN or bot.MAX_OPEN_TRADES} işlem · kaldıraç ≤{bot.LEVERAGE}x",
+        f"🧾 Komisyon: limit %{RS_MAKER * 100:g} · market %{RS_TAKER * 100:g}",
         "Ayar eğitimde seçildi, doğrulama verisini strateji hiç görmedi.",
         "",
     ]
@@ -453,7 +466,7 @@ def render_test_curves(bot, results):
 
 def run_and_report(bot):
     try:
-        bot.send_telegram(f"🔬 Strateji araştırması başladı: {RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi. "
+        bot.send_telegram(f"🔬 Strateji araştırması başladı ({EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}): {RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi. "
                           f"Veri indirme ve testler 10-20 dakika sürebilir...")
         t_start = time.time()
         results, n, t0, split, t1 = run(bot)
