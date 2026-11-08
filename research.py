@@ -658,6 +658,9 @@ COMBO_DEFAULTS = {
     "breakout_1h": {"lookback": 20, "st": 1, "sl": 2.5, "tp": [2.0, 5.0], "be": 0.0},
     "pullback_1h": {"rsi": 50, "st": 0, "sl": 1.5, "tp": [1.5, 3.0], "be": 0.0},
     "breakout_4h": {"lookback": 20, "st": 0, "sl": 2.0, "tp": [3.0, 9.0], "be": 0.0},
+    "cprofile_15m": {"bands": 7, "tp_r": [1.5, 3.0], "be": 0.0},
+    "cprofile_ha_15m": {"bands": 7, "ha": 1, "tp_r": [1.5, 3.0], "be": 0.0},
+    "cprofile_td_15m": {"bands": 7, "td": 1, "tp_r": [1.5, 3.0], "be": 0.0},
 }
 
 
@@ -714,7 +717,9 @@ def load_data_combo(bot, ex, tfs, progress=None):
         out = {}
         for tf, df in frames.items():
             if tf in tfs:
-                out[tf] = _slim(align(prep(bot, df, tf), b4, ["btc_up", "btc_dn"], ""))
+                dd = _slim(align(prep(bot, df, tf), b4, ["btc_up", "btc_dn"], ""))
+                cut = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=RS_COMBO_END_DAYS_AGO - 2)
+                out[tf] = dd[dd["close_time"] <= cut].reset_index(drop=True)   # pencere sonrasi gereksiz (bellek)
         if all(tf in out for tf in tfs):
             data[sym] = out
         gc.collect()
@@ -741,6 +746,7 @@ def run_combo(bot, ex=None, progress=None):
             for t in simulate(bot, sym, d, sigs, sp["params"], max_bars):
                 t["strategy"] = sp["sid"]
                 trades.append(t)
+        _SIG_CACHE.clear()
         res = portfolio(bot, trades, start, end)
         rows.append((sp, res))
         all_trades += trades

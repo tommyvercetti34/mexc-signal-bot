@@ -1310,11 +1310,11 @@ def td_arrays(d, params):
         sc = (sc + 1 if (sc > 0 or (C[i - 1] <= C[i - 5])) else 0) if up else 0
         sig = 0
         if bc == 9:
-            if mode == "9q" and min(L[i], L[i - 1]) <= min(L[i - 2], L[i - 3]):
+            if mode == "9" or (mode == "9q" and min(L[i], L[i - 1]) <= min(L[i - 2], L[i - 3])):
                 sig = 1
             cd[1], cd[-1] = 0, None
         if sc == 9:
-            if mode == "9q" and max(H[i], H[i - 1]) >= max(H[i - 2], H[i - 3]):
+            if mode == "9" or (mode == "9q" and max(H[i], H[i - 1]) >= max(H[i - 2], H[i - 3])):
                 sig = -1
             cd[-1], cd[1] = 0, None
         if mode == "13":
@@ -1368,6 +1368,20 @@ def candle_profile_arrays(d, params):
         conds[i] = dom <= -dom_th and nbear >= min_b and C[i] < ema[i] and ema[i] < ema[i - 1]
     l = condl & ~np.r_[False, condl[:-1]]
     s = conds & ~np.r_[False, conds[:-1]]
+    if int(params.get("ha", 0)):                # birlesim 1: Heikin Ashi trendi ayni yonde olmali
+        Hh = (O + H + L + C) / 4.0
+        ho = np.empty(n)
+        ho[0] = (O[0] + C[0]) / 2.0
+        for i in range(1, n):
+            ho[i] = (ho[i - 1] + Hh[i - 1]) / 2.0
+        hema = pd.Series(Hh).ewm(span=50, adjust=False).mean().to_numpy()
+        l &= (Hh > hema) & (Hh > ho)
+        s &= (Hh < hema) & (Hh < ho)
+    if int(params.get("td", 0)):                # birlesim 2: son 9 mumda TERS yonde TD 9 tukenmesi varsa girme
+        tl, ts_, _ = td_arrays(d, {"mode": "9"})
+        recent = lambda a: pd.Series(a.astype(float)).rolling(9, min_periods=1).max().to_numpy() > 0
+        l &= ~recent(ts_)                       # yukselis tukendi (satis kurulumu 9) -> long alma
+        s &= ~recent(tl)
     for arr in (l, s):                          # ayni yonde en az 'gap' mum ara
         last = -10**9
         for i in np.where(arr)[0]:
@@ -1487,9 +1501,13 @@ STRAT_DEFS = {
     "tdseq_1h": {"family": "tdseq", "tf": 60, "name": "TD Sequential", "max_hours": 72,
                     "params": {'mode': '9q', 'tp_r': [1.0, 2.0], 'be': 0.0}},
     "cprofile_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili", "max_hours": 24,
-                    "params": {'bands': 7, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+                    "params": {'bands': 7, 'tp_r': [1.5, 3.0], 'be': 0.0}},
     "cprofile_1h": {"family": "cprofile", "tf": 60, "name": "Mum profili", "max_hours": 72,
                     "params": {'bands': 7, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "cprofile_ha_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili + HA trend", "max_hours": 24,
+                        "params": {"bands": 7, "ha": 1, "tp_r": [1.5, 3.0], "be": 0.0}},
+    "cprofile_td_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili + TD tükenme filtresi", "max_hours": 24,
+                        "params": {"bands": 7, "td": 1, "tp_r": [1.5, 3.0], "be": 0.0}},
     "scalein_15m": {"family": "scalein", "tf": 15, "name": "Kademeli dönüş (eski sistem)", "max_hours": MAX_TRADE_HOURS,
                     "params": {}},
 }
