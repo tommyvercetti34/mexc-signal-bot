@@ -537,6 +537,8 @@ def render_test_curves(bot, results):
 
 
 def run_and_report(bot):
+    if RS_MODE == "combo":
+        return run_combo_and_report(bot)
     try:
         what = (f"uzun vade 4 saat, {RS_LONG_DAYS} gün, sabit coin listesi, {len(active_families())} strateji"
                 if RS_MODE == "long4h" else f"{RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi")
@@ -561,3 +563,180 @@ if __name__ == "__main__":
     with open("research_curves.png", "wb") as fh:
         fh.write(render_test_curves(bot, res))
     print("\nGrafik: research_curves.png")
+
+
+# ============================================================================
+# KOMBINASYON TESTI (RS_MODE=combo)
+# Secilmis stratejiler, AYARLARINA DOKUNULMADAN, daha once hic kullanilmamis bir donemde
+# (varsayilan: son 180 gunden ONCEKI 540 gun) tek tek ve birlikte test edilir. Optimizasyon yok.
+# ============================================================================
+RS_COMBO = _env("RS_COMBO", "breakout_1h,pullback_1h,breakout_4h")
+RS_COMBO_END_DAYS_AGO = _env("RS_COMBO_END_DAYS_AGO", 180, int)   # test penceresi bu kadar gun once biter
+RS_COMBO_DAYS = _env("RS_COMBO_DAYS", 540, int)                   # test penceresinin uzunlugu
+# Son 180 gunluk arastirmada (Binance seviyesi komisyon) secilen ayarlar:
+COMBO_DEFAULTS = {
+    "breakout_1h": {"lookback": 20, "st": 1, "sl": 2.5, "tp": [2.0, 5.0], "be": 0.0},
+    "pullback_1h": {"rsi": 50, "st": 0, "sl": 1.5, "tp": [1.5, 3.0], "be": 0.0},
+    "breakout_4h": {"lookback": 20, "st": 0, "sl": 2.0, "tp": [3.0, 9.0], "be": 0.0},
+}
+
+
+def combo_specs(bot):
+    import json as _json
+    try:
+        over = _json.loads(os.getenv("STRATEGY_PARAMS", "") or "{}")
+    except ValueError:
+        over = {}
+    specs = []
+    for sid in [s.strip() for s in RS_COMBO.split(",") if s.strip()]:
+        if sid not in bot.STRAT_DEFS or bot.STRAT_DEFS[sid]["family"] == "scalein":
+            log.warning("Kombinasyonda bilinmeyen/desteklenmeyen strateji atlandi: %s", sid)
+            continue
+        base = bot.STRAT_DEFS[sid]
+        p = {**base["params"], **COMBO_DEFAULTS.get(sid, {}), **(over.get(sid) or {})}
+        specs.append({"sid": sid, "family": base["family"], "tf": base["tf"], "params": p,
+                      "max_hours": float(p.pop("max_hours", base["max_hours"])) if "max_hours" in p else base["max_hours"],
+                      "name": f"{base['name']} ({bot.TF_LABELS[base['tf']]})"})
+    return specs
+
+
+def load_data_combo(bot, ex, tfs, progress=None):
+    """Sabit coin listesi icin 1s/4s mumlari dogrudan ceker (15dk gerekmez)."""
+    if not ex.markets:
+        if bot.with_retry(ex.load_markets, desc="load_markets") is None:
+            raise RuntimeError("piyasa listesi alinamadi")
+    btc = bot.btc_perp_symbol(ex)
+    syms = [f"{b.strip().upper()}/USDT:USDT" for b in RS_SYMBOLS.split(",") if b.strip()]
+    syms = [s for s in syms if s in ex.markets and s.split("/")[0] not in bot.EXCLUDE_SYMBOLS]
+    if btc not in syms:
+        syms.insert(0, btc)
+    days = RS_COMBO_END_DAYS_AGO + RS_COMBO_DAYS + 45          # + isinma payi
+    need = sorted(set(tfs) | {240})                            # BTC rejimi icin 4s her zaman
+    raw = {}
+    for idx, sym in enumerate(syms, 1):
+        for tf in need:
+            try:
+                df = fetch_15m(bot, ex, sym, days, tf_min=tf, min_bars=WARMUP + 100)
+                if df is not None:
+                    raw.setdefault(sym, {})[tf] = df
+            except Exception as e:
+                log.warning("Kombinasyon veri hatasi %s %s: %s", sym, tf, e)
+        if progress and idx % 5 == 0:
+            progress(f"{idx}/{len(syms)} coin")
+    if btc not in raw or 240 not in raw[btc]:
+        raise RuntimeError(f"BTC 4s verisi alinamadi ({btc})")
+    b4 = prep(bot, raw[btc][240], 240)
+    b4["btc_up"] = (b4["close"] > b4["ema50"]).astype(int)
+    b4["btc_dn"] = (b4["close"] < b4["ema50"]).astype(int)
+    data = {}
+    for sym in list(raw):
+        frames = raw.pop(sym)
+        out = {}
+        for tf, df in frames.items():
+            if tf in tfs:
+                out[tf] = _slim(align(prep(bot, df, tf), b4, ["btc_up", "btc_dn"], ""))
+        if all(tf in out for tf in tfs):
+            data[sym] = out
+        gc.collect()
+    return data
+
+
+def run_combo(bot, ex=None, progress=None):
+    ex = ex or make_exchange(bot)
+    specs = combo_specs(bot)
+    if not specs:
+        raise RuntimeError("RS_COMBO icinde gecerli strateji yok")
+    data = load_data_combo(bot, ex, sorted({s["tf"] for s in specs}), progress)
+    now = pd.Timestamp.now(tz="UTC")
+    end = now - pd.Timedelta(days=RS_COMBO_END_DAYS_AGO)
+    start = end - pd.Timedelta(days=RS_COMBO_DAYS)
+    all_trades, rows = [], []
+    for sp in specs:
+        fn = _shared(sp["family"])
+        max_bars = int(sp["max_hours"] * 60 / sp["tf"])
+        trades = []
+        for sym, frames in data.items():
+            d = frames[sp["tf"]]
+            sigs = [s for s in fn(bot, d, sp["params"]) if start <= d["close_time"].iloc[s[0]] < end]
+            for t in simulate(bot, sym, d, sigs, sp["params"], max_bars):
+                t["strategy"] = sp["sid"]
+                trades.append(t)
+        res = portfolio(bot, trades, start, end)
+        rows.append((sp, res))
+        all_trades += trades
+    combo = portfolio(bot, all_trades, start, end)
+    return rows, combo, len(data), start, end
+
+
+def format_combo_report(bot, rows, combo, n_coins, start, end):
+    tz = bot.DISPLAY_TZ
+    f = lambda t: t.tz_convert(tz).strftime("%d.%m.%y")
+    ok = combo["n"] >= RS_MIN_TEST_TRADES and combo["pf"] >= 1.1 and combo["t"] >= RS_MIN_T and combo["max_dd"] <= 20
+    lines = [
+        f"🧩 KOMBİNASYON TESTİ · {EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}",
+        f"🗓 {f(start)} → {f(end)} ({RS_COMBO_DAYS} gün) · {n_coins} sabit coin",
+        "Bu dönem önceki araştırmalarda HİÇ kullanılmadı; ayarlar değiştirilmeden test edildi.",
+        f"💼 ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem · en fazla {RS_MAX_OPEN or bot.MAX_OPEN_TRADES} işlem · "
+        f"komisyon %{RS_MAKER * 100:g} / %{RS_TAKER * 100:g}",
+        "",
+    ]
+    for sp, r in rows:
+        lines += [f"• {sp['name']}: PF {_pf(r['pf'])} · {r['n']} işlem · %{r['ret']:+.1f} · maks. düşüş %{r['max_dd']:.1f} · t = {r['t']:.2f}"]
+    lines += [
+        "",
+        f"🧩 BİRLİKTE: PF {_pf(combo['pf'])} · {combo['n']} işlem · %{combo['winrate']:.0f} kazanma · %{combo['ret']:+.1f} · "
+        f"maks. düşüş %{combo['max_dd']:.1f}",
+        f"   Anlamlılık: işlem başı {combo['avg_r']:+.2f}R · t = {combo['t']:.2f} (şart ≥ {RS_MIN_T:g})",
+        "",
+        ("✅ Kombinasyon görülmemiş dönemde de anlamlı şekilde kârlı. Canlı bota alıp önce kâğıt üzerinde takip edebiliriz."
+         if ok else
+         "❌ Kombinasyon görülmemiş dönemde güvenilir bir avantaj göstermedi; gerçek parayla işlem önerilmez."),
+        "⚠️ Geçmiş performans geleceği garanti etmez. Funding ve kayma dahil değil.",
+    ]
+    return "\n".join(lines), ok
+
+
+def render_combo_curves(bot, rows, combo):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    colors = ["#2962FF", "#43A047", "#E53935", "#8E24AA", "#FF9800"]
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=110)
+    fig.patch.set_facecolor("#FFFBE6")
+    ax.set_facecolor("#FFFBE6")
+    series = [(sp["name"], r) for sp, r in rows] + [("BİRLİKTE", combo)]
+    for (name, r), c in zip(series, colors[:len(rows)] + ["#111111"]):
+        cur = r["curve"]
+        if len(cur) < 2:
+            continue
+        x = [pd.Timestamp(t).tz_convert(bot.DISPLAY_TZ) for t, _ in cur]
+        ax.step(x, [e for _, e in cur], where="post", color=c, linewidth=2.6 if name == "BİRLİKTE" else 1.4,
+                label=f"{name} (${r['final']:,.0f})")
+    ax.axhline(RS_BALANCE, color="#555", linewidth=0.8, linestyle=":")
+    ax.grid(True, color="#E8E2C8")
+    ax.set_title(f"Kombinasyon · görülmemiş dönem · ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem",
+                 loc="left", fontweight="bold", color="#333")
+    ax.set_ylabel("Bakiye ($)")
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
+    for s in ax.spines.values():
+        s.set_color("#E8E2C8")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def run_combo_and_report(bot):
+    try:
+        bot.send_telegram(f"🧩 Kombinasyon testi başladı ({EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}): {RS_COMBO} · "
+                          f"{RS_COMBO_DAYS} günlük görülmemiş dönem. 5-20 dakika sürebilir...")
+        rows, combo, n, start, end = run_combo(bot)
+        report, _ = format_combo_report(bot, rows, combo, n, start, end)
+        log.info("Kombinasyon testi bitti\n%s", report)
+        bot.send_telegram(report)
+        bot.send_telegram_photo(render_combo_curves(bot, rows, combo), "📈 Kombinasyon · görülmemiş dönem")
+    except Exception as e:
+        log.exception("Kombinasyon testi hatasi: %s", e)
+        bot.send_telegram(f"⚠️ Kombinasyon testi çalıştırılamadı: {e}")
