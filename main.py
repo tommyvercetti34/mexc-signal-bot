@@ -391,8 +391,10 @@ def get_top_symbols(ex, top_n=None):
     return [s for s, _ in ranked[:(top_n or TOP_N_SYMBOLS)]]
 
 
-def fetch_closed_ohlcv(ex, symbol):
-    raw = with_retry(ex.fetch_ohlcv, symbol, TIMEFRAME, limit=OHLCV_LIMIT, desc=f"ohlcv {symbol}")
+def fetch_closed_ohlcv(ex, symbol, tf=None):
+    tf = tf or TF_MINUTES
+    code = {15: "15m", 60: "1h", 240: "4h"}.get(tf, TIMEFRAME)
+    raw = with_retry(ex.fetch_ohlcv, symbol, code, limit=OHLCV_LIMIT, desc=f"ohlcv {symbol} {code}")
     if not raw or len(raw) < 100:
         return None
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -402,7 +404,7 @@ def fetch_closed_ohlcv(ex, symbol):
         df[c] = df[c].astype(float)
     # Henuz kapanmamis son mumu at
     now = datetime.now(timezone.utc)
-    df = df[df["ts"] + timedelta(minutes=TF_MINUTES) <= now].reset_index(drop=True)
+    df = df[df["ts"] + timedelta(minutes=tf) <= now].reset_index(drop=True)
     return df if len(df) >= 100 else None
 
 
@@ -590,10 +592,11 @@ def render_chart(ex, symbol, df, sig):
         ax.text(x1 + 0.3, label_y[i], f" {label} {fmt_price(ex, symbol, price)} ", color="white", fontsize=7.5,
                 va="center", ha="left", fontweight="bold",
                 bbox=dict(boxstyle="square,pad=0.25", facecolor=color, edgecolor="none"))
-    if sig.get("strategy") == "breakout" and sig.get("level"):
-        x_lvl = max(0, n - 1 - BO_LOOKBACK)
+    if sig.get("family") == "breakout" and sig.get("level"):
+        lb = sig.get("lookback", BO_LOOKBACK)
+        x_lvl = max(0, n - 1 - lb)
         ax.hlines(sig["level"], x_lvl, n - 1, colors="#616161", linewidth=1.0, linestyles=":")
-        ax.text(x_lvl, sig["level"], f" kırılım seviyesi ({BO_LOOKBACK} mum) ", fontsize=7, color="#616161",
+        ax.text(x_lvl, sig["level"], f" kırılım seviyesi ({lb} mum) ", fontsize=7, color="#616161",
                 va="bottom", ha="left")
     # sinyal mumu isareti
     ax.annotate("▲" if sig["direction"] == "LONG" else "▼",
@@ -607,7 +610,8 @@ def render_chart(ex, symbol, df, sig):
 
     base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0]) if ex.markets else symbol
     dir_txt = "LONG" if sig["direction"] == "LONG" else "SHORT"
-    ax.set_title(f"{base}USDT · MEXC Futures · {TF_LABEL} · {dir_txt}   |   ADX {sig['adx']:.1f}",
+    ax.set_title(f"{base}USDT · MEXC Futures · {sig.get('tf_label', TF_LABEL)} · {dir_txt}   |   ADX {sig['adx']:.1f}"
+                 + (f"   |   {sig['strategy_name']}" if sig.get("strategy_name") else ""),
                  loc="left", fontsize=11, fontweight="bold", color="#333")
 
     # --- hacim ---
@@ -923,11 +927,28 @@ def evaluate_reversal(df):
 
 
 # ----------------------------------------------------------------------------
-# TREND KIRILIMI (STRATEGY=breakout) - research.py ile AYNI fonksiyon kullanilir
+# STRATEJI KAYDI - sinyal fonksiyonlari research.py ile ORTAK (test edilen = calisan)
 # ----------------------------------------------------------------------------
+def reversal_base_arrays(d):
+    """Donus tetigi (Stoch RSI kesisimi + VWAP + ADX + SuperTrend), vektorel. (long_, short, adx)."""
+    k, dd, adx = d["k"].to_numpy(), d["d"].to_numpy(), d["adx"].to_numpy()
+    pk, pd_ = np.r_[np.nan, k[:-1]], np.r_[np.nan, dd[:-1]]
+    c, vwap = d["close"].to_numpy(), d["vwap"].to_numpy()
+    st, st_dir = d["st"].to_numpy(), d["st_dir"].to_numpy()
+    with np.errstate(invalid="ignore"):
+        cross_up = (pk <= pd_) & (k > dd) & (np.maximum(pk, pd_) < STOCH_OVERSOLD)
+        cross_dn = (pk >= pd_) & (k < dd) & (np.minimum(pk, pd_) > STOCH_OVERBOUGHT)
+        strong = adx >= ADX_THRESHOLD
+        long_ = cross_up & (c > vwap) & strong
+        short = cross_dn & ~long_ & (c < vwap) & strong
+        if USE_SUPERTREND:
+            long_ &= (st_dir == 1) & ~np.isnan(st)
+            short &= (st_dir == -1) & ~np.isnan(st)
+    return long_, short, adx
+
+
 def breakout_signal_arrays(d, lookback, adx_min, btc_up, btc_dn):
-    """Vektorel kirilim sinyali. LONG: kapanis onceki N mumun tepesinin ustunde + EMA200 ustu + ADX>=min
-    + BTC 4s yukari rejim. SHORT: tersi. (long_, short) bool dizileri doner."""
+    """Kirilim: kapanis onceki N mumun tepesinin ustunde + EMA200 ustu + ADX>=min + BTC 4s yukari (SHORT tersi)."""
     hh = d["high"].rolling(lookback).max().shift(1).to_numpy()
     ll = d["low"].rolling(lookback).min().shift(1).to_numpy()
     c, e200, adx = d["close"].to_numpy(), d["ema200"].to_numpy(), d["adx"].to_numpy()
@@ -938,9 +959,108 @@ def breakout_signal_arrays(d, lookback, adx_min, btc_up, btc_dn):
     return np.nan_to_num(long_, nan=0).astype(bool), np.nan_to_num(short, nan=0).astype(bool)
 
 
+def pullback_signal_arrays(d, rsi_th, btc_up, btc_dn):
+    """Trend ici geri cekilme: EMA50>EMA200 trendinde son 2 mumda EMA20'ye degip ustunde kapanis + RSI esigi
+    yukari kesiyor + BTC 4s yukari (SHORT tersi)."""
+    c, lo, hi = d["close"].to_numpy(), d["low"].to_numpy(), d["high"].to_numpy()
+    e20 = d["close"].ewm(span=20, adjust=False).mean().to_numpy()
+    e50 = d["close"].ewm(span=50, adjust=False).mean().to_numpy()
+    e200 = d["ema200"].to_numpy()
+    rsi = calc_rsi(d["close"], 14).to_numpy()
+    prsi = np.r_[np.nan, rsi[:-1]]
+    up, dn = np.asarray(btc_up), np.asarray(btc_dn)
+    touch_lo = np.minimum(lo, np.r_[np.nan, lo[:-1]]) <= e20
+    touch_hi = np.maximum(hi, np.r_[np.nan, hi[:-1]]) >= e20
+    with np.errstate(invalid="ignore"):
+        long_ = (e50 > e200) & (c > e50) & touch_lo & (c > e20) & (prsi < rsi_th) & (rsi >= rsi_th) & (up == 1)
+        short = (e50 < e200) & (c < e50) & touch_hi & (c < e20) & (prsi > 100 - rsi_th) & (rsi <= 100 - rsi_th) \
+            & (dn == 1) & ~long_
+    return np.nan_to_num(long_, nan=0).astype(bool), np.nan_to_num(short, nan=0).astype(bool)
+
+
+def strategy_signal_arrays(family, d, params, btc_up, btc_dn, h1_close=None, h1_ema50=None):
+    """Tum aileler icin tek giris noktasi. (long_, short, skor)."""
+    adx = d["adx"].to_numpy()
+    up, dn = np.asarray(btc_up), np.asarray(btc_dn)
+    if family == "breakout":
+        l, s = breakout_signal_arrays(d, int(params["lookback"]), BO_ADX_MIN, up, dn)
+    elif family == "pullback":
+        l, s = pullback_signal_arrays(d, float(params["rsi"]), up, dn)
+    elif family in ("reversal_btc", "reversal_f", "reversal_raw"):
+        l, s, _ = reversal_base_arrays(d)
+        with np.errstate(invalid="ignore"):
+            if family in ("reversal_btc", "reversal_f"):
+                l = l & (up == 1)
+                s = s & (dn == 1)
+            if family == "reversal_f":
+                hc, he = np.asarray(h1_close), np.asarray(h1_ema50)
+                l = l & (hc > he)
+                s = s & (hc < he)
+        l, s = np.nan_to_num(l, nan=0).astype(bool), np.nan_to_num(s, nan=0).astype(bool) & ~np.nan_to_num(l, nan=0).astype(bool)
+    else:
+        raise ValueError(f"bilinmeyen strateji ailesi: {family}")
+    return l, s, adx
+
+
+TF_LABELS = {15: "15 Dakika", 60: "1 Saat", 240: "4 Saat"}
+TF_CODES = {15: "15m", 60: "1h", 240: "4h"}
+
+STRAT_DEFS = {
+    "breakout_1h": {"family": "breakout", "tf": 60, "name": "Trend kırılımı", "max_hours": BO_MAX_HOURS,
+                    "params": {"lookback": BO_LOOKBACK, "sl": BO_SL_ATR, "tp": [BO_TP1_ATR, BO_TP2_ATR], "be": BO_BE_ATR}},
+    "breakout_4h": {"family": "breakout", "tf": 240, "name": "Trend kırılımı", "max_hours": 240,
+                    "params": {"lookback": 20, "sl": 3.0, "tp": [3.0, 9.0], "be": 1.5}},
+    "pullback_1h": {"family": "pullback", "tf": 60, "name": "Trend içi geri çekilme", "max_hours": 72,
+                    "params": {"rsi": 50, "sl": 2.5, "tp": [1.5, 3.0], "be": 0.0}},
+    "pullback_4h": {"family": "pullback", "tf": 240, "name": "Trend içi geri çekilme", "max_hours": 240,
+                    "params": {"rsi": 50, "sl": 3.0, "tp": [3.0, 6.0], "be": 1.5}},
+    "reversal_15m": {"family": "reversal_f", "tf": 15, "name": "Dönüş + BTC/1s filtre", "max_hours": 48,
+                     "params": {"sl": 2.5, "tp": [2.0, 4.0], "be": 0.0}},
+    "reversal_1h": {"family": "reversal_btc", "tf": 60, "name": "Dönüş + BTC filtre", "max_hours": 96,
+                    "params": {"sl": 2.5, "tp": [2.0, 4.0], "be": 0.0}},
+    "scalein_15m": {"family": "scalein", "tf": 15, "name": "Kademeli dönüş (eski sistem)", "max_hours": MAX_TRADE_HOURS,
+                    "params": {}},
+}
+
+
+def _load_strategies():
+    raw = _env("STRATEGIES", "")
+    if not raw:
+        raw = "scalein_15m" if STRATEGY == "reversal" else ("breakout_4h" if TIMEFRAME == "4h" else "breakout_1h")
+    ids = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    bad = [x for x in ids if x not in STRAT_DEFS]
+    if bad:
+        logging.error("Bilinmeyen strateji(ler) yok sayildi: %s (gecerli: %s)", bad, ", ".join(STRAT_DEFS))
+    ids = [x for x in ids if x in STRAT_DEFS] or ["breakout_1h"]
+    try:
+        over = json.loads(_env("STRATEGY_PARAMS", "") or "{}")
+    except ValueError as e:
+        logging.error("STRATEGY_PARAMS JSON hatali, yok sayildi: %s", e)
+        over = {}
+    out = {}
+    for sid in ids:
+        spec = {**STRAT_DEFS[sid], "id": sid, "params": dict(STRAT_DEFS[sid]["params"])}
+        if isinstance(over.get(sid), dict):
+            o = dict(over[sid])
+            if "max_hours" in o:
+                spec["max_hours"] = float(o.pop("max_hours"))
+            spec["params"].update(o)
+        spec["tf_label"] = TF_LABELS.get(spec["tf"], f"{spec['tf']}dk")
+        out[sid] = spec
+    return out
+
+
+ACTIVE_STRATEGIES = _load_strategies()
+
+
+def strategy_label(sid):
+    sp = ACTIVE_STRATEGIES.get(sid) or {**STRAT_DEFS.get(sid, {"name": sid, "tf": 0}), "id": sid}
+    return f"{sp['name']} ({TF_LABELS.get(sp['tf'], '?')})"
+
+
 def safe_leverage(sl_dist):
     """Stop, likidasyondan once gelecek sekilde en yuksek kaldirac (en fazla LEVERAGE)."""
-    room = sl_dist * (1 + LIQ_BUFFER_PCT / 100.0 + 0.25) + MMR_PCT / 100.0   # stop mesafesi + %25 pay + bakim teminati
+    room = sl_dist * (1 + LIQ_BUFFER_PCT / 100.0 + 0.25) + MMR_PCT / 100.0
     return max(1, min(LEVERAGE, int(1.0 / room)))
 
 
@@ -966,15 +1086,26 @@ def btc_regime(ex):
     return val
 
 
-def evaluate_breakout(df, btc):
-    """Son kapanmis 1 saatlik mum icin kirilim sinyali + plan; yoksa None."""
-    if btc is None or len(df) < max(220, BO_LOOKBACK + 5):
+def evaluate_strategy(sid, df, btc, h1=None, spec=None):
+    """Son kapanmis mum icin strateji sinyali + tek girisli plan; yoksa None.
+    btc = (up, dn) son kapanmis 4s BTC rejimi; h1 = (close, ema50) son kapanmis 1s (reversal_15m icin)."""
+    spec = spec or ACTIVE_STRATEGIES.get(sid) or {**STRAT_DEFS[sid], "id": sid,
+                                                  "tf_label": TF_LABELS.get(STRAT_DEFS[sid]["tf"], "")}
+    fam, p = spec["family"], spec["params"]
+    if fam == "scalein":
+        return evaluate_reversal(df)
+    if btc is None or len(df) < 220:
         return None
     n = len(df)
-    up = np.zeros(n)
-    dn = np.zeros(n)
+    up, dn = np.zeros(n), np.zeros(n)
     up[-1], dn[-1] = btc
-    long_, short = breakout_signal_arrays(df, BO_LOOKBACK, BO_ADX_MIN, up, dn)
+    hc = he = None
+    if fam == "reversal_f":
+        if not h1:
+            return None
+        hc, he = np.full(n, np.nan), np.full(n, np.nan)
+        hc[-1], he[-1] = h1
+    long_, short, adx = strategy_signal_arrays(fam, df, p, up, dn, hc, he)
     if not (long_[-1] or short[-1]):
         return None
     cur = df.iloc[-1]
@@ -983,36 +1114,47 @@ def evaluate_breakout(df, btc):
     e, atr = float(cur["close"]), float(cur["atr"])
     if not (atr > 0 and e > 0):
         return None
-    sl = e - sign * BO_SL_ATR * atr
+    sl = e - sign * float(p["sl"]) * atr
     sl_dist = abs(e - sl) / e
     if sl_dist < 0.002 or sl_dist > 0.08:
         return None
     lev = safe_leverage(sl_dist)
+    tp1_atr, tp2_atr, be_atr = float(p["tp"][0]), float(p["tp"][1]), float(p.get("be", 0.0))
     plan = {"direction": direction, "sign": sign, "entry": e, "entries": [e], "weights": [1.0], "supports": [],
             "used_support": False, "compressed": False, "sl": sl, "atr": atr, "avg_full": e,
             "liq_full": liq_price(e, sign, lev), "sl_avg_pct": sl_dist * 100, "sl_e1_pct": sl_dist * 100,
-            "sl_dist": sl_dist, "leverage": lev, "strategy": "breakout",
-            "level": float(df["high"].iloc[-BO_LOOKBACK - 1:-1].max() if sign == 1 else df["low"].iloc[-BO_LOOKBACK - 1:-1].min())}
-    s = new_state(plan, tp1_atr=BO_TP1_ATR, tp2_atr=BO_TP2_ATR, tp1_frac=0.5, move_be=True, be_atr=BO_BE_ATR)
+            "sl_dist": sl_dist, "leverage": lev, "strategy": sid, "family": fam, "tf": spec["tf"],
+            "tf_label": spec["tf_label"], "strategy_name": spec["name"], "max_hours": spec["max_hours"],
+            "tp1_atr": tp1_atr, "tp2_atr": tp2_atr, "be_atr": be_atr}
+    if fam == "breakout":
+        lb = int(p["lookback"])
+        plan["level"] = float(df["high"].iloc[-lb - 1:-1].max() if sign == 1 else df["low"].iloc[-lb - 1:-1].min())
+        plan["lookback"] = lb
+    s = new_state(plan, tp1_atr=tp1_atr, tp2_atr=tp2_atr, tp1_frac=0.5, move_be=True, be_atr=be_atr)
     tp1, tp2 = st_targets(s)
     plan.update(candle_ts=cur["ts"], adx=float(cur["adx"]), k=float(cur["k"]), d=float(cur["d"]),
                 vwap=float(cur["vwap"]), tp1=tp1, tp=tp2, tp1_full=tp1, tp2_full=tp2, sl_pct=sl_dist * 100)
     return plan
 
 
-def evaluate(df, btc=None):
-    """Secili stratejiye gore sinyal + plan."""
-    if STRATEGY == "breakout":
-        return evaluate_breakout(df, btc)
-    return evaluate_reversal(df)
+def evaluate_breakout(df, btc):
+    """(geriye uyum) 1 saatlik trend kirilimi."""
+    return evaluate_strategy("breakout_1h", df, btc, spec={**STRAT_DEFS["breakout_1h"], "id": "breakout_1h",
+                                                          "tf_label": "1 Saat"})
+
+
+def evaluate(df, btc=None, h1=None):
+    """(geriye uyum) ilk aktif strateji."""
+    sid = next(iter(ACTIVE_STRATEGIES))
+    return evaluate_strategy(sid, df, btc, h1)
 
 
 def size_position(sig):
-    """Pozisyon buyuklugu. breakout: risk bazli (stop olursa bakiyenin RISK_PCT'si);
-    reversal: bakiye x slot x kademe agirliklari."""
+    """Pozisyon buyuklugu. Tek girisli stratejiler: risk bazli (stop olursa bakiyenin RISK_PCT'si);
+    kademeli eski sistem: bakiye x slot x kademe agirliklari."""
     bal = current_balance()
     slot = bal * SLOT_FRACTION
-    if sig.get("strategy") == "breakout":
+    if sig.get("family", "scalein") != "scalein" and "sl_dist" in sig:
         lev = sig["leverage"]
         notional = bal * RISK_PCT / 100.0 / sig["sl_dist"]
         margin = notional / lev
@@ -1025,37 +1167,50 @@ def size_position(sig):
                    risk_usd=notional * sig["sl_dist"])
     else:
         _, total, margins = plan_margin()
-        sig.update(balance=bal, slot=slot, margins=margins, notional=total * LEVERAGE, leverage=LEVERAGE)
+        sig.update(balance=bal, slot=slot, margins=margins, notional=total * LEVERAGE, leverage=LEVERAGE,
+                   strategy=sig.get("strategy", "scalein_15m"), family="scalein")
     return sig
 
 
-def build_message_breakout(ex, symbol, sig):
+def build_message_single(ex, symbol, sig):
     base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0])
     p = lambda v: fmt_price(ex, symbol, v)
     lev = sig["leverage"]
     margin = sig["margins"][0]
-    kind = "yukarı" if sig["direction"] == "LONG" else "aşağı"
+    fam = sig["family"]
+    if fam == "breakout":
+        kind = "yukarı" if sig["direction"] == "LONG" else "aşağı"
+        reason = (f"📈 Son {sig['lookback']} mumun {'tepesi' if sig['sign'] == 1 else 'dibi'} ({p(sig['level'])}) "
+                  f"{kind} kırıldı · ADX {sig['adx']:.0f}")
+    elif fam == "pullback":
+        reason = f"📈 Trend içinde EMA20'ye geri çekilme ve RSI dönüşü · ADX {sig['adx']:.0f}"
+    else:
+        zone = "aşırı satım" if sig["direction"] == "LONG" else "aşırı alım"
+        reason = f"📈 Stoch RSI {zone} bölgesinden dönüş · ADX {sig['adx']:.0f}"
     msg = (
-        "🎯 YENİ KRİPTO SİNYALİ · Trend kırılımı\n"
+        f"🎯 YENİ KRİPTO SİNYALİ · {sig['strategy_name']}\n"
         f"📌 Coin: {base}/USDT\n"
         f"📊 Yön: {sig['direction']}\n"
         f"⚙️ İşlem Türü: {MARGIN_MODE} · {lev}x\n"
-        f"🕒 Zaman Dilimi: {TF_LABEL}\n"
-        f"📈 Son {BO_LOOKBACK} mumun {'tepesi' if sig['sign'] == 1 else 'dibi'} ({p(sig['level'])}) {kind} kırıldı · ADX {sig['adx']:.0f}\n"
+        f"🕒 Zaman Dilimi: {sig['tf_label']}\n"
+        f"{reason}\n"
         f"🟢 Giriş: {p(sig['entry'])} (piyasa)\n"
         f"🔴 Stop: {p(sig['sl'])} (%{sig['sl_dist'] * 100:.2f} · {lev}x ile ~%{sig['sl_dist'] * 100 * lev:.0f})\n"
         f"☠️ Tahmini likidasyon: {p(sig['liq_full'])}\n"
         f"🎯 Hedef 1 (%50 kapat): {p(sig['tp1'])}\n"
         f"🎯 Hedef 2 (kalan): {p(sig['tp'])}\n"
     )
-    if BO_BE_ATR > 0:
-        msg += f"🛡 Fiyat {BO_BE_ATR:g} ATR lehe gidince stop girişe çekilir\n"
+    if sig.get("be_atr", 0) > 0:
+        msg += f"🛡 Fiyat {sig['be_atr']:g} ATR lehe gidince stop girişe çekilir\n"
     rr = abs(sig["tp"] - sig["entry"]) / abs(sig["entry"] - sig["sl"])
     msg += f"⚖️ Risk/Reward (Hedef 2): {rr:.1f}R\n"
     msg += (f"💵 Teminat: {_usd(margin)} → pozisyon {_usd(sig['notional'])} · "
             f"stop olursa -{_usd(sig['risk_usd'])} (bakiyenin %{sig['risk_usd'] / sig['balance'] * 100:.1f} kadarı)\n")
     msg += f"⚙️ Kaldıraç: {lev}x\n📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ"
     return msg
+
+
+build_message_breakout = build_message_single
 
 
 def fmt_price(ex, symbol, price):
@@ -1244,9 +1399,10 @@ def dashboard_data():
                 "timeframe": TF_LABEL, "leverage": LEVERAGE, "margin_mode": MARGIN_MODE,
                 "rr": f"TP {TP1_ATR:g}/{TP2_ATR:g} ATR", "levels": len(LADDER_WEIGHTS), "supertrend": USE_SUPERTREND,
                 "weights": [round(x * 100) for x in LADDER_WEIGHTS], "level_mode": LEVEL_MODE,
-                "strategy": STRATEGY, "risk_pct": RISK_PCT,
-                "strategy_label": (f"Trend kırılımı · {BO_LOOKBACK} mum · stop {BO_SL_ATR:g} ATR · TP {BO_TP1_ATR:g}/{BO_TP2_ATR:g} ATR · risk %{RISK_PCT:g}"
-                                   if STRATEGY == "breakout" else "Dönüş sistemi (kademeli)"),
+                "strategy": "multi" if len(ACTIVE_STRATEGIES) > 1 else next(iter(ACTIVE_STRATEGIES)), "risk_pct": RISK_PCT,
+                "strategies": {sid: strategy_label(sid) for sid in ACTIVE_STRATEGIES},
+                "strategy_names": {sid: strategy_label(sid) for sid in STRAT_DEFS},
+                "strategy_label": " + ".join(strategy_label(sid) for sid in ACTIVE_STRATEGIES) + f" · risk %{RISK_PCT:g}/işlem",
                 "persistent": _gist_enabled(), "dry_run": DRY_RUN,
                 "account_balance": ACCOUNT_BALANCE, "balance": current_balance(),
                 "margin_pct": SLOT_FRACTION * LADDER_ALLOC * 100, "max_open": MAX_OPEN_TRADES,
@@ -1266,10 +1422,12 @@ def register_trade(ex, symbol, sig, message_id):
     trade = {
         "symbol": symbol, "coin": f"{base}/USDT", "direction": sig["direction"],
         "entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"], "liq_full": sig.get("liq_full"),
-        "state": (new_state(sig, tp1_atr=BO_TP1_ATR, tp2_atr=BO_TP2_ATR, tp1_frac=0.5, move_be=True, be_atr=BO_BE_ATR)
-                  if sig.get("strategy") == "breakout" else new_state(sig)),
-        "strategy": sig.get("strategy", "reversal"), "leverage": sig.get("leverage", LEVERAGE),
-        "max_hours": BO_MAX_HOURS if sig.get("strategy") == "breakout" else MAX_TRADE_HOURS,
+        "state": (new_state(sig, tp1_atr=sig["tp1_atr"], tp2_atr=sig["tp2_atr"], tp1_frac=0.5, move_be=True,
+                            be_atr=sig["be_atr"])
+                  if sig.get("family", "scalein") != "scalein" else new_state(sig)),
+        "strategy": sig.get("strategy", "scalein_15m"), "family": sig.get("family", "scalein"),
+        "tf": sig.get("tf", 15), "leverage": sig.get("leverage", LEVERAGE),
+        "max_hours": sig.get("max_hours", MAX_TRADE_HOURS),
         "opened_ms": int(opened.timestamp() * 1000),
         "last_checked_ms": int(opened.timestamp() * 1000),
         "message_id": message_id,
@@ -1489,7 +1647,8 @@ def monitor_trades(ex):
                     "tp": t.get("tp"), "entry1": s["entries"][0], "filled": nf, "levels": len(s["entries"]),
                     "filled_weight": ws, "tp1_hit": s["tp1_done"],
                     "pnl_pct": round(net / ws * 100, 4), "pos_ret_pct": round(net * 100, 4), "net": True,
-                    "leverage": t.get("leverage", LEVERAGE), "strategy": t.get("strategy", "reversal"),
+                    "leverage": t.get("leverage", LEVERAGE), "strategy": t.get("strategy", "scalein_15m"),
+                    "family": t.get("family", "scalein"),
                     "opened_ms": t["opened_ms"], "closed_ms": now_ms,
                     "margin": t.get("margin"), "usd": round(usd, 4) if usd is not None else None,
                 })
@@ -1506,8 +1665,21 @@ def monitor_trades(ex):
 # ============================================================================
 # TARAMA DONGUSU
 # ============================================================================
-def scan(ex):
+def due_timeframes(t=None):
+    """Bu tarama aninda kapanmis olan zaman dilimleri (UTC hizali)."""
+    t = t or datetime.now(timezone.utc)
+    m = t.hour * 60 + t.minute
+    m -= m % 15                                   # 15dk sinirina yuvarla
+    return sorted({sp["tf"] for sp in ACTIVE_STRATEGIES.values() if m % sp["tf"] == 0})
+
+
+def scan(ex, due=None):
+    """due: taranacak zaman dilimleri (dk). None = aktif stratejilerin hepsi."""
     t0 = time.time()
+    due = set(due) if due is not None else {sp["tf"] for sp in ACTIVE_STRATEGIES.values()}
+    strategies = [sp for sp in ACTIVE_STRATEGIES.values() if sp["tf"] in due]
+    if not strategies:
+        return
     free = (MAX_OPEN_TRADES - len(TRADES["open"])) if (TRACK_TRADES and MAX_OPEN_TRADES > 0) else 10**6
     if free <= 0:
         log.info("Tarama atlandi: %d/%d islem slotu dolu", len(TRADES["open"]), MAX_OPEN_TRADES)
@@ -1516,48 +1688,65 @@ def scan(ex):
     if not symbols:
         raise RuntimeError("Sembol listesi alinamadi (borsa erisimi?)")
     btc = None
-    if STRATEGY == "breakout":
+    if any(sp["family"] != "scalein" for sp in strategies):
         btc = btc_regime(ex)
         if btc is None:
             raise RuntimeError("BTC 4s rejimi alinamadi")
-    log.info("Tarama basladi: %d sembol, %s bos slot%s", len(symbols), free if free < 10**6 else "sinirsiz",
+    log.info("Tarama: %s | %d sembol | %s bos slot%s", ", ".join(sp["id"] for sp in strategies), len(symbols),
+             free if free < 10**6 else "sinirsiz",
              f" | BTC rejim: {'YUKARI' if btc[0] else 'ASAGI' if btc[1] else 'NOTR'}" if btc else "")
 
-    # 1) Tum coinleri tara, sinyalleri topla
+    # 1) Tum coinleri ve bu anda kapanan zaman dilimlerinin stratejilerini tara
     candidates = []
     for sym in symbols:
-        try:
-            if in_cooldown(sym):
-                continue
-            if TRACK_TRADES and ONE_TRADE_PER_SYMBOL and has_open_trade(sym):
-                continue
-            df = fetch_closed_ohlcv(ex, sym)
-            if df is None:
-                continue
-            dfi = add_indicators(df)
-            sig = evaluate(dfi, btc)
-            if sig:
-                candidates.append((sym, sig, dfi))
-                log.info("ADAY %s %s | ADX=%.1f K=%.1f D=%.1f", sym, sig["direction"], sig["adx"], sig["k"], sig["d"])
-        except Exception as e:  # tek coindeki hata tum taramayi durdurmasin
-            log.exception("%s islenirken hata: %s", sym, e)
+        if in_cooldown(sym) or (TRACK_TRADES and ONE_TRADE_PER_SYMBOL and has_open_trade(sym)):
+            continue
+        cache = {}
 
-    # 2) Bos slot kadarini, trendi en guclu (ADX) olandan baslayarak gonder
-    candidates.sort(key=lambda c: c[1]["adx"], reverse=True)
+        def frame(tf):
+            if tf not in cache:
+                raw = fetch_closed_ohlcv(ex, sym, tf)
+                cache[tf] = add_indicators(raw) if raw is not None else None
+            return cache[tf]
+
+        for sp in strategies:
+            try:
+                dfi = frame(sp["tf"])
+                if dfi is None:
+                    continue
+                h1 = None
+                if sp["family"] == "reversal_f":
+                    d1 = frame(60)
+                    if d1 is None:
+                        continue
+                    h1 = (float(d1["close"].iloc[-1]), float(d1["close"].ewm(span=50, adjust=False).mean().iloc[-1]))
+                sig = evaluate_strategy(sp["id"], dfi, btc, h1, spec=sp)
+                if sig:
+                    sig.setdefault("strategy", sp["id"])
+                    sig.setdefault("tf", sp["tf"])
+                    sig.setdefault("tf_label", sp["tf_label"])
+                    sig.setdefault("strategy_name", sp["name"])
+                    candidates.append((sym, sig, dfi))
+                    log.info("ADAY %s %s %s | ADX=%.1f", sp["id"], sym, sig["direction"], sig["adx"])
+                    break                         # bu coin icin tek aday yeter
+            except Exception as e:                # tek coindeki hata tum taramayi durdurmasin
+                log.exception("%s / %s islenirken hata: %s", sym, sp["id"], e)
+
+    # 2) Bos slot kadarini gonder: once buyuk zaman dilimi, sonra trend gucu (ADX)
+    candidates.sort(key=lambda c: (c[1].get("tf", 0), c[1]["adx"]), reverse=True)
     found = 0
     for sym, sig, dfi in candidates:
         if found >= free:
-            log.info("Slot dolu, atlanan sinyal: %s %s (ADX %.1f)", sym, sig["direction"], sig["adx"])
+            log.info("Slot dolu, atlanan sinyal: %s %s %s", sig["strategy"], sym, sig["direction"])
             continue
         try:
             size_position(sig)
             if sum(sig["margins"]) <= 1:
                 log.info("Teminat yetersiz, sinyal atlandi: %s", sym)
                 continue
-            msg = build_message_breakout(ex, sym, sig) if sig.get("strategy") == "breakout" else build_message(ex, sym, sig)
-            log.info("SINYAL %s %s | ADX=%.1f teminat=$%.0f pozisyon=$%.0f", sym, sig["direction"], sig["adx"],
-                     sum(sig["margins"]), sig.get("notional", 0))
-
+            msg = build_message(ex, sym, sig) if sig.get("family") == "scalein" else build_message_single(ex, sym, sig)
+            log.info("SINYAL %s %s %s | ADX=%.1f teminat=$%.0f pozisyon=$%.0f", sig["strategy"], sym, sig["direction"],
+                     sig["adx"], sum(sig["margins"]), sig.get("notional", 0))
             msg_id = None
             if SEND_CHART:
                 try:
@@ -1579,15 +1768,22 @@ def scan(ex):
              time.time() - t0, len(TRADES["open"]), MAX_OPEN_TRADES)
 
 
+def scan_step_minutes():
+    return min(sp["tf"] for sp in ACTIVE_STRATEGIES.values())
+
+
 def next_scan_time():
+    step = scan_step_minutes()
     now = datetime.now(timezone.utc)
     minutes = now.hour * 60 + now.minute
-    next_boundary = (minutes // TF_MINUTES + 1) * TF_MINUTES
+    next_boundary = (minutes // step + 1) * step
     return now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=next_boundary, seconds=SCAN_DELAY_SEC)
 
 
 def main():
-    log.info("Strateji: %s | risk %%%g/islem | BTC rejim EMA%d (4s)", STRATEGY, RISK_PCT, BTC_REGIME_EMA)
+    for sid, sp in ACTIVE_STRATEGIES.items():
+        log.info("Strateji aktif: %s (%s) params=%s", sid, sp["tf_label"], sp["params"])
+    log.info("Risk %%%g/islem | en fazla %d islem | BTC rejim EMA%d (4s)", RISK_PCT, MAX_OPEN_TRADES, BTC_REGIME_EMA)
     log.info("Bot basliyor | TF=%s TOP_N=%d ADX>%.0f Lev=%dx Kademe=%s (%s) TP=%g/%g ATR Slot=%d ST=%s DRY_RUN=%s",
              TIMEFRAME, TOP_N_SYMBOLS, ADX_THRESHOLD, LEVERAGE,
              "/".join(f"{w * 100:.0f}" for w in LADDER_WEIGHTS), LEVEL_MODE, TP1_ATR, TP2_ATR,
@@ -1619,8 +1815,8 @@ def main():
 
     if SEND_STARTUP_MESSAGE:
         extra =f", {len(TRADES['open'])} açık işlem takipte" if TRACK_TRADES and TRADES["open"] else ""
-        strat = "Trend kırılımı" if STRATEGY == "breakout" else "Dönüş sistemi"
-        send_telegram(f"🤖 Sinyal botu başlatıldı · {strat} · {TF_LABEL} · MEXC Futures{extra}.")
+        strat = " + ".join(strategy_label(sid) for sid in ACTIVE_STRATEGIES)
+        send_telegram(f"🤖 Sinyal botu başlatıldı · {strat} · MEXC Futures{extra}.")
 
     next_scan = datetime.now(timezone.utc) if RUN_SCAN_ON_START else next_scan_time()
     log.info("Ilk tarama: %s", next_scan.astimezone(DISPLAY_TZ).strftime("%H:%M:%S"))
@@ -1642,7 +1838,13 @@ def main():
 
             # 2) Mum kapanisinda tara
             if datetime.now(timezone.utc) >= next_scan:
-                scan(ex)
+                if STATE["last_scan_at"] is None:     # acilis: sadece son 20 dk icinde kapanan zaman dilimleri
+                    nm = datetime.now(timezone.utc)
+                    mm = nm.hour * 60 + nm.minute
+                    due = [sp["tf"] for sp in ACTIVE_STRATEGIES.values() if mm % sp["tf"] <= 20]
+                else:
+                    due = due_timeframes(next_scan - timedelta(seconds=SCAN_DELAY_SEC))
+                scan(ex, due)
                 STATE["last_scan_at"] = datetime.now(timezone.utc).isoformat()
                 STATE["last_scan_ok"] = True
                 next_scan = next_scan_time()
@@ -1771,6 +1973,11 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="card" id="stratCard" style="margin-bottom:16px;display:none">
+    <h2>Strateji bazında sonuçlar</h2>
+    <div class="tablewrap"><table id="stratTbl"></table></div>
+  </div>
+
   <div class="card" style="margin-bottom:16px">
     <h2>Açık işlemler <small id="openCount"></small></h2>
     <div class="tablewrap"><table id="openTbl"></table></div>
@@ -1819,7 +2026,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 
   function usd(t, st){
     // risk bazli islemler: botun gercek $ sonucunu girilen bakiyeye oranla
-    if (t.usd != null && t.strategy === "breakout") return t.usd * st.bal / (S.data?.bot.account_balance || st.bal);
+    if (t.usd != null && t.strategy && t.family !== "scalein" && t.strategy !== "reversal") return t.usd * st.bal / (S.data?.bot.account_balance || st.bal);
     const lev = t.leverage || (S.data?.bot.leverage ?? 15);
     const notional = st.margin * lev;
     let v = notional * (t.pos_ret_pct ?? t.pnl_pct*(t.filled_weight??1)) / 100;
@@ -1840,8 +2047,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     if (!S.data) return;
     const d = S.data, st = settings();
     const b = d.bot;
-    $("cfg").textContent = b.strategy === "breakout"
-      ? `${b.timeframe} · ${b.strategy_label} · en fazla ${b.max_open} işlem${b.dry_run?" · DRY_RUN":""}`
+    $("cfg").textContent = b.strategy !== "scalein_15m"
+      ? `${b.strategy_label} · en fazla ${b.max_open} işlem${b.dry_run?" · DRY_RUN":""}`
       : `${b.timeframe} · ${b.leverage}x ${b.margin_mode} · ${b.levels} kademe ${(b.weights||[]).join("/")} · ${b.rr} · en fazla ${b.max_open} işlem · SuperTrend ${b.supertrend?"açık":"kapalı"}${b.dry_run?" · DRY_RUN":""}`;
     $("persistWarn").style.display = b.persistent ? "none" : "block";
     const ok = b.last_scan_ok !== false;
@@ -1873,6 +2080,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     drawEquity(curve, st);
     drawCoins(rows);
     renderOpen(d.open, st);
+    renderStrategies(rows);
     renderClosed(rows);
   }
 
@@ -1921,14 +2129,31 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     coinChart = new Chart($("coinChart"), cfg);
   }
 
+  function renderStrategies(rows){
+    const names = S.data.bot.strategy_names || {};
+    const by = {};
+    rows.forEach(t => { const k = t.strategy || "scalein_15m"; (by[k] ??= []).push(t); });
+    const keys = Object.keys(by);
+    const card = $("stratCard");
+    if (!keys.length){ card.style.display = "none"; return; }
+    card.style.display = "block";
+    $("stratTbl").innerHTML = `<thead><tr><th>Strateji</th><th class="r">İşlem</th><th class="r">Kazanma</th><th class="r">Profit factor</th><th class="r">Net $</th></tr></thead><tbody>` +
+      keys.map(k => {
+        const r = by[k], w = r.filter(t=>t.usd>0).reduce((a,t)=>a+t.usd,0), l = -r.filter(t=>t.usd<=0).reduce((a,t)=>a+t.usd,0);
+        const tp = r.filter(t=>isWin(t.outcome)).length, sl = r.filter(t=>t.outcome==="SL").length, net = w - l;
+        const pf = l>0 ? (w/l).toFixed(2) : (w>0 ? "∞" : "—");
+        return `<tr><td><b>${esc(names[k] || k)}</b></td><td class="r">${r.length}</td><td class="r">${(tp+sl)?"%"+(tp/(tp+sl)*100).toFixed(0):"—"}</td><td class="r">${pf}</td><td class="r ${cls(net)}"><b>${money(net)}</b></td></tr>`;
+      }).join("") + "</tbody>";
+  }
+
   function renderOpen(open, st){
     $("openCount").textContent = `(${open.length}${S.data.bot.max_open ? " / " + S.data.bot.max_open + " slot" : ""})`;
     if (!open.length){ $("openTbl").innerHTML = '<tr><td class="empty">Şu an açık işlem yok</td></tr>'; return; }
     const lev = S.data.bot.leverage;
-    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">Kaldıraçlı</th><th class="r">Süre</th></tr></thead><tbody>` +
+    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Strateji</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">Kaldıraçlı</th><th class="r">Süre</th></tr></thead><tbody>` +
       open.slice().sort((a,b)=>b.opened_ms-a.opened_ms).map(t => {
         const p = t.pnl_pct;
-        return `<tr><td>${fmtTime(t.opened_ms)}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td>
+        return `<tr><td>${fmtTime(t.opened_ms)}</td><td>${esc((S.data.bot.strategy_names||{})[t.strategy] || "—")}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td>
           <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.last_price)}</td><td class="r">${price(t.sl)}</td><td class="r">${t.tp1_done ? "✓ alındı" : price(t.tp1)}</td><td class="r">${price(t.tp)}</td>
           <td>${t.filled}/${t.levels}</td><td class="r ${cls(p)}">${p==null?"—":pct(p)}</td><td class="r ${cls(p)}">${p==null?"—":pct(p*(t.leverage||lev),1)}</td>
           <td class="r">${dur(S.data.now_ms - t.opened_ms)}</td></tr>`;

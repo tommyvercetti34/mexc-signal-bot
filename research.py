@@ -10,6 +10,7 @@ Aileler:
   2) Trend ici geri cekilme (1 saat): EMA50>EMA200 trendinde EMA20'ye geri cekilme + RSI donusu + BTC rejimi
   3) Donus sinyali + filtre (15 dk): mevcut Stoch RSI tetigi + BTC 4s rejimi + 1 saatlik trend
   4) Mevcut sistem (15 dk): referans
+  5) Trend kirilimi (4 saat)   6) Trend ici geri cekilme (4 saat)   7) Donus sinyali + BTC filtre (1 saat)
 
 Pozisyon buyuklugu: her islemde stop olursa bakiyenin RS_RISK_PCT'si (%1) kaybedilir;
 kaldirac en fazla LEVERAGE (15x), ayni anda en fazla MAX_OPEN_TRADES islem.
@@ -121,69 +122,44 @@ def _dir_list(long_, short, score, start=WARMUP):
     return [(int(i), "LONG" if long_[i] else "SHORT", float(score[i])) for i in idx if i >= start]
 
 
-def sig_breakout(bot, d, p):
-    """Canli botla AYNI fonksiyon: bot.breakout_signal_arrays."""
-    long_, short = bot.breakout_signal_arrays(d, p["lookback"], bot.BO_ADX_MIN, d["btc_up"].to_numpy(),
-                                              d["btc_dn"].to_numpy())
-    return _dir_list(long_, short, d["adx"].to_numpy())
+def _shared(family):
+    """Canli botla AYNI sinyal fonksiyonu (bot.strategy_signal_arrays)."""
+    def fn(bot, d, p):
+        h1c = d["h1_close"].to_numpy() if "h1_close" in d else None
+        h1e = d["h1_ema50"].to_numpy() if "h1_ema50" in d else None
+        long_, short, score = bot.strategy_signal_arrays(family, d, p, d["btc_up"].to_numpy(), d["btc_dn"].to_numpy(),
+                                                         h1c, h1e)
+        return _dir_list(long_, short, score)
+    return fn
 
 
-def sig_pullback(bot, d, p):
-    th = p["rsi"]
-    c, lo, hi = d["close"].to_numpy(), d["low"].to_numpy(), d["high"].to_numpy()
-    e20, e50, e200 = d["ema20"].to_numpy(), d["ema50"].to_numpy(), d["ema200"].to_numpy()
-    rsi = d["rsi"].to_numpy()
-    prsi = np.r_[np.nan, rsi[:-1]]
-    up, dn = d["btc_up"].to_numpy(), d["btc_dn"].to_numpy()
-    touch_lo = np.minimum(lo, np.r_[np.nan, lo[:-1]]) <= e20      # son 2 mumda EMA20'ye degdi
-    touch_hi = np.maximum(hi, np.r_[np.nan, hi[:-1]]) >= e20
-    with np.errstate(invalid="ignore"):
-        long_ = (e50 > e200) & (c > e50) & touch_lo & (c > e20) & (prsi < th) & (rsi >= th) & (up == 1)
-        short = (e50 < e200) & (c < e50) & touch_hi & (c < e20) & (prsi > 100 - th) & (rsi <= 100 - th) & (dn == 1)
-    return _dir_list(long_, short, d["adx"].to_numpy())
-
-
-def _reversal_base(bot, d):
-    """bot.trigger_direction'in vektorel karsiligi."""
-    k, dd, adx = d["k"].to_numpy(), d["d"].to_numpy(), d["adx"].to_numpy()
-    pk, pd_ = np.r_[np.nan, k[:-1]], np.r_[np.nan, dd[:-1]]
-    c, vwap = d["close"].to_numpy(), d["vwap"].to_numpy()
-    st, st_dir = d["st"].to_numpy(), d["st_dir"].to_numpy()
-    with np.errstate(invalid="ignore"):
-        cross_up = (pk <= pd_) & (k > dd) & (np.maximum(pk, pd_) < bot.STOCH_OVERSOLD)
-        cross_dn = (pk >= pd_) & (k < dd) & (np.minimum(pk, pd_) > bot.STOCH_OVERBOUGHT)
-        strong = adx >= bot.ADX_THRESHOLD
-        long_ = cross_up & (c > vwap) & strong
-        short = cross_dn & ~long_ & (c < vwap) & strong
-        if bot.USE_SUPERTREND:
-            long_ &= (st_dir == 1) & ~np.isnan(st)
-            short &= (st_dir == -1) & ~np.isnan(st)
-    return long_, short, adx
-
-
-def sig_reversal_filtered(bot, d, p):
-    long_, short, adx = _reversal_base(bot, d)
-    c = d["close"].to_numpy()
-    with np.errstate(invalid="ignore"):
-        long_ = long_ & (d["btc_up"].to_numpy() == 1) & (d["h1_close"].to_numpy() > d["h1_ema50"].to_numpy())
-        short = short & (d["btc_dn"].to_numpy() == 1) & (d["h1_close"].to_numpy() < d["h1_ema50"].to_numpy())
-    return _dir_list(long_, short, adx)
+sig_breakout = _shared("breakout")
+sig_pullback = _shared("pullback")
+sig_reversal_filtered = _shared("reversal_f")
+sig_reversal_btc = _shared("reversal_btc")
 
 
 def sig_reversal_raw(bot, d, p):
-    long_, short, adx = _reversal_base(bot, d)
-    return _dir_list(long_, short, adx)
+    long_, short, score = bot.strategy_signal_arrays("reversal_raw", d, p, np.ones(len(d)), np.ones(len(d)))
+    return _dir_list(long_, short, score)
 
 
 FAMILIES = [
-    {"key": "breakout", "name": "Trend kırılımı (1 saat)", "tf": 60, "fn": sig_breakout, "max_hours": 72,
+    {"sid": "breakout_1h", "key": "breakout", "name": "Trend kırılımı (1 saat)", "tf": 60, "fn": sig_breakout, "max_hours": 72,
      "grid": {"lookback": [20, 40], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 5.0)], "be": [0.0, 1.0]}},
-    {"key": "pullback", "name": "Trend içi geri çekilme (1 saat)", "tf": 60, "fn": sig_pullback, "max_hours": 72,
+    {"sid": "pullback_1h", "key": "pullback", "name": "Trend içi geri çekilme (1 saat)", "tf": 60, "fn": sig_pullback, "max_hours": 72,
      "grid": {"rsi": [40, 50], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
-    {"key": "rev_f", "name": "Dönüş sinyali + BTC/1s filtre (15 dk)", "tf": 15, "fn": sig_reversal_filtered,
+    {"sid": "reversal_15m", "key": "rev_f", "name": "Dönüş sinyali + BTC/1s filtre (15 dk)", "tf": 15, "fn": sig_reversal_filtered,
      "max_hours": 48, "grid": {"sl": [1.5, 2.5], "tp": [(1.0, 2.0), (1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
-    {"key": "rev", "name": "Mevcut sistem (15 dk, referans)", "tf": 15, "fn": sig_reversal_raw, "max_hours": 48,
+    {"sid": None, "key": "rev", "name": "Mevcut sistem (15 dk, referans)", "tf": 15, "fn": sig_reversal_raw, "max_hours": 48,
      "grid": {"sl": [1.5], "tp": [(1.5, 3.0)], "be": [0.0]}},
+    # --- buyuk zaman dilimleri: komisyon riske gore cok daha kucuk kalir ---
+    {"sid": "breakout_4h", "key": "breakout4h", "name": "Trend kırılımı (4 saat)", "tf": 240, "fn": sig_breakout, "max_hours": 240,
+     "grid": {"lookback": [20, 55], "sl": [2.0, 3.0], "tp": [(2.0, 6.0), (3.0, 9.0)], "be": [0.0, 1.5]}},
+    {"sid": "pullback_4h", "key": "pullback4h", "name": "Trend içi geri çekilme (4 saat)", "tf": 240, "fn": sig_pullback, "max_hours": 240,
+     "grid": {"rsi": [40, 50], "sl": [2.0, 3.0], "tp": [(2.0, 4.0), (3.0, 6.0)], "be": [0.0, 1.5]}},
+    {"sid": "reversal_1h", "key": "rev1h", "name": "Dönüş sinyali + BTC filtre (1 saat)", "tf": 60, "fn": sig_reversal_btc, "max_hours": 96,
+     "grid": {"sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
 ]
 
 
@@ -326,7 +302,8 @@ def load_data(bot, ex, progress=None):
         d60 = prep(bot, resample(df, 60), 60)
         d15 = align(align(d15, b4, ["btc_up", "btc_dn"], ""), d60, ["close", "ema50"], "h1_")
         d60 = align(d60, b4, ["btc_up", "btc_dn"], "")
-        data[sym] = {15: d15, 60: d60}
+        d240 = align(prep(bot, resample(df, 240), 240), b4, ["btc_up", "btc_dn"], "")
+        data[sym] = {15: d15, 60: d60, 240: d240}
     return data
 
 
@@ -365,6 +342,24 @@ def run(bot, ex=None, progress=None):
     return results, len(data), t0, split, t1
 
 
+def config_lines(winners):
+    """Gecen stratejiler icin kopyala-yapistir ayar satirlari."""
+    import json as _json
+    ws = [w for w in winners if w["family"].get("sid")]
+    if not ws:
+        return []
+    params = {}
+    for w in ws:
+        p = {k: v for k, v in w["params"].items()}
+        if "tp" in p:
+            p["tp"] = list(p["tp"])
+        params[w["family"]["sid"]] = p
+    return ["Key: STRATEGIES",
+            f"Value: {','.join(w['family']['sid'] for w in ws)}",
+            "Key: STRATEGY_PARAMS",
+            f"Value: {_json.dumps(params, separators=(',', ':'))}"]
+
+
 def _pf(v):
     return "∞" if v == float("inf") else f"{v:.2f}"
 
@@ -392,9 +387,12 @@ def format_report(bot, results, n_coins, t0, split, t1):
         ]
     winners = [r for r in results if r["passed"]]
     if winners:
-        w = max(winners, key=lambda r: r["test"]["pf"])
-        lines.append(f"🏁 Aday: {w['family']['name']} ({fmt_params(w['family'], w['params'])})")
-        lines.append("Bir sonraki adım: canlı bota bu stratejiyi kâğıt üzerinde (gerçek para olmadan) uygulamak.")
+        names = ", ".join(w["family"]["name"] for w in winners)
+        lines.append(f"🏁 Geçen strateji(ler): {names}")
+        cfg = config_lines(winners)
+        if cfg:
+            lines += ["", "⚙️ Botta açmak için Render → Environment'a ekle:"] + cfg
+        lines.append("Önce kâğıt üzerinde (gerçek para olmadan) birkaç hafta takip et.")
     else:
         lines.append("🏁 Hiçbir strateji doğrulamayı geçemedi. Bu dönemde bu yaklaşımlarla güvenilir bir avantaj yok;")
         lines.append("gerçek parayla işlem önerilmez.")
@@ -407,7 +405,7 @@ def render_test_curves(bot, results):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    colors = ["#2962FF", "#43A047", "#FF9800", "#9E9E9E"]
+    colors = ["#2962FF", "#43A047", "#FF9800", "#9E9E9E", "#E53935", "#8E24AA", "#00897B"]
     fig, ax = plt.subplots(figsize=(10, 5), dpi=110)
     fig.patch.set_facecolor("#FFFBE6")
     ax.set_facecolor("#FFFBE6")
@@ -436,7 +434,7 @@ def render_test_curves(bot, results):
 
 def run_and_report(bot):
     try:
-        bot.send_telegram(f"🔬 Strateji araştırması başladı: {RS_DAYS} gün, {RS_TOP_N} coin, 4 strateji ailesi. "
+        bot.send_telegram(f"🔬 Strateji araştırması başladı: {RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi. "
                           f"Veri indirme ve testler 10-20 dakika sürebilir...")
         t_start = time.time()
         results, n, t0, split, t1 = run(bot)
