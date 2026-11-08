@@ -293,9 +293,9 @@ def load_data(bot, ex, progress=None):
         if bot.with_retry(ex.load_markets, desc="load_markets") is None:
             raise RuntimeError(f"{EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)} piyasa listesi alinamadi (bolge/erisim kisitlamasi olabilir)")
     symbols = bot.get_top_symbols(ex, top_n=RS_TOP_N)
-    btc = next((s for s in ex.markets if s.startswith("BTC/USDT")), None)
-    if btc is None:
-        raise RuntimeError("BTC/USDT vadeli bulunamadi (rejim filtresi icin gerekli)")
+    btc = bot.btc_perp_symbol(ex)
+    if btc not in ex.markets:
+        raise RuntimeError("BTC/USDT surekli vadeli kontrati bulunamadi (rejim filtresi icin gerekli)")
     raw = {}
     for idx, sym in enumerate(dict.fromkeys([btc] + symbols), 1):
         try:
@@ -307,7 +307,7 @@ def load_data(bot, ex, progress=None):
         if progress and idx % 10 == 0:
             progress(f"{idx} coin indirildi")
     if btc not in raw:
-        raise RuntimeError("BTC verisi alinamadi")
+        raise RuntimeError(f"BTC verisi alinamadi ({btc}) - borsa gecmis veriyi vermedi veya erisim kisitli")
 
     b4 = prep(bot, resample(raw[btc], 240), 240)
     b4["btc_up"] = (b4["close"] > b4["ema50"]).astype(int)

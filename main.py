@@ -1082,6 +1082,17 @@ def safe_leverage(sl_dist):
     return max(1, min(LEVERAGE, int(1.0 / room)))
 
 
+def btc_perp_symbol(ex):
+    """BTC/USDT SUREKLI (perpetual) kontrati. Vadeli (ceyreklik) kontratlari secmez - Binance'te onlar da var."""
+    mk = ex.markets or {}
+    if "BTC/USDT:USDT" in mk:
+        return "BTC/USDT:USDT"
+    for sym, m in mk.items():
+        if m.get("base") == "BTC" and m.get("quote") == "USDT" and m.get("swap") and m.get("linear"):
+            return sym
+    return "BTC/USDT:USDT"
+
+
 _btc_cache = {"t": 0.0, "val": None}
 
 
@@ -1089,7 +1100,7 @@ def btc_regime(ex):
     """BTC/USDT 4 saatlik SON KAPANMIS mumun kapanisi EMA'nin ustunde mi? (up, dn) - 10 dk onbellek."""
     if time.time() - _btc_cache["t"] < 600 and _btc_cache["val"] is not None:
         return _btc_cache["val"]
-    sym = next((s for s in (ex.markets or {}) if s.startswith("BTC/USDT")), "BTC/USDT:USDT")
+    sym = btc_perp_symbol(ex)
     raw = with_retry(ex.fetch_ohlcv, sym, "4h", limit=300, desc="btc 4h")
     if not raw:
         return None
