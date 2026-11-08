@@ -10,7 +10,8 @@ Aileler:
   2) Trend ici geri cekilme (1 saat): EMA50>EMA200 trendinde EMA20'ye geri cekilme + RSI donusu + BTC rejimi
   3) Donus sinyali + filtre (15 dk): mevcut Stoch RSI tetigi + BTC 4s rejimi + 1 saatlik trend
   4) Mevcut sistem (15 dk): referans
-  5) Trend kirilimi (4 saat)   6) Trend ici geri cekilme (4 saat)   7) Donus sinyali + BTC filtre (1 saat)
+  5) Trend kirilimi (4 saat)   6) Trend ici geri cekilme (4 saat)
+  7) SuperTrend donusu (1 saat) 8) SuperTrend donusu (4 saat)  9) Donus sinyali + BTC filtre (1 saat)
 
 Pozisyon buyuklugu: her islemde stop olursa bakiyenin RS_RISK_PCT'si (%1) kaybedilir;
 kaldirac en fazla LEVERAGE (15x), ayni anda en fazla MAX_OPEN_TRADES islem.
@@ -49,6 +50,9 @@ RS_RISK_PCT = _env("RS_RISK_PCT", 1.0, float)          # islem basina risk (baki
 RS_MAX_OPEN = _env("RS_MAX_OPEN", 0, int)              # 0 = botun MAX_OPEN_TRADES
 RS_TRAIN_FRAC = _env("RS_TRAIN_FRAC", 0.67, float)     # egitim donemi orani
 RS_MIN_TRADES = _env("RS_MIN_TRADES", 25, int)         # egitimde en az islem (az islemle secim yapma)
+RS_MIN_TEST_TRADES = _env("RS_MIN_TEST_TRADES", 30, int)  # dogrulamada en az islem (t-testi icin alt sinir)
+RS_MIN_T = _env("RS_MIN_T", 2.5, float)                # dogrulamada islem basi getirinin t-istatistigi (sans elemesi;
+                                                       # 9 strateji birlikte test edildigi icin coklu test duzeltmeli)
 RS_MAKER = _env("BT_MAKER_FEE", 0.0, float)
 RS_TAKER = _env("BT_TAKER_FEE", 0.0002, float)
 WARMUP = 220                                           # EMA200 isinmasi
@@ -137,6 +141,7 @@ sig_breakout = _shared("breakout")
 sig_pullback = _shared("pullback")
 sig_reversal_filtered = _shared("reversal_f")
 sig_reversal_btc = _shared("reversal_btc")
+sig_supertrend = _shared("supertrend")
 
 
 def sig_reversal_raw(bot, d, p):
@@ -146,18 +151,22 @@ def sig_reversal_raw(bot, d, p):
 
 FAMILIES = [
     {"sid": "breakout_1h", "key": "breakout", "name": "Trend kırılımı (1 saat)", "tf": 60, "fn": sig_breakout, "max_hours": 72,
-     "grid": {"lookback": [20, 40], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 5.0)], "be": [0.0, 1.0]}},
+     "grid": {"lookback": [20, 40], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 5.0)], "be": [0.0, 1.0], "st": [0, 1]}},
     {"sid": "pullback_1h", "key": "pullback", "name": "Trend içi geri çekilme (1 saat)", "tf": 60, "fn": sig_pullback, "max_hours": 72,
-     "grid": {"rsi": [40, 50], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
+     "grid": {"rsi": [40, 50], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0], "st": [0, 1]}},
     {"sid": "reversal_15m", "key": "rev_f", "name": "Dönüş sinyali + BTC/1s filtre (15 dk)", "tf": 15, "fn": sig_reversal_filtered,
      "max_hours": 48, "grid": {"sl": [1.5, 2.5], "tp": [(1.0, 2.0), (1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
     {"sid": None, "key": "rev", "name": "Mevcut sistem (15 dk, referans)", "tf": 15, "fn": sig_reversal_raw, "max_hours": 48,
      "grid": {"sl": [1.5], "tp": [(1.5, 3.0)], "be": [0.0]}},
     # --- buyuk zaman dilimleri: komisyon riske gore cok daha kucuk kalir ---
     {"sid": "breakout_4h", "key": "breakout4h", "name": "Trend kırılımı (4 saat)", "tf": 240, "fn": sig_breakout, "max_hours": 240,
-     "grid": {"lookback": [20, 55], "sl": [2.0, 3.0], "tp": [(2.0, 6.0), (3.0, 9.0)], "be": [0.0, 1.5]}},
+     "grid": {"lookback": [20, 55], "sl": [2.0, 3.0], "tp": [(2.0, 6.0), (3.0, 9.0)], "be": [0.0, 1.5], "st": [0, 1]}},
     {"sid": "pullback_4h", "key": "pullback4h", "name": "Trend içi geri çekilme (4 saat)", "tf": 240, "fn": sig_pullback, "max_hours": 240,
-     "grid": {"rsi": [40, 50], "sl": [2.0, 3.0], "tp": [(2.0, 4.0), (3.0, 6.0)], "be": [0.0, 1.5]}},
+     "grid": {"rsi": [40, 50], "sl": [2.0, 3.0], "tp": [(2.0, 4.0), (3.0, 6.0)], "be": [0.0, 1.5], "st": [0, 1]}},
+    {"sid": "supertrend_1h", "key": "st1h", "name": "SuperTrend dönüşü (1 saat)", "tf": 60, "fn": sig_supertrend,
+     "max_hours": 96, "grid": {"trend": [0, 1], "sl": [2.0, 3.0], "tp": [(2.0, 4.0), (3.0, 6.0)], "be": [0.0, 1.0]}},
+    {"sid": "supertrend_4h", "key": "st4h", "name": "SuperTrend dönüşü (4 saat)", "tf": 240, "fn": sig_supertrend,
+     "max_hours": 240, "grid": {"trend": [0, 1], "sl": [2.0, 3.0], "tp": [(2.0, 4.0), (3.0, 6.0)], "be": [0.0, 1.0]}},
     {"sid": "reversal_1h", "key": "rev1h", "name": "Dönüş sinyali + BTC filtre (1 saat)", "tf": 60, "fn": sig_reversal_btc, "max_hours": 96,
      "grid": {"sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
 ]
@@ -175,6 +184,10 @@ def fmt_params(fam, p):
         parts.append(f"{p['lookback']} mum kırılım")
     if "rsi" in p:
         parts.append(f"RSI {p['rsi']}")
+    if "trend" in p:
+        parts.append("EMA200+BTC filtreli" if p["trend"] else "filtresiz")
+    if "st" in p:
+        parts.append("SuperTrend onaylı" if p["st"] else "SuperTrend'siz")
     parts.append(f"stop {p['sl']:g} ATR")
     parts.append(f"TP {p['tp'][0]:g}/{p['tp'][1]:g} ATR")
     parts.append(f"başa baş {p['be']:g} ATR'de" if p.get("be") else "başa baş yok")
@@ -246,16 +259,20 @@ def portfolio(bot, trades, start, end):
         if notional <= 1:
             continue
         pnl = max(notional * (t["ret"] - t["fee"]), -margin)
+        risk_usd = notional * t["sl_dist"]
         open_pos.append({"exit_time": t["exit_time"], "pnl": pnl, "margin": margin, "symbol": t["symbol"]})
         levs.append(notional / equity)
-        done.append(dict(t, pnl=pnl))
+        done.append(dict(t, pnl=pnl, r=pnl / risk_usd if risk_usd > 0 else 0.0))
     settle(pd.Timestamp.max.tz_localize("UTC"))
     n = len(done)
     wins = [t["pnl"] for t in done if t["pnl"] > 0]
     losses = [-t["pnl"] for t in done if t["pnl"] <= 0]
     eq = np.array([e for _, e in curve])
     peak = np.maximum.accumulate(eq)
+    rs_ = np.array([t["r"] for t in done])
+    t_stat = float(rs_.mean() / (rs_.std(ddof=1) / np.sqrt(n))) if n > 2 and rs_.std(ddof=1) > 0 else 0.0
     return {
+        "t": t_stat, "avg_r": float(rs_.mean()) if n else 0.0,
         "n": n, "final": equity, "ret": (equity / RS_BALANCE - 1) * 100,
         "winrate": len(wins) / n * 100 if n else 0.0,
         "pf": (sum(wins) / sum(losses)) if losses and sum(losses) > 0 else (float("inf") if wins else 0.0),
@@ -333,8 +350,8 @@ def run(bot, ex=None, progress=None):
                 best = (score, p, trades, train)
         _, p, trades, train = best
         test = portfolio(bot, trades, split, end)
-        passed = (train["n"] >= RS_MIN_TRADES and train["pf"] >= 1.1 and test["n"] >= 15
-                  and test["pf"] >= 1.1 and test["max_dd"] <= 20)
+        passed = (train["n"] >= RS_MIN_TRADES and train["pf"] >= 1.1 and test["n"] >= RS_MIN_TEST_TRADES
+                  and test["pf"] >= 1.1 and test["max_dd"] <= 20 and test["t"] >= RS_MIN_T)
         results.append({"family": fam, "params": p, "train": train, "test": test, "passed": passed,
                         "grid_n": len(tried)})
         log.info("Arastirma %s: egitim PF %.2f (%d) | dogrulama PF %.2f (%d)", fam["key"], train["pf"],
@@ -382,6 +399,7 @@ def format_report(bot, results, n_coins, t0, split, t1):
             f"   Ayar: {fmt_params(r['family'], r['params'])} ({r['grid_n']} ayar denendi)",
             f"   Eğitim: PF {_pf(tr['pf'])} · {tr['n']} işlem · %{tr['ret']:+.1f}",
             f"   Doğrulama: PF {_pf(te['pf'])} · {te['n']} işlem · %{te['winrate']:.0f} kazanma · %{te['ret']:+.1f} · maks. düşüş %{te['max_dd']:.1f}",
+            f"   Anlamlılık: işlem başı {te['avg_r']:+.2f}R · t = {te['t']:.2f} (şart ≥ {RS_MIN_T:g})",
             f"   Doğrulamada LONG ${te['long']:+,.0f} · SHORT ${te['short']:+,.0f} · ort. pozisyon bakiyenin {te['exposure']:.1f} katı",
             "",
         ]
@@ -396,7 +414,8 @@ def format_report(bot, results, n_coins, t0, split, t1):
     else:
         lines.append("🏁 Hiçbir strateji doğrulamayı geçemedi. Bu dönemde bu yaklaşımlarla güvenilir bir avantaj yok;")
         lines.append("gerçek parayla işlem önerilmez.")
-    lines += ["", "Geçti şartı: eğitim ve doğrulamada PF ≥ 1.1, doğrulamada ≥15 işlem ve maks. düşüş ≤ %20.",
+    lines += ["", f"Geçti şartı: eğitim ve doğrulamada PF ≥ 1.1, doğrulamada ≥{RS_MIN_TEST_TRADES} işlem, maks. düşüş ≤ %20"
+              f" ve t ≥ {RS_MIN_T:g} (tüm stratejiler birlikte düşünüldüğünde şansla geçme ihtimali ~%5).",
               "⚠️ Geçmiş performans geleceği garanti etmez. Funding ve kayma dahil değil."]
     return "\n".join(lines)
 
@@ -405,7 +424,7 @@ def render_test_curves(bot, results):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    colors = ["#2962FF", "#43A047", "#FF9800", "#9E9E9E", "#E53935", "#8E24AA", "#00897B"]
+    colors = ["#2962FF", "#43A047", "#FF9800", "#9E9E9E", "#E53935", "#8E24AA", "#00897B", "#6D4C41", "#F06292"]
     fig, ax = plt.subplots(figsize=(10, 5), dpi=110)
     fig.patch.set_facecolor("#FFFBE6")
     ax.set_facecolor("#FFFBE6")

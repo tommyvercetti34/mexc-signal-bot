@@ -997,8 +997,22 @@ def strategy_signal_arrays(family, d, params, btc_up, btc_dn, h1_close=None, h1_
                 l = l & (hc > he)
                 s = s & (hc < he)
         l, s = np.nan_to_num(l, nan=0).astype(bool), np.nan_to_num(s, nan=0).astype(bool) & ~np.nan_to_num(l, nan=0).astype(bool)
+    elif family == "supertrend":
+        sd = d["st_dir"].to_numpy().astype(float)
+        psd = np.r_[np.nan, sd[:-1]]
+        c, e200 = d["close"].to_numpy(), d["ema200"].to_numpy()
+        with np.errstate(invalid="ignore"):
+            l = (sd == 1) & (psd == -1)           # SuperTrend asagidan yukari dondu
+            s = (sd == -1) & (psd == 1)           # yukaridan asagi dondu
+            if int(params.get("trend", 1)):       # trend filtresi: EMA200 + BTC 4s rejimi
+                l = l & (c > e200) & (up == 1)
+                s = s & (c < e200) & (dn == 1)
+        l, s = np.nan_to_num(l, nan=0).astype(bool), np.nan_to_num(s, nan=0).astype(bool)
     else:
         raise ValueError(f"bilinmeyen strateji ailesi: {family}")
+    if family in ("breakout", "pullback") and int(params.get("st", 0)):
+        sd = d["st_dir"].to_numpy()               # SuperTrend onay filtresi: yon SuperTrend ile ayni olmali
+        l, s = l & (sd == 1), s & (sd == -1)
     return l, s, adx
 
 
@@ -1018,6 +1032,10 @@ STRAT_DEFS = {
                      "params": {"sl": 2.5, "tp": [2.0, 4.0], "be": 0.0}},
     "reversal_1h": {"family": "reversal_btc", "tf": 60, "name": "Dönüş + BTC filtre", "max_hours": 96,
                     "params": {"sl": 2.5, "tp": [2.0, 4.0], "be": 0.0}},
+    "supertrend_1h": {"family": "supertrend", "tf": 60, "name": "SuperTrend dönüşü", "max_hours": 96,
+                      "params": {"trend": 1, "sl": 2.5, "tp": [2.0, 5.0], "be": 1.0}},
+    "supertrend_4h": {"family": "supertrend", "tf": 240, "name": "SuperTrend dönüşü", "max_hours": 240,
+                      "params": {"trend": 1, "sl": 3.0, "tp": [3.0, 6.0], "be": 1.0}},
     "scalein_15m": {"family": "scalein", "tf": 15, "name": "Kademeli dönüş (eski sistem)", "max_hours": MAX_TRADE_HOURS,
                     "params": {}},
 }
@@ -1125,7 +1143,7 @@ def evaluate_strategy(sid, df, btc, h1=None, spec=None):
             "liq_full": liq_price(e, sign, lev), "sl_avg_pct": sl_dist * 100, "sl_e1_pct": sl_dist * 100,
             "sl_dist": sl_dist, "leverage": lev, "strategy": sid, "family": fam, "tf": spec["tf"],
             "tf_label": spec["tf_label"], "strategy_name": spec["name"], "max_hours": spec["max_hours"],
-            "tp1_atr": tp1_atr, "tp2_atr": tp2_atr, "be_atr": be_atr}
+            "tp1_atr": tp1_atr, "tp2_atr": tp2_atr, "be_atr": be_atr, "st_confirm": bool(int(p.get("st", 0)))}
     if fam == "breakout":
         lb = int(p["lookback"])
         plan["level"] = float(df["high"].iloc[-lb - 1:-1].max() if sign == 1 else df["low"].iloc[-lb - 1:-1].min())
@@ -1182,8 +1200,15 @@ def build_message_single(ex, symbol, sig):
         kind = "yukarı" if sig["direction"] == "LONG" else "aşağı"
         reason = (f"📈 Son {sig['lookback']} mumun {'tepesi' if sig['sign'] == 1 else 'dibi'} ({p(sig['level'])}) "
                   f"{kind} kırıldı · ADX {sig['adx']:.0f}")
+        if sig.get("st_confirm"):
+            reason += " · SuperTrend onaylı"
     elif fam == "pullback":
         reason = f"📈 Trend içinde EMA20'ye geri çekilme ve RSI dönüşü · ADX {sig['adx']:.0f}"
+        if sig.get("st_confirm"):
+            reason += " · SuperTrend onaylı"
+    elif fam == "supertrend":
+        reason = (f"📈 SuperTrend ({ST_PERIOD},{ST_MULT:g}) {'yukarı' if sig['direction'] == 'LONG' else 'aşağı'} döndü"
+                  f" · ADX {sig['adx']:.0f}")
     else:
         zone = "aşırı satım" if sig["direction"] == "LONG" else "aşırı alım"
         reason = f"📈 Stoch RSI {zone} bölgesinden dönüş · ADX {sig['adx']:.0f}"

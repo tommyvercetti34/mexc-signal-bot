@@ -140,6 +140,27 @@ set DRY_RUN=true && python main.py   # Windows CMD
 
 ---
 
+## 8a. Çoklu strateji
+
+Bot aynı anda birden fazla stratejiyi, farklı zaman dilimlerinde çalıştırabilir. Hangilerinin açık olacağı `STRATEGIES` ayarıyla seçilir (virgülle ayrılmış):
+
+| Kimlik | Strateji | Zaman dilimi |
+|---|---|---|
+| `breakout_1h` | Trend kırılımı | 1 saat (varsayılan) |
+| `breakout_4h` | Trend kırılımı | 4 saat |
+| `pullback_1h` | Trend içi geri çekilme | 1 saat |
+| `pullback_4h` | Trend içi geri çekilme | 4 saat |
+| `reversal_15m` | Dönüş sinyali + BTC/1s filtre | 15 dk |
+| `reversal_1h` | Dönüş sinyali + BTC filtre | 1 saat |
+| `scalein_15m` | Eski kademeli dönüş sistemi | 15 dk |
+
+- Bot her 15 dakikalık kapanışta, o an kapanan zaman dilimlerinin stratejilerini tarar (15 dk her seferinde, 1 saat saat başı, 4 saat 00/04/08/12/16/20 UTC'de).
+- **Slotlar ortaktır:** Tüm stratejiler toplamda en fazla `MAX_OPEN_TRADES` (2) işlem açar, aynı coine tek işlem. Aynı anda birden fazla aday varsa önce büyük zaman dilimi, sonra trend gücü (ADX) seçilir.
+- Her işlem %1 risk bazlı (stop olursa bakiyenin %1'i), kaldıraç stop mesafesine göre otomatik.
+- **Parametreler** `STRATEGY_PARAMS` ile JSON olarak verilir. Örnek: `{"breakout_4h":{"lookback":55,"sl":3,"tp":[3,9],"be":1.5}}`. Araştırma raporu, geçen stratejiler için bu iki satırı (`STRATEGIES` ve `STRATEGY_PARAMS`) hazır olarak verir; Key/Value olarak Render'a kopyalaman yeterli.
+- Dashboard'da strateji bazında sonuç tablosu vardır.
+- Araştırma ve canlı bot aynı sinyal fonksiyonlarını kullanır; test edilen ile çalışan birebir aynıdır.
+
 ## 8. Strateji nasıl işliyor?
 
 Bot iki strateji içerir; `STRATEGY` ayarıyla seçilir. **Varsayılan: `breakout` (trend kırılımı)**. Bu strateji araştırmada (bölüm 9b) hiç görmediği veriyle yapılan doğrulamayı geçen tek stratejidir.
@@ -209,7 +230,7 @@ Test 4 varyantı karşılaştırır: SuperTrend açık/kapalı × kademeli/tek g
 
 `research.py` dosyasını da GitHub'a yükle. Render → Environment: `RUN_RESEARCH` = `true` → kaydet. Bot açılışta araştırmayı arka planda çalıştırır; 10–20 dakika sonra Telegram'a rapor ve doğrulama dönemi grafiği gelir. Rapor gelince `RUN_RESEARCH`'i sil.
 
-4 strateji ailesi yarışır: trend kırılımı (1 saat), trend içi geri çekilme (1 saat), dönüş sinyali + BTC/1 saat filtresi (15 dk), mevcut sistem (referans). Her ailenin ayarı ilk ~60 günde seçilir, son ~30 günde (strateji bu veriyi hiç görmedi) sınanır. **Geçti** şartı: eğitim ve doğrulamada profit factor ≥ 1.1, doğrulamada ≥ 15 işlem, maksimum düşüş ≤ %20. Pozisyonlar risk bazlıdır: stop olursa bakiyenin %1'i kaybedilir.
+4 strateji ailesi yarışır: trend kırılımı (1 saat), trend içi geri çekilme (1 saat), dönüş sinyali + BTC/1 saat filtresi (15 dk), mevcut sistem (referans). Her ailenin ayarı ilk ~60 günde seçilir, son ~30 günde (strateji bu veriyi hiç görmedi) sınanır. **Geçti** şartı: eğitim ve doğrulamada profit factor ≥ 1.1, doğrulamada ≥ 30 işlem, maksimum düşüş ≤ %20 ve işlem başı getirinin t-istatistiği ≥ 2.5 (sonucun şanstan kaynaklanmadığını gösterir; rastgele veriyle yapılan testlerde yanlış pozitif oranı ~%1). Pozisyonlar risk bazlıdır: stop olursa bakiyenin %1'i kaybedilir.
 
 | Değişken | Varsayılan | Açıklama |
 |---|---|---|
