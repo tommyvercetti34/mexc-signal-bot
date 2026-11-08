@@ -112,6 +112,12 @@ MONITOR_INTERVAL_SEC = _env("MONITOR_INTERVAL_SEC", 60, int)  # kac sn'de bir ko
 MAX_TRADE_HOURS = _env("MAX_TRADE_HOURS", 48, float)      # bu sureden sonra TP/SL olmazsa "suresi doldu" kapat
 ONE_TRADE_PER_SYMBOL = _env("ONE_TRADE_PER_SYMBOL", True, bool)  # acik islem varken ayni coine yeni sinyal verme
 STATE_FILE = _env("STATE_FILE", "trades.json")
+MAX_CLOSED_HISTORY = _env("MAX_CLOSED_HISTORY", 2000, int)  # dashboard icin saklanan kapanmis islem sayisi
+# Kalici kayit (Render her deploy'da dosyalari siler): GitHub Gist
+GITHUB_TOKEN = _env("GITHUB_TOKEN", "")                   # sadece "gist" yetkili token
+GIST_ID = _env("GIST_ID", "")
+# Dashboard
+DASHBOARD_KEY = _env("DASHBOARD_KEY", "")                 # doluysa /dashboard?key=... ile acilir
 
 # --- Sistem ---
 DISPLAY_TZ = ZoneInfo(_env("DISPLAY_TZ", "Europe/Istanbul"))
@@ -168,17 +174,38 @@ _last_signal = {}   # symbol -> datetime (UTC) of last signal
 # SAGLIK SUNUCUSU (Render free web service icin; disaridan ping ile uyanik tutulur)
 # ============================================================================
 class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = (
-            f"OK\nstarted_at={STATE['started_at'].isoformat()}\n"
-            f"last_scan_at={STATE['last_scan_at']}\nlast_scan_ok={STATE['last_scan_ok']}\n"
-            f"signals_sent={STATE['signals_sent']}\n"
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+    def _send(self, code, body: bytes, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        url = urlparse(self.path)
+        key = parse_qs(url.query).get("key", [""])[0]
+        try:
+            if url.path in ("/dashboard", "/dashboard/", "/api/data"):
+                if DASHBOARD_KEY and key != DASHBOARD_KEY:
+                    return self._send(403, "Yetkisiz: ?key=... gerekli".encode(), "text/plain; charset=utf-8")
+                if url.path == "/api/data":
+                    return self._send(200, json.dumps(dashboard_data(), ensure_ascii=False).encode(),
+                                      "application/json; charset=utf-8")
+                return self._send(200, DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
+            body = (
+                f"OK\nstarted_at={STATE['started_at'].isoformat()}\n"
+                f"last_scan_at={STATE['last_scan_at']}\nlast_scan_ok={STATE['last_scan_ok']}\n"
+                f"signals_sent={STATE['signals_sent']}\n"
+            ).encode()
+            self._send(200, body, "text/plain; charset=utf-8")
+        except Exception as e:
+            log.error("HTTP hata: %s", e)
+            try:
+                self._send(500, b"error", "text/plain")
+            except Exception:
+                pass
 
     def do_HEAD(self):
         self.send_response(200)
@@ -681,31 +708,102 @@ def in_cooldown(symbol):
 # ============================================================================
 # ISLEM TAKIBI (TP / STOP BILDIRIMLERI)
 # ============================================================================
-TRADES = {"open": [], "stats": {"tp": 0, "sl": 0, "expired": 0, "pnl_pct": 0.0}}
+TRADES = {"open": [], "closed": [], "stats": {"tp": 0, "sl": 0, "expired": 0, "pnl_pct": 0.0},
+          "started_ms": int(time.time() * 1000)}
 _trade_lock = threading.Lock()
+GIST_FILE = "trades.json"
+
+
+def _gist_enabled():
+    return bool(GITHUB_TOKEN and GIST_ID)
+
+
+def _gist_headers():
+    return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def _apply_loaded(data, source):
+    TRADES["open"] = data.get("open", [])
+    TRADES["closed"] = data.get("closed", [])
+    TRADES["stats"].update(data.get("stats", {}))
+    TRADES["started_ms"] = data.get("started_ms", TRADES["started_ms"])
+    log.info("%s: %d acik, %d kapanmis islem yuklendi", source, len(TRADES["open"]), len(TRADES["closed"]))
 
 
 def load_trades():
-    global TRADES
+    if _gist_enabled():
+        try:
+            r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=20)
+            r.raise_for_status()
+            f = r.json().get("files", {}).get(GIST_FILE)
+            if f:
+                content = f.get("content", "")
+                if f.get("truncated") and f.get("raw_url"):
+                    content = requests.get(f["raw_url"], headers=_gist_headers(), timeout=30).text
+                if content.strip():
+                    _apply_loaded(json.loads(content), "Gist")
+                    return
+        except Exception as e:
+            log.error("Gist okunamadi, yerel dosya denenecek: %s", e)
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            TRADES["open"] = data.get("open", [])
-            TRADES["stats"].update(data.get("stats", {}))
-            log.info("%d acik islem dosyadan yuklendi", len(TRADES["open"]))
+                _apply_loaded(json.load(f), "Yerel dosya")
     except Exception as e:
         log.error("Islem dosyasi okunamadi (%s): %s", STATE_FILE, e)
 
 
-def save_trades():
+def _push_gist(payload):
+    try:
+        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(),
+                           json={"files": {GIST_FILE: {"content": payload}}}, timeout=30)
+        if r.status_code >= 300:
+            log.error("Gist yazilamadi %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.error("Gist yazilamadi: %s", e)
+
+
+def save_trades(remote=False):
+    """Yerel dosyaya her zaman, Gist'e sadece onemli olaylarda (acilis/kademe/kapanis) yazar."""
+    TRADES["closed"] = TRADES["closed"][-MAX_CLOSED_HISTORY:]
+    payload = json.dumps(TRADES, ensure_ascii=False)
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(TRADES, f, ensure_ascii=False, indent=1)
+            f.write(payload)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         log.error("Islem dosyasi yazilamadi: %s", e)
+    if remote and _gist_enabled():
+        threading.Thread(target=_push_gist, args=(payload,), daemon=True).start()
+
+
+def dashboard_data():
+    """Dashboard'un /api/data ucu: acik ve kapanmis islemler + bot durumu."""
+    with _trade_lock:
+        open_rows = []
+        for t in TRADES["open"]:
+            avg, w, nf, n = _avg_filled(t)
+            last = t.get("last_price")
+            sign = 1 if t["direction"] == "LONG" else -1
+            open_rows.append({
+                "coin": t["coin"], "direction": t["direction"], "avg_entry": avg, "entry1": t["entry"],
+                "sl": t["sl"], "tp": t["tp"], "filled": nf, "levels": n, "filled_weight": w,
+                "last_price": last, "opened_ms": t["opened_ms"],
+                "pnl_pct": (sign * (last - avg) / avg * 100) if last else None,
+            })
+        return {
+            "now_ms": int(time.time() * 1000),
+            "started_ms": TRADES.get("started_ms"),
+            "bot": {
+                "last_scan_at": STATE["last_scan_at"], "last_scan_ok": STATE["last_scan_ok"],
+                "timeframe": TF_LABEL, "leverage": LEVERAGE, "margin_mode": MARGIN_MODE,
+                "rr": RR_RATIO, "levels": len(LADDER_WEIGHTS), "supertrend": USE_SUPERTREND,
+                "persistent": _gist_enabled(), "dry_run": DRY_RUN,
+            },
+            "open": open_rows,
+            "closed": list(TRADES["closed"]),
+        }
 
 
 def has_open_trade(symbol):
@@ -727,7 +825,7 @@ def register_trade(ex, symbol, sig, message_id):
     }
     with _trade_lock:
         TRADES["open"].append(trade)
-        save_trades()
+        save_trades(remote=True)
 
 
 def _ladder(t):
@@ -845,6 +943,7 @@ def check_trade(ex, t):
                 return "TP", t["tp"], new_fills
         t["last_checked_ms"] = int(raw[-1][0])   # son (acik olabilir) mumu sonraki kontrolde tekrar incele
         last_close = float(raw[-1][4])
+        t["last_price"] = last_close
 
     if MAX_TRADE_HOURS > 0 and now_ms - t["opened_ms"] > MAX_TRADE_HOURS * 3600_000 and last_close:
         return "EXPIRED", last_close, new_fills
@@ -855,30 +954,43 @@ def monitor_trades(ex):
     if not TRADES["open"]:
         return
     now_ms = int(time.time() * 1000)
-    changed = False
+    changed = remote = False
     for t in list(TRADES["open"]):
         try:
             outcome, price, new_fills = check_trade(ex, t)
             changed = True                     # last_checked_ms / filled guncellendi
+            remote = remote or bool(new_fills)
             if new_fills and NOTIFY_ENTRY_FILLS and outcome is None:
                 for i in new_fills:
                     send_telegram(_fill_message(ex, t, i), reply_to=t.get("message_id"))
                     log.info("KADEME DOLDU %s %d/%d", t["symbol"], i + 1, len(t["entries"]))
             if not outcome:
                 continue
-            pnl, *_ = _pnl(t, price)
+            pnl, avg, w, nf, n = _pnl(t, price)
+            entries, weights, filled = _ladder(t)
+            sign = 1 if t["direction"] == "LONG" else -1
+            # tam planlanan pozisyona gore getiri (dolmayan kademeler 0 katki) -> dashboard $ hesabi icin
+            pos_ret = sum(wi * sign * (price - e) / e for e, wi, f in zip(entries, weights, filled) if f) * 100
             with _trade_lock:
                 st = TRADES["stats"]
                 st[{"TP": "tp", "SL": "sl", "EXPIRED": "expired"}[outcome]] += 1
                 st["pnl_pct"] = round(st.get("pnl_pct", 0.0) + pnl, 4)
                 TRADES["open"].remove(t)
+                TRADES["closed"].append({
+                    "symbol": t["symbol"], "coin": t["coin"], "direction": t["direction"],
+                    "outcome": outcome, "avg_entry": avg, "exit": price, "sl": t["sl"], "tp": t["tp"],
+                    "entry1": entries[0], "filled": nf, "levels": n, "filled_weight": w,
+                    "pnl_pct": round(pnl, 4), "pos_ret_pct": round(pos_ret, 4), "leverage": LEVERAGE,
+                    "opened_ms": t["opened_ms"], "closed_ms": now_ms,
+                })
+            remote = True
             log.info("ISLEM KAPANDI %s %s -> %s (%.2f%%)", t["symbol"], t["direction"], outcome, pnl)
             send_telegram(_close_message(ex, t, outcome, price, now_ms), reply_to=t.get("message_id"))
         except Exception as e:
             log.exception("Islem takibinde hata (%s): %s", t.get("symbol"), e)
     if changed:
         with _trade_lock:
-            save_trades()
+            save_trades(remote=remote)
 
 
 # ============================================================================
@@ -1008,6 +1120,317 @@ def main():
             if datetime.now(timezone.utc) >= next_scan:
                 next_scan = next_scan_time()      # basarisiz taramayi sonsuza dek tekrarlama
             time.sleep(min(60 * consecutive_failures, 300))
+
+
+
+# ============================================================================
+# DASHBOARD SAYFASI  (/dashboard)
+# ============================================================================
+DASHBOARD_HTML = r'''<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sinyal Botu · Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#f6f5f1; --surface:#ffffff; --ink:#1d1d1b; --ink2:#5b5a55; --muted:#8c8a83; --line:#e7e4dc;
+    --accent:#2f5bd3; --good:#1f8a4c; --good-bg:#e6f4ec; --bad:#c43c3c; --bad-bg:#fbeaea; --warn:#9a6a00; --warn-bg:#fbf1dc;
+    --chip:#efede7;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#141413; --surface:#1e1e1c; --ink:#ecebe6; --ink2:#b3b1aa; --muted:#85837c; --line:#2f2e2b;
+      --accent:#7a9bff; --good:#4cc283; --good-bg:#183526; --bad:#ff7a7a; --bad-bg:#3a1d1d; --warn:#e6b450; --warn-bg:#3a2e14;
+      --chip:#2a2a27;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 16px 48px}
+  header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+  h1{font-size:20px;margin:0;font-weight:650;letter-spacing:-.01em}
+  .sub{color:var(--ink2);font-size:13px;margin-top:2px}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;background:var(--chip);color:var(--ink2)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+  .dot.ok{background:var(--good)} .dot.err{background:var(--bad)}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:16px}
+  .controls label{font-size:12px;color:var(--ink2);display:flex;align-items:center;gap:6px}
+  .controls input[type=number]{width:90px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+  .seg{display:inline-flex;background:var(--chip);border-radius:9px;padding:2px}
+  .seg button{border:0;background:transparent;color:var(--ink2);padding:5px 10px;border-radius:7px;font:inherit;font-size:12px;cursor:pointer}
+  .seg button.on{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.08)}
+  .spacer{flex:1}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px;margin-bottom:16px}
+  .tile{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .tile .lab{font-size:12px;color:var(--ink2)}
+  .tile .val{font-size:24px;font-weight:650;margin-top:4px;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .tile .note{font-size:12px;color:var(--muted);margin-top:2px}
+  .grid2{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:16px}
+  @media (max-width:860px){.grid2{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .card h2{font-size:14px;margin:0 0 10px;font-weight:620}
+  .card h2 small{font-weight:400;color:var(--muted);margin-left:6px}
+  .chartbox{position:relative;height:260px}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th,td{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);white-space:nowrap;font-size:13px}
+  th{font-size:12px;color:var(--ink2);font-weight:550}
+  td.r,th.r{text-align:right}
+  .tablewrap{overflow-x:auto}
+  .badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:550}
+  .b-tp{background:var(--good-bg);color:var(--good)} .b-sl{background:var(--bad-bg);color:var(--bad)} .b-exp{background:var(--warn-bg);color:var(--warn)}
+  .b-long{background:var(--good-bg);color:var(--good)} .b-short{background:var(--bad-bg);color:var(--bad)}
+  .pos{color:var(--good)} .neg{color:var(--bad)}
+  .empty{color:var(--muted);text-align:center;padding:24px 8px}
+  .foot{color:var(--muted);font-size:12px;margin-top:18px;line-height:1.6}
+  .warnbar{background:var(--warn-bg);color:var(--warn);border-radius:10px;padding:8px 12px;font-size:13px;margin-bottom:14px;display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>MEXC Sinyal Botu</h1>
+      <div class="sub" id="cfg">—</div>
+    </div>
+    <span class="pill"><span class="dot" id="statusDot"></span><span id="statusTxt">Bağlanıyor…</span></span>
+  </header>
+
+  <div class="warnbar" id="persistWarn">⚠️ Kalıcı kayıt (GitHub Gist) ayarlı değil: Render'da yeni deploy yapıldığında işlem geçmişi sıfırlanır.</div>
+
+  <div class="controls">
+    <div class="seg" id="period">
+      <button data-d="1">Bugün</button><button data-d="7">7 gün</button><button data-d="30">30 gün</button><button data-d="0" class="on">Tümü</button>
+    </div>
+    <span class="spacer"></span>
+    <label>Bakiye $ <input type="number" id="bal" value="2000" min="1" step="100"></label>
+    <label>Teminat/işlem % <input type="number" id="mpct" value="10" min="0.5" max="100" step="0.5"></label>
+    <label><input type="checkbox" id="fees" checked> Komisyon (~%0,06)</label>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Sermaye eğrisi <small id="eqNote"></small></h2>
+      <div class="chartbox"><canvas id="eqChart" aria-label="Sermaye eğrisi"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Coin bazında net K/Z <small>($)</small></h2>
+      <div class="chartbox"><canvas id="coinChart" aria-label="Coin bazında kâr zarar"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <h2>Açık işlemler <small id="openCount"></small></h2>
+    <div class="tablewrap"><table id="openTbl"></table></div>
+  </div>
+
+  <div class="card">
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Kapanan işlemler <small id="closedCount"></small>
+      <span class="spacer"></span>
+      <span class="seg" id="ofilter"><button data-o="ALL" class="on">Tümü</button><button data-o="TP">TP</button><button data-o="SL">Stop</button><button data-o="EXPIRED">Süre doldu</button></span>
+    </h2>
+    <div class="tablewrap"><table id="closedTbl"></table></div>
+  </div>
+
+  <div class="foot" id="foot">
+    $ hesapları: her işleme <b>bakiye × teminat %</b> kadar sabit teminat ve botun kaldıracı varsayılır; kademeli girişlerde dolmayan kademeler hesaba katılmaz.
+    Funding ve kayma dahil değildir. Sayfa her 60 saniyede yenilenir. Yatırım tavsiyesi değildir.
+  </div>
+</div>
+
+<script>
+(() => {
+  const TZ = "Europe/Istanbul";
+  const KEY = new URLSearchParams(location.search).get("key") || "";
+  const FEE_RT = 0.0006;
+  const S = { data: null, days: 0, outcome: "ALL", showAll: false };
+  let eqChart = null, coinChart = null;
+
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const fmtTime = ms => new Intl.DateTimeFormat("tr-TR",{timeZone:TZ,day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}).format(new Date(ms));
+  const money = (v, sign=true) => (sign ? (v>=0?"+":"−") : (v<0?"−":"")) + "$" + Math.abs(v).toLocaleString("tr-TR",{maximumFractionDigits:2, minimumFractionDigits: Math.abs(v)<100?2:0});
+  const pct = (v, d=2) => (v>=0?"+":"−") + "%" + Math.abs(v).toLocaleString("tr-TR",{minimumFractionDigits:d,maximumFractionDigits:d});
+  const price = v => v==null ? "—" : (v>=100 ? v.toLocaleString("tr-TR",{maximumFractionDigits:2}) : v>=1 ? v.toLocaleString("tr-TR",{maximumFractionDigits:4}) : v.toPrecision(5));
+  const cls = v => v>0 ? "pos" : v<0 ? "neg" : "";
+  const dur = ms => { const m=Math.floor(ms/60000), d=Math.floor(m/1440), h=Math.floor(m%1440/60), mm=m%60; return (d?d+"g ":"")+(h?h+"s ":"")+mm+"dk"; };
+  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ TP</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
+  const dirBadge = d => d==="LONG" ? '<span class="badge b-long">▲ LONG</span>' : '<span class="badge b-short">▼ SHORT</span>';
+
+  function settings(){
+    const bal = Math.max(1, +$("bal").value || 2000);
+    const m = Math.min(100, Math.max(0.1, +$("mpct").value || 10));
+    return { bal, margin: bal*m/100, fees: $("fees").checked };
+  }
+
+  function usd(t, st){
+    const lev = t.leverage || (S.data?.bot.leverage ?? 15);
+    const notional = st.margin * lev;
+    let v = notional * (t.pos_ret_pct ?? t.pnl_pct*(t.filled_weight??1)) / 100;
+    if (st.fees) v -= notional * (t.filled_weight ?? 1) * FEE_RT;
+    return Math.max(v, -st.margin);
+  }
+
+  function filtered(){
+    const all = S.data?.closed ?? [];
+    if (!S.days) return all;
+    const from = S.days===1
+      ? new Date(new Intl.DateTimeFormat("en-CA",{timeZone:TZ}).format(new Date())+"T00:00:00+03:00").getTime()
+      : Date.now() - S.days*86400000;
+    return all.filter(t => t.closed_ms >= from);
+  }
+
+  function render(){
+    if (!S.data) return;
+    const d = S.data, st = settings();
+    const b = d.bot;
+    $("cfg").textContent = `${b.timeframe} · ${b.leverage}x ${b.margin_mode} · R:R ${b.rr} · ${b.levels} kademe · SuperTrend ${b.supertrend?"açık":"kapalı"}${b.dry_run?" · DRY_RUN":""}`;
+    $("persistWarn").style.display = b.persistent ? "none" : "block";
+    const ok = b.last_scan_ok !== false;
+    $("statusDot").className = "dot " + (ok ? "ok" : "err");
+    $("statusTxt").textContent = b.last_scan_at ? `${ok?"Çalışıyor":"Hata"} · son tarama ${fmtTime(Date.parse(b.last_scan_at))}` : "İlk tarama bekleniyor";
+
+    const closed = filtered().slice().sort((a,b)=>a.closed_ms-b.closed_ms);
+    const rows = closed.map(t => ({...t, usd: usd(t, st)}));
+    const tp = rows.filter(t=>t.outcome==="TP").length, sl = rows.filter(t=>t.outcome==="SL").length, ex = rows.filter(t=>t.outcome==="EXPIRED").length;
+    const net = rows.reduce((s,t)=>s+t.usd,0);
+    const gw = rows.filter(t=>t.usd>0).reduce((s,t)=>s+t.usd,0), gl = -rows.filter(t=>t.usd<=0).reduce((s,t)=>s+t.usd,0);
+    const pf = gl>0 ? gw/gl : (gw>0 ? Infinity : 0);
+    let eq = st.bal, peak = st.bal, mdd = 0; const curve = [];
+    if (rows.length) curve.push({x: rows[0].opened_ms, y: st.bal});
+    for (const t of rows){ eq += t.usd; peak = Math.max(peak, eq); mdd = Math.max(mdd, (peak-eq)/peak*100); curve.push({x:t.closed_ms, y:eq, t}); }
+    const avgDur = rows.length ? rows.reduce((s,t)=>s+(t.closed_ms-t.opened_ms),0)/rows.length : 0;
+    const wr = (tp+sl) ? tp/(tp+sl)*100 : 0;
+
+    const tiles = [
+      ["Net kâr / zarar", `<span class="${cls(net)}">${money(net)}</span>`, `Bakiye ${money(st.bal+net,false)} · ${pct(net/st.bal*100,1)}`],
+      ["Kazanma oranı", rows.length ? `%${wr.toFixed(0)}` : "—", `${tp} TP · ${sl} Stop · ${ex} süre doldu`],
+      ["İşlem sayısı", `${rows.length}`, `${d.open.length} açık işlem`],
+      ["Profit factor", rows.length ? (pf===Infinity?"∞":pf.toFixed(2)) : "—", "Toplam kâr ÷ toplam zarar"],
+      ["Maks. düşüş", rows.length ? `%${mdd.toFixed(1)}` : "—", "Zirveden en büyük geri çekilme"],
+      ["Ort. işlem süresi", rows.length ? dur(avgDur) : "—", `İşlem başı teminat ${money(st.margin,false)}`],
+    ];
+    $("kpis").innerHTML = tiles.map(([l,v,n])=>`<div class="tile"><div class="lab">${l}</div><div class="val">${v}</div><div class="note">${n}</div></div>`).join("");
+
+    drawEquity(curve, st);
+    drawCoins(rows);
+    renderOpen(d.open, st);
+    renderClosed(rows);
+  }
+
+  function drawEquity(curve, st){
+    $("eqNote").textContent = curve.length ? `(başlangıç ${money(st.bal,false)})` : "";
+    if (!window.Chart) return;
+    const line = css("--accent"), grid = css("--line"), ink2 = css("--ink2");
+    const cfg = {
+      type:"line",
+      data:{datasets:[{data:curve, borderColor:line, backgroundColor:line, borderWidth:2, pointRadius:0, pointHoverRadius:5, stepped:"after", fill:false}]},
+      options:{
+        responsive:true, maintainAspectRatio:false, animation:false,
+        interaction:{mode:"index", intersect:false},
+        parsing:false,
+        scales:{
+          x:{type:"linear", grid:{display:false}, ticks:{color:ink2, maxTicksLimit:6, callback:v=>fmtTime(v)}},
+          y:{grid:{color:grid}, ticks:{color:ink2, callback:v=>"$"+Number(v).toLocaleString("tr-TR")}}
+        },
+        plugins:{legend:{display:false}, tooltip:{callbacks:{
+          title:i=>fmtTime(i[0].raw.x),
+          label:i=>{const t=i.raw.t; return t ? [`Bakiye: ${money(i.raw.y,false)}`, `${t.coin} ${t.direction} · ${t.outcome==="TP"?"TP":t.outcome==="SL"?"Stop":"Süre doldu"} · ${money(t.usd)}`] : `Başlangıç: ${money(i.raw.y,false)}`;}
+        }}}
+      }
+    };
+    if (eqChart) eqChart.destroy();
+    eqChart = new Chart($("eqChart"), cfg);
+  }
+
+  function drawCoins(rows){
+    if (!window.Chart) return;
+    const by = {};
+    rows.forEach(t => { (by[t.coin] ??= {v:0,n:0}); by[t.coin].v += t.usd; by[t.coin].n++; });
+    let items = Object.entries(by).sort((a,b)=>b[1].v-a[1].v);
+    if (items.length > 12) items = [...items.slice(0,6), ...items.slice(-6)];
+    const good = css("--good"), bad = css("--bad"), grid = css("--line"), ink2 = css("--ink2");
+    const cfg = {
+      type:"bar",
+      data:{labels:items.map(([c])=>c.replace("/USDT","")), datasets:[{data:items.map(([,o])=>o.v), backgroundColor:items.map(([,o])=>o.v>=0?good:bad), borderRadius:4, barPercentage:.7}]},
+      options:{
+        indexAxis:"y", responsive:true, maintainAspectRatio:false, animation:false,
+        scales:{x:{grid:{color:grid}, ticks:{color:ink2, callback:v=>"$"+v}}, y:{grid:{display:false}, ticks:{color:ink2}}},
+        plugins:{legend:{display:false}, tooltip:{callbacks:{label:i=>`${money(i.raw)} · ${items[i.dataIndex][1].n} işlem`}}}
+      }
+    };
+    if (coinChart) coinChart.destroy();
+    coinChart = new Chart($("coinChart"), cfg);
+  }
+
+  function renderOpen(open, st){
+    $("openCount").textContent = open.length ? `(${open.length})` : "";
+    if (!open.length){ $("openTbl").innerHTML = '<tr><td class="empty">Şu an açık işlem yok</td></tr>'; return; }
+    const lev = S.data.bot.leverage;
+    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">${lev}x</th><th class="r">Süre</th></tr></thead><tbody>` +
+      open.slice().sort((a,b)=>b.opened_ms-a.opened_ms).map(t => {
+        const p = t.pnl_pct;
+        return `<tr><td>${fmtTime(t.opened_ms)}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td>
+          <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.last_price)}</td><td class="r">${price(t.sl)}</td><td class="r">${price(t.tp)}</td>
+          <td>${t.filled}/${t.levels}</td><td class="r ${cls(p)}">${p==null?"—":pct(p)}</td><td class="r ${cls(p)}">${p==null?"—":pct(p*lev,1)}</td>
+          <td class="r">${dur(S.data.now_ms - t.opened_ms)}</td></tr>`;
+      }).join("") + "</tbody>";
+  }
+
+  function renderClosed(rows){
+    const list = rows.filter(t => S.outcome==="ALL" || t.outcome===S.outcome).sort((a,b)=>b.closed_ms-a.closed_ms);
+    $("closedCount").textContent = `(${list.length})`;
+    if (!list.length){ $("closedTbl").innerHTML = '<tr><td class="empty">Bu filtrede kapanan işlem yok</td></tr>'; return; }
+    const lev = S.data.bot.leverage;
+    $("closedTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Coin</th><th>Yön</th><th>Sonuç</th><th class="r">Ort. giriş</th><th class="r">Çıkış</th><th>Kademe</th><th class="r">K/Z</th><th class="r">${lev}x</th><th class="r">$</th><th class="r">Süre</th></tr></thead><tbody>` +
+      list.slice(0, S.showAll ? 1000 : 50).map(t => `<tr><td>${fmtTime(t.closed_ms)}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td><td>${outBadge(t.outcome)}</td>
+        <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.exit)}</td><td>${t.filled}/${t.levels}</td>
+        <td class="r ${cls(t.pnl_pct)}">${pct(t.pnl_pct)}</td><td class="r ${cls(t.pnl_pct)}">${pct(t.pnl_pct*(t.leverage||lev),1)}</td>
+        <td class="r ${cls(t.usd)}"><b>${money(t.usd)}</b></td><td class="r">${dur(t.closed_ms-t.opened_ms)}</td></tr>`).join("") + "</tbody>" +
+      (list.length > 50 ? `<tfoot><tr><td colspan="11" style="text-align:center;border:0;padding-top:12px"><button id="moreBtn" style="border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:8px;padding:6px 14px;font:inherit;cursor:pointer">${S.showAll ? "Daha az göster" : "Tümünü göster (" + list.length + ")"}</button></td></tr></tfoot>` : "");
+    const mb = $("moreBtn"); if (mb) mb.onclick = () => { S.showAll = !S.showAll; render(); };
+  }
+
+  async function load(){
+    try{
+      const r = await fetch("/api/data" + (KEY ? "?key="+encodeURIComponent(KEY) : ""), {cache:"no-store"});
+      if (!r.ok) throw new Error(r.status);
+      S.data = await r.json();
+      render();
+    }catch(e){
+      $("statusDot").className = "dot err";
+      $("statusTxt").textContent = "Bota ulaşılamadı (" + e.message + ")";
+    }
+  }
+
+  // ayarlari tarayicida hatirla
+  try{
+    const saved = JSON.parse(localStorage.getItem("dash_settings") || "{}");
+    if (saved.bal) $("bal").value = saved.bal;
+    if (saved.mpct) $("mpct").value = saved.mpct;
+    if (saved.fees === false) $("fees").checked = false;
+  }catch(e){}
+  const persist = () => { try{ localStorage.setItem("dash_settings", JSON.stringify({bal:$("bal").value, mpct:$("mpct").value, fees:$("fees").checked})); }catch(e){} };
+  ["bal","mpct","fees"].forEach(id => $(id).addEventListener("input", () => { persist(); render(); }));
+
+  document.querySelectorAll("#period button").forEach(b => b.onclick = () => {
+    document.querySelectorAll("#period button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); S.days = +b.dataset.d; render();
+  });
+  document.querySelectorAll("#ofilter button").forEach(b => b.onclick = () => {
+    document.querySelectorAll("#ofilter button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); S.outcome = b.dataset.o; render();
+  });
+
+  load();
+  setInterval(load, 60000);
+})();
+</script>
+</body>
+</html>
+'''
 
 
 if __name__ == "__main__":
