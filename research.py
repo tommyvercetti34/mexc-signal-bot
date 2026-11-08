@@ -76,7 +76,10 @@ def fetch_15m(bot, ex, symbol, days, tf_min=15, min_bars=2000):
     while since < now_ms - tf_ms:
         batch = bot.with_retry(ex.fetch_ohlcv, symbol, code, since=since, limit=1000, desc=f"rs {symbol} {code}")
         if not batch:
-            break
+            if rows:
+                break
+            since += 1000 * tf_ms                 # borsa bu kadar eskisini vermiyor: ilk mevcut veriye kadar ilerle
+            continue
         rows.extend(batch)
         nxt = batch[-1][0] + tf_ms
         if nxt <= since or len(batch) < 2:
@@ -731,10 +734,21 @@ def run_combo(bot, ex=None, progress=None):
     specs = combo_specs(bot)
     if not specs:
         raise RuntimeError("RS_COMBO icinde gecerli strateji yok")
-    data = load_data_combo(bot, ex, sorted({s["tf"] for s in specs}), progress)
+    tfs = sorted({s["tf"] for s in specs})
+    data = load_data_combo(bot, ex, tfs, progress)
     now = pd.Timestamp.now(tz="UTC")
     end = now - pd.Timedelta(days=RS_COMBO_END_DAYS_AGO)
     start = end - pd.Timedelta(days=RS_COMBO_DAYS)
+    if not data:
+        raise RuntimeError(f"{'/'.join(str(t) + 'dk' for t in tfs)} verisi hicbir coin icin alinamadi "
+                           f"(borsa bu kadar eski mum vermiyor olabilir; RS_COMBO_END_DAYS_AGO / RS_COMBO_DAYS kucultun)")
+    first = min(fr[tf]["close_time"].iloc[min(WARMUP, len(fr[tf]) - 1)] for fr in data.values() for tf in tfs)
+    if first > start:                             # veri daha gec basliyor: pencereyi gercek veriye gore daralt
+        log.warning("Kombinasyon penceresi veriye gore daraltildi: %s -> %s", start, first)
+        start = first
+    if start >= end - pd.Timedelta(days=14):
+        raise RuntimeError(f"Görülmemiş dönem için yeterli geçmiş veri yok (ilk kullanılabilir mum: "
+                           f"{first.tz_convert(bot.DISPLAY_TZ):%d.%m.%y}). RS_COMBO_END_DAYS_AGO değerini küçültün.")
     all_trades, rows = [], []
     for sp in specs:
         fn = _shared(sp["family"])
@@ -760,7 +774,7 @@ def format_combo_report(bot, rows, combo, n_coins, start, end):
     ok = combo["n"] >= RS_MIN_TEST_TRADES and combo["pf"] >= 1.1 and combo["t"] >= RS_MIN_T and combo["max_dd"] <= 20
     lines = [
         f"🧩 KOMBİNASYON TESTİ · {EXCHANGE_NAMES.get(RS_EXCHANGE, RS_EXCHANGE)}",
-        f"🗓 {f(start)} → {f(end)} ({RS_COMBO_DAYS} gün) · {n_coins} sabit coin",
+        f"🗓 {f(start)} → {f(end)} ({(end - start).days} gün) · {n_coins} sabit coin",
         "Bu dönem önceki araştırmalarda HİÇ kullanılmadı; ayarlar değiştirilmeden test edildi.",
         f"💼 ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem · en fazla {RS_MAX_OPEN or bot.MAX_OPEN_TRADES} işlem · "
         f"komisyon %{RS_MAKER * 100:g} / %{RS_TAKER * 100:g}",
