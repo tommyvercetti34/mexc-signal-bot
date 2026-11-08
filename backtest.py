@@ -125,7 +125,7 @@ def simulate_symbol(bot, symbol, d, var):
         plan = bot.plan_trade(H, L, C, A, i, direction, weights=var["weights"], mode=var["mode"])
         if not plan:
             continue
-        s = bot.new_state(plan, tp1_atr=var["tp1"], tp2_atr=var["tp2"], taker=BT_TAKER_FEE)
+        s = bot.new_state(plan, tp1_atr=var["tp1"], tp2_atr=var["tp2"], taker=BT_TAKER_FEE, be_atr=var.get("be"))
         j = i
         for j in range(i + 1, min(len(d), i + 1 + max_bars)):
             bot.process_bar(s, H[j], L[j], maker=BT_MAKER_FEE, taker=BT_TAKER_FEE)
@@ -196,7 +196,7 @@ def stats(done, curve, final, skipped):
     cnt = lambda o: sum(t["outcome"] == o for t in done)
     side = lambda dname: sum(t["pnl"] for t in done if t["direction"] == dname)
     return {
-        "n": n, "tp": cnt("TP"), "tp1be": cnt("TP1_BE"), "sl": cnt("SL"), "exp": cnt("EXPIRED"),
+        "n": n, "tp": cnt("TP"), "tp1be": cnt("TP1_BE"), "sl": cnt("SL"), "be": cnt("BE"), "exp": cnt("EXPIRED"),
         "winrate": len(wins) / n * 100 if n else 0.0,
         "pnl": final - BT_BALANCE, "ret": (final / BT_BALANCE - 1) * 100, "final": final,
         "pf": gross_win / gross_loss if gross_loss > 0 else float("inf"),
@@ -220,6 +220,7 @@ def variants(bot):
         {"name": f"⭐ Destek kademeli {wt} · TP {t1:g}/{t2:g} ATR", "st": bot.USE_SUPERTREND, "mode": "support", "weights": w, "tp1": t1, "tp2": t2},
         {"name": f"Destek kademeli · TP 1/2 ATR", "st": bot.USE_SUPERTREND, "mode": "support", "weights": w, "tp1": 1.0, "tp2": 2.0},
         {"name": f"Destek kademeli · TP 2/4 ATR", "st": bot.USE_SUPERTREND, "mode": "support", "weights": w, "tp1": 2.0, "tp2": 4.0},
+        {"name": f"Destek kademeli · başa baş KAPALI", "st": bot.USE_SUPERTREND, "mode": "support", "weights": w, "tp1": t1, "tp2": t2, "be": 0.0},
         {"name": f"ATR kademeli {wt} · TP {t1:g}/{t2:g} ATR", "st": bot.USE_SUPERTREND, "mode": "atr", "weights": w, "tp1": t1, "tp2": t2},
         {"name": f"Tek giriş · TP {t1:g}/{t2:g} ATR", "st": bot.USE_SUPERTREND, "mode": "support", "weights": [1.0], "tp1": t1, "tp2": t2},
     ]
@@ -272,11 +273,12 @@ def format_report(bot, results, n_coins, start, end):
         f"💼 Başlangıç ${BT_BALANCE:,.0f} · en fazla {BT_MAX_OPEN or bot.MAX_OPEN_TRADES} açık işlem · "
         f"işlem başı teminat %{bot.SLOT_FRACTION * bot.LADDER_ALLOC * 100:g} (ilk ${BT_BALANCE * bot.SLOT_FRACTION * bot.LADDER_ALLOC:,.0f}) · {bot.LEVERAGE}x",
         f"🪜 Kademeler: " + " / ".join(f"${BT_BALANCE * bot.SLOT_FRACTION * bot.LADDER_ALLOC * w:,.0f}" for w in bot.LADDER_WEIGHTS)
-        + f" · Hedef 1'de %{bot.TP1_CLOSE_PCT:.0f} kapat" + (" + stop girişe" if bot.MOVE_SL_TO_BE else ""),
+        + f" · Hedef 1'de %{bot.TP1_CLOSE_PCT:.0f} kapat" + (" + stop girişe" if bot.MOVE_SL_TO_BE else "")
+        + (f" · {bot.BE_TRIGGER_ATR:g} ATR kârda stop girişe" if bot.BE_TRIGGER_ATR > 0 else ""),
         "",
         f"{results[0][0]}",
         f"💰 Son bakiye: ${s0['final']:,.0f} ({_money(s0['pnl'])}, %{s0['ret']:+.1f})",
-        f"📊 İşlem: {s0['n']} · Hedef 2 {s0['tp']} / Hedef 1+giriş {s0['tp1be']} / Stop {s0['sl']} / Süre doldu {s0['exp']}",
+        f"📊 İşlem: {s0['n']} · Hedef 2 {s0['tp']} / Hedef 1+giriş {s0['tp1be']} / Başa baş {s0['be']} / Stop {s0['sl']} / Süre doldu {s0['exp']}",
         f"🎯 Kazanma oranı: %{s0['winrate']:.0f} · Profit factor: {s0['pf']:.2f}",
         f"⚖️ Ort. kazanç {_money(s0['avg_win'])} · ort. kayıp -${s0['avg_loss']:,.0f}",
         f"↕️ LONG {s0['long_n']} işlem {_money(s0['long_pnl'])} · SHORT {s0['short_n']} işlem {_money(s0['short_pnl'])}",
@@ -309,7 +311,7 @@ def render_equity(bot, results):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    colors = ["#2962FF", "#43A047", "#FF9800", "#8E24AA", "#9E9E9E"]
+    colors = ["#2962FF", "#43A047", "#FF9800", "#E53935", "#8E24AA", "#9E9E9E"]
     fig, ax = plt.subplots(figsize=(10, 5), dpi=110)
     fig.patch.set_facecolor("#FFFBE6")
     ax.set_facecolor("#FFFBE6")

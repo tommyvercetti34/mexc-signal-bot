@@ -182,13 +182,13 @@ def sig_reversal_raw(bot, d, p):
 
 FAMILIES = [
     {"key": "breakout", "name": "Trend kırılımı (1 saat)", "tf": 60, "fn": sig_breakout, "max_hours": 72,
-     "grid": {"lookback": [20, 40], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 5.0)]}},
+     "grid": {"lookback": [20, 40], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 5.0)], "be": [0.0, 1.0]}},
     {"key": "pullback", "name": "Trend içi geri çekilme (1 saat)", "tf": 60, "fn": sig_pullback, "max_hours": 72,
-     "grid": {"rsi": [40, 50], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)]}},
+     "grid": {"rsi": [40, 50], "sl": [1.5, 2.5], "tp": [(1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
     {"key": "rev_f", "name": "Dönüş sinyali + BTC/1s filtre (15 dk)", "tf": 15, "fn": sig_reversal_filtered,
-     "max_hours": 48, "grid": {"sl": [1.5, 2.5], "tp": [(1.0, 2.0), (1.5, 3.0), (2.0, 4.0)]}},
+     "max_hours": 48, "grid": {"sl": [1.5, 2.5], "tp": [(1.0, 2.0), (1.5, 3.0), (2.0, 4.0)], "be": [0.0, 1.0]}},
     {"key": "rev", "name": "Mevcut sistem (15 dk, referans)", "tf": 15, "fn": sig_reversal_raw, "max_hours": 48,
-     "grid": {"sl": [1.5], "tp": [(1.5, 3.0)]}},
+     "grid": {"sl": [1.5], "tp": [(1.5, 3.0)], "be": [0.0]}},
 ]
 
 
@@ -206,6 +206,7 @@ def fmt_params(fam, p):
         parts.append(f"RSI {p['rsi']}")
     parts.append(f"stop {p['sl']:g} ATR")
     parts.append(f"TP {p['tp'][0]:g}/{p['tp'][1]:g} ATR")
+    parts.append(f"başa baş {p['be']:g} ATR'de" if p.get("be") else "başa baş yok")
     return ", ".join(parts)
 
 
@@ -228,7 +229,8 @@ def simulate(bot, symbol, d, sigs, p, max_bars):
         if sl_dist < 0.002 or sl_dist > 0.08:
             continue
         plan = {"direction": direction, "sign": sign, "entries": [e], "weights": [1.0], "sl": sl, "atr": atr}
-        s = bot.new_state(plan, tp1_atr=p["tp"][0], tp2_atr=p["tp"][1], tp1_frac=0.5, move_be=True, taker=RS_TAKER)
+        s = bot.new_state(plan, tp1_atr=p["tp"][0], tp2_atr=p["tp"][1], tp1_frac=0.5, move_be=True, taker=RS_TAKER,
+                          be_atr=p.get("be", 0.0))
         j = i
         for j in range(i + 1, min(len(d), i + 1 + max_bars)):
             bot.process_bar(s, H[j], L[j], maker=RS_MAKER, taker=RS_TAKER)

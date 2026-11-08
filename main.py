@@ -114,6 +114,8 @@ TP1_ATR = _env("TP1_ATR", 1.5, float)                     # Hedef 1 = ortalama g
 TP2_ATR = _env("TP2_ATR", 3.0, float)                     # Hedef 2 = ortalama giris +/- bu kadar ATR
 TP1_CLOSE_PCT = _env("TP1_CLOSE_PCT", 50.0, float)        # Hedef 1'de pozisyonun % kaci kapansin
 MOVE_SL_TO_BE = _env("MOVE_SL_TO_BE", True, bool)         # Hedef 1 sonrasi stop ortalama girise cekilsin
+BE_TRIGGER_ATR = _env("BE_TRIGGER_ATR", 1.0, float)       # fiyat ortalamadan bu kadar ATR lehe gidince stop girise (0 = kapali)
+BE_FEE_BUFFER_PCT = _env("BE_FEE_BUFFER_PCT", 0.05, float)  # basa bas stopu komisyonu karsilasin diye girisin bu kadar karli tarafina
 RR_RATIO = TP2_ATR / ATR_SL_MULT                          # (eski ayar adi ile uyum, sadece bilgi)
 
 # --- Pozisyon buyuklugu / eszamanli islem ---
@@ -761,7 +763,7 @@ def plan_trade(high, low, close, atr_arr, i, direction, weights=None, mode=None,
 # ----------------------------------------------------------------------------
 # ISLEM MOTORU (canli takip ve backtest ayni fonksiyonu kullanir)
 # ----------------------------------------------------------------------------
-def new_state(plan, tp1_atr=None, tp2_atr=None, tp1_frac=None, move_be=None, taker=None):
+def new_state(plan, tp1_atr=None, tp2_atr=None, tp1_frac=None, move_be=None, taker=None, be_atr=None):
     taker = FEE_TAKER if taker is None else taker
     w = plan["weights"]
     return {
@@ -772,6 +774,7 @@ def new_state(plan, tp1_atr=None, tp2_atr=None, tp1_frac=None, move_be=None, tak
         "tp2_atr": TP2_ATR if tp2_atr is None else tp2_atr,
         "tp1_frac": (TP1_CLOSE_PCT / 100.0) if tp1_frac is None else tp1_frac,
         "move_be": MOVE_SL_TO_BE if move_be is None else move_be,
+        "be_atr": BE_TRIGGER_ATR if be_atr is None else be_atr, "be_done": False,
         "tp1_done": False, "rem": 1.0, "ret": 0.0, "fee": w[0] * taker,
         "closed": False, "outcome": None, "exit": None,
     }
@@ -832,9 +835,17 @@ def process_bar(s, high, low, maker=None, taker=None):
     # 2) stop
     if touch(s["sl"]):
         _st_close(s, 1.0, s["sl"], taker)
-        s.update(closed=True, exit=s["sl"], outcome="TP1_BE" if s["tp1_done"] else "SL")
-        ev.append(("BE" if s["tp1_done"] else "SL", s["sl"]))
+        outcome = "TP1_BE" if s["tp1_done"] else ("BE" if s.get("be_done") else "SL")
+        s.update(closed=True, exit=s["sl"], outcome=outcome)
+        ev.append(("SL" if outcome == "SL" else "BE", s["sl"]))
         return ev
+    # 2b) basa bas: fiyat ortalamadan be_atr kadar lehe gittiyse stop girise (yeni stop sonraki mumdan gecerli)
+    if not s["tp1_done"] and not s.get("be_done") and s.get("be_atr", 0) > 0 and s["atr"] > 0:
+        avg_now, _ = st_avg(s)
+        if reach(avg_now + sg * s["be_atr"] * s["atr"]):
+            s["sl"] = avg_now * (1 + sg * BE_FEE_BUFFER_PCT / 100.0)
+            s["be_done"], s["cancelled"] = True, True          # dolmayan kademeler iptal
+            ev.append(("BE_SET", s["sl"]))
     # 3) hedefler
     tp1, tp2 = pre_targets
     if not s["tp1_done"] and reach(tp1):
@@ -846,7 +857,8 @@ def process_bar(s, high, low, maker=None, taker=None):
             s.update(closed=True, exit=tp1, outcome="TP")
             return ev
         if s["move_be"]:
-            s["sl"] = st_avg(s)[0]
+            s["sl"] = st_avg(s)[0] * (1 + sg * BE_FEE_BUFFER_PCT / 100.0)
+            s["be_done"] = True
     if s["tp1_done"] and not s["closed"] and reach(tp2):
         _st_close(s, 1.0, tp2, maker)
         s.update(closed=True, exit=tp2, outcome="TP")
@@ -1164,6 +1176,24 @@ def _fill_message(ex, t, idx):
     )
 
 
+def _be_message(ex, t, sl):
+    s = t["state"]
+    avg, _ = st_avg(s)
+    tp1, tp2 = st_targets(s)
+    n, nf = len(s["entries"]), sum(s["filled"])
+    p = lambda v: fmt_price(ex, t["symbol"], v)
+    msg = (
+        f"🛡 STOP GİRİŞE ÇEKİLDİ · işlem artık risksiz\n"
+        f"📌 Coin: {t['coin']} | {t['direction']}\n"
+        f"📍 Ortalama giriş: {p(avg)} · fiyat {s['be_atr']:g} ATR lehe gitti\n"
+        f"🔴 Yeni stop: {p(sl)} (komisyonu karşılayacak kadar kârlı tarafta)\n"
+    )
+    if nf < n:
+        msg += f"🚫 Dolmayan {n - nf} kademe emrini iptal et\n"
+    msg += f"🎯 Hedefler aynı: {p(tp1)} / {p(tp2)}\n📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ"
+    return msg
+
+
 def _tp1_message(ex, t, px):
     s = t["state"]
     avg, _ = st_avg(s)
@@ -1203,6 +1233,7 @@ def _close_message(ex, t, now_ms):
         "TP": "✅ HEDEF 2 GERÇEKLEŞTİ · işlem tamamlandı",
         "TP1_BE": "✅ HEDEF 1 + GİRİŞTE KAPANDI (kârda)",
         "SL": "❌ STOP OLDU",
+        "BE": "⚪ GİRİŞTE KAPANDI (başa baş, zarar yok)",
         "EXPIRED": "⌛ SÜRE DOLDU (piyasadan kapatıldı)",
     }.get(s["outcome"], s["outcome"])
     msg = (
@@ -1215,7 +1246,7 @@ def _close_message(ex, t, now_ms):
     )
     if usd is not None:
         msg += f"💵 {_money_signed(usd)} · Bakiye: {_usd(current_balance())}\n"
-    if s["outcome"] in ("SL", "EXPIRED") and nf < n and not s["cancelled"]:
+    if s["outcome"] in ("SL", "EXPIRED", "BE") and nf < n and not s["cancelled"]:
         msg += f"🚫 Dolmayan {n - nf} kademe emrini iptal et\n"
     msg += (
         f"⏱️ Süre: {_fmt_duration(now_ms - t['opened_ms'])}\n"
@@ -1244,6 +1275,8 @@ def check_trade(ex, t):
                     text = _fill_message(ex, t, val)
                 elif kind == "TP1" and not s["closed"]:
                     text = _tp1_message(ex, t, val)
+                elif kind == "BE_SET" and not s["tp1_done"]:
+                    text = _be_message(ex, t, val)
                 events.append((kind, val, text))
             t["last_checked_ms"] = int(ts) + 60_000
             if s["closed"]:
@@ -1271,9 +1304,9 @@ def monitor_trades(ex):
                 if kind == "FILL":
                     remote = True
                     log.info("KADEME DOLDU %s %d/%d", t["symbol"], val + 1, len(s["entries"]))
-                elif kind == "TP1":
+                elif kind in ("TP1", "BE_SET"):
                     remote = True
-                    log.info("HEDEF 1 %s", t["symbol"])
+                    log.info("%s %s", "HEDEF 1" if kind == "TP1" else "BASA BAS STOP", t["symbol"])
                 if text:
                     send_telegram(text, reply_to=t.get("message_id"))
             if not s["closed"]:
@@ -1283,7 +1316,7 @@ def monitor_trades(ex):
             avg, _ = st_avg(s)
             with _trade_lock:
                 stt = TRADES["stats"]
-                key = {"TP": "tp", "TP1_BE": "tp", "SL": "sl", "EXPIRED": "expired"}.get(s["outcome"], "expired")
+                key = {"TP": "tp", "TP1_BE": "tp", "SL": "sl", "BE": "be", "EXPIRED": "expired"}.get(s["outcome"], "expired")
                 stt[key] = stt.get(key, 0) + 1
                 stt["pnl_pct"] = round(stt.get("pnl_pct", 0.0) + net / ws * 100, 4)
                 TRADES["open"].remove(t)
@@ -1599,7 +1632,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   const price = v => v==null ? "—" : (v>=100 ? v.toLocaleString("tr-TR",{maximumFractionDigits:2}) : v>=1 ? v.toLocaleString("tr-TR",{maximumFractionDigits:4}) : v.toPrecision(5));
   const cls = v => v>0 ? "pos" : v<0 ? "neg" : "";
   const dur = ms => { const m=Math.floor(ms/60000), d=Math.floor(m/1440), h=Math.floor(m%1440/60), mm=m%60; return (d?d+"g ":"")+(h?h+"s ":"")+mm+"dk"; };
-  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ Hedef 2</span>' : o==="TP1_BE" ? '<span class="badge b-tp">✓ Hedef 1 + giriş</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
+  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ Hedef 2</span>' : o==="TP1_BE" ? '<span class="badge b-tp">✓ Hedef 1 + giriş</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : o==="BE" ? '<span class="badge b-exp">⚪ Başa baş</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
   const isWin = o => o==="TP" || o==="TP1_BE";
   const dirBadge = d => d==="LONG" ? '<span class="badge b-long">▲ LONG</span>' : '<span class="badge b-short">▼ SHORT</span>';
 
@@ -1638,7 +1671,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 
     const closed = filtered().slice().sort((a,b)=>a.closed_ms-b.closed_ms);
     const rows = closed.map(t => ({...t, usd: usd(t, st)}));
-    const tp = rows.filter(t=>isWin(t.outcome)).length, sl = rows.filter(t=>t.outcome==="SL").length, ex = rows.filter(t=>t.outcome==="EXPIRED").length;
+    const tp = rows.filter(t=>isWin(t.outcome)).length, sl = rows.filter(t=>t.outcome==="SL").length, ex = rows.filter(t=>t.outcome==="EXPIRED").length, be = rows.filter(t=>t.outcome==="BE").length;
     const net = rows.reduce((s,t)=>s+t.usd,0);
     const gw = rows.filter(t=>t.usd>0).reduce((s,t)=>s+t.usd,0), gl = -rows.filter(t=>t.usd<=0).reduce((s,t)=>s+t.usd,0);
     const pf = gl>0 ? gw/gl : (gw>0 ? Infinity : 0);
@@ -1650,7 +1683,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 
     const tiles = [
       ["Net kâr / zarar", `<span class="${cls(net)}">${money(net)}</span>`, `Bakiye ${money(st.bal+net,false)} · ${pct(net/st.bal*100,1)}`],
-      ["Kazanma oranı", rows.length ? `%${wr.toFixed(0)}` : "—", `${tp} kârlı · ${sl} stop · ${ex} süre doldu`],
+      ["Kazanma oranı", rows.length ? `%${wr.toFixed(0)}` : "—", `${tp} kârlı · ${sl} stop · ${be} başa baş · ${ex} süre doldu`],
       ["İşlem sayısı", `${rows.length}`, `${d.open.length} açık işlem`],
       ["Profit factor", rows.length ? (pf===Infinity?"∞":pf.toFixed(2)) : "—", "Toplam kâr ÷ toplam zarar"],
       ["Maks. düşüş", rows.length ? `%${mdd.toFixed(1)}` : "—", "Zirveden en büyük geri çekilme"],
