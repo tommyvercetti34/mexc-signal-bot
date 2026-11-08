@@ -133,9 +133,21 @@ def _dir_list(long_, short, score, start=WARMUP):
     return [(int(i), "LONG" if long_[i] else "SHORT", float(score[i])) for i in idx if i >= start]
 
 
+_SIG_CACHE = {}
+
+
 def _shared(family):
     """Canli botla AYNI sinyal fonksiyonu (bot.strategy_signal_arrays)."""
     def fn(bot, d, p):
+        if family in bot.STRUCT_FAMILIES:         # sinyal hedeften bagimsiz: tp_r degisince yeniden hesaplama
+            key = (family, id(d), len(d), float(d["close"].iloc[0]), float(d["close"].iloc[-1]), tuple(sorted((k, str(v)) for k, v in p.items() if k not in ("tp_r", "be"))))
+            if key not in _SIG_CACHE:
+                long_, short, score = bot.strategy_signal_arrays(family, d, p, d["btc_up"].to_numpy(),
+                                                                 d["btc_dn"].to_numpy())
+                _SIG_CACHE[key] = (long_, short, score, d["struct_sl"].to_numpy().copy())
+            long_, short, score, stop = _SIG_CACHE[key]
+            d["struct_sl"] = stop
+            return _dir_list(long_, short, score)
         h1c = d["h1_close"].to_numpy() if "h1_close" in d else None
         h1e = d["h1_ema50"].to_numpy() if "h1_ema50" in d else None
         long_, short, score = bot.strategy_signal_arrays(family, d, p, d["btc_up"].to_numpy(), d["btc_dn"].to_numpy(),
@@ -149,7 +161,8 @@ sig_pullback = _shared("pullback")
 sig_reversal_filtered = _shared("reversal_f")
 sig_reversal_btc = _shared("reversal_btc")
 sig_supertrend = _shared("supertrend")
-sig_sweep = _shared("sweep")              # HTF Sweep + CISD (yapisal stop d["sweep_sl"] sutununa yazilir)
+sig_sweep = _shared("sweep")
+SIG_FN = {f: _shared(f) for f in ("ha_pb", "harmony", "impulse", "diverg", "ribbon", "tdseq", "cprofile")}              # HTF Sweep + CISD (yapisal stop d["struct_sl"] sutununa yazilir)
 
 
 def sig_reversal_raw(bot, d, p):
@@ -182,6 +195,35 @@ FAMILIES = [
      "grid": {"htf": [60], "tp_r": [(1.0, 2.0), (1.0, 3.0), (1.5, 3.0)], "kz": [0, 1], "be": [0.0]}},
     {"sid": "sweep_1h", "key": "sweep1h", "name": "HTF Sweep + CISD (1 saat / 4 saat)", "tf": 60, "fn": sig_sweep, "max_hours": 72,
      "grid": {"htf": [240], "tp_r": [(1.0, 2.0), (1.0, 3.0), (1.5, 3.0)], "kz": [0, 1], "be": [0.0]}},
+    # --- TOPLU TEST: TradingView fikirleri (yapisal stop + R hedefleri), 15 dk ve 1 saat ---
+    {"sid": "ha_pb_15m", "key": "ha_pb15m", "name": "Heikin Ashi geri çekilme (15 dk)", "tf": 15, "fn": SIG_FN["ha_pb"],
+     "max_hours": 24, "grid": {"ema": [50], "tp_r": [(1.5, 1.5), (1.0, 2.0)], "be": [0.0]}},
+    {"sid": "ha_pb_1h", "key": "ha_pb1h", "name": "Heikin Ashi geri çekilme (1 saat)", "tf": 60, "fn": SIG_FN["ha_pb"],
+     "max_hours": 72, "grid": {"ema": [50], "tp_r": [(1.5, 1.5), (1.0, 2.0)], "be": [0.0]}},
+    {"sid": "harmony_15m", "key": "harmony15m", "name": "Reversal Pressure (Harmony) (15 dk)", "tf": 15, "fn": SIG_FN["harmony"],
+     "max_hours": 24, "grid": {"ext": [1.4, 2.0], "rec": [1.2], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "harmony_1h", "key": "harmony1h", "name": "Reversal Pressure (Harmony) (1 saat)", "tf": 60, "fn": SIG_FN["harmony"],
+     "max_hours": 72, "grid": {"ext": [1.4, 2.0], "rec": [1.2], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "impulse_15m", "key": "impulse15m", "name": "Momentum itki devamı (Pineify) (15 dk)", "tf": 15, "fn": SIG_FN["impulse"],
+     "max_hours": 24, "grid": {"tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "impulse_1h", "key": "impulse1h", "name": "Momentum itki devamı (Pineify) (1 saat)", "tf": 60, "fn": SIG_FN["impulse"],
+     "max_hours": 72, "grid": {"tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "diverg_15m", "key": "diverg15m", "name": "CCI/RSI uyumsuzluğu (15 dk)", "tf": 15, "fn": SIG_FN["diverg"],
+     "max_hours": 24, "grid": {"piv": [5], "mode": ["cci", "both"], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "diverg_1h", "key": "diverg1h", "name": "CCI/RSI uyumsuzluğu (1 saat)", "tf": 60, "fn": SIG_FN["diverg"],
+     "max_hours": 72, "grid": {"piv": [5], "mode": ["cci", "both"], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "ribbon_15m", "key": "ribbon15m", "name": "ALMA trend şeridi (BOSWaves) (15 dk)", "tf": 15, "fn": SIG_FN["ribbon"],
+     "max_hours": 24, "grid": {"slope": [0.08], "tp_r": [(1.0, 2.0), (2.0, 4.0)], "be": [0.0]}},
+    {"sid": "ribbon_1h", "key": "ribbon1h", "name": "ALMA trend şeridi (BOSWaves) (1 saat)", "tf": 60, "fn": SIG_FN["ribbon"],
+     "max_hours": 72, "grid": {"slope": [0.08], "tp_r": [(1.0, 2.0), (2.0, 4.0)], "be": [0.0]}},
+    {"sid": "tdseq_15m", "key": "tdseq15m", "name": "TD Sequential (DGT) (15 dk)", "tf": 15, "fn": SIG_FN["tdseq"],
+     "max_hours": 24, "grid": {"mode": ["9q", "13"], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "tdseq_1h", "key": "tdseq1h", "name": "TD Sequential (DGT) (1 saat)", "tf": 60, "fn": SIG_FN["tdseq"],
+     "max_hours": 72, "grid": {"mode": ["9q", "13"], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "cprofile_15m", "key": "cprofile15m", "name": "Mum profili (Zeiierman) (15 dk)", "tf": 15, "fn": SIG_FN["cprofile"],
+     "max_hours": 24, "grid": {"bands": [7], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "cprofile_1h", "key": "cprofile1h", "name": "Mum profili (Zeiierman) (1 saat)", "tf": 60, "fn": SIG_FN["cprofile"],
+     "max_hours": 72, "grid": {"bands": [7], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
 ]
 
 
@@ -201,7 +243,14 @@ def fmt_params(fam, p):
         parts.append("EMA200+BTC filtreli" if p["trend"] else "filtresiz")
     if "st" in p:
         parts.append("SuperTrend onaylı" if p["st"] else "SuperTrend'siz")
-    if "tp_r" in p:
+    if "mode" in p:
+        parts.append({"cci": "sadece CCI", "both": "CCI+RSI", "9q": "9 sayımı (mükemmel)", "13": "13 geri sayımı"}.get(p["mode"], p["mode"]))
+    if "ext" in p:
+        parts.append(f"uzama {p['ext']:g} ölçek")
+    if "tp_r" in p and "htf" not in p:
+        parts.append("yapısal stop")
+        parts.append(f"TP {p['tp_r'][0]:g}R/{p['tp_r'][1]:g}R")
+    elif "tp_r" in p:
         parts.append("sadece Londra/NY seansı" if p.get("kz") else "tüm saatler")
         parts.append("stop sweep ucunda")
         parts.append(f"TP {p['tp_r'][0]:g}R/{p['tp_r'][1]:g}R")
@@ -220,7 +269,7 @@ def simulate(bot, symbol, d, sigs, p, max_bars):
     Canli botun islem motoru (bot.process_bar) kullanilir."""
     H, L, C, A = (d[c].to_numpy() for c in ("high", "low", "close", "atr"))
     ct = d["close_time"].to_numpy()
-    SW = d["sweep_sl"].to_numpy() if "sweep_sl" in d else None
+    SW = d["struct_sl"].to_numpy() if "struct_sl" in d else None
     out = []
     for i, direction, score in sigs:
         atr, e = float(A[i]), float(C[i])
@@ -453,6 +502,7 @@ def run(bot, ex=None, progress=None):
             tried.append((p, train))
             if best is None or score > best[0]:
                 best = (score, p, trades, train)
+        _SIG_CACHE.clear()                        # bellek: onbellek sadece aile icinde
         _, p, trades, train = best
         test = portfolio(bot, trades, split, end)
         passed = (train["n"] >= RS_MIN_TRADES and train["pf"] >= 1.1 and test["n"] >= RS_MIN_TEST_TRADES
@@ -534,17 +584,22 @@ def render_test_curves(bot, results):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    colors = ["#2962FF", "#43A047", "#FF9800", "#9E9E9E", "#E53935", "#8E24AA", "#00897B", "#6D4C41", "#F06292"]
+    colors = ["#2962FF", "#43A047", "#FF9800", "#E53935", "#8E24AA", "#00897B"]
     fig, ax = plt.subplots(figsize=(10, 5), dpi=110)
     fig.patch.set_facecolor("#FFFBE6")
     ax.set_facecolor("#FFFBE6")
-    for r, c in zip(results, colors):
+    ranked = sorted([r for r in results if len(r["test"]["curve"]) >= 2], key=lambda r: -r["test"]["final"])
+    for r in ranked[len(colors):]:            # cok strateji varsa: ilk 6 renkli, kalanlar ince gri
         cur = r["test"]["curve"]
-        if len(cur) < 2:
-            continue
+        x = [pd.Timestamp(t).tz_convert(bot.DISPLAY_TZ) for t, _ in cur]
+        ax.step(x, [e for _, e in cur], where="post", color="#BDBDBD", linewidth=0.8)
+    for r, c in zip(ranked[:len(colors)], colors):
+        cur = r["test"]["curve"]
         x = [pd.Timestamp(t).tz_convert(bot.DISPLAY_TZ) for t, _ in cur]
         ax.step(x, [e for _, e in cur], where="post", color=c, linewidth=1.8,
                 label=f"{'✓ ' if r['passed'] else ''}{r['family']['name']} (${r['test']['final']:,.0f})")
+    if len(ranked) > len(colors):
+        ax.plot([], [], color="#BDBDBD", linewidth=0.8, label=f"diğer {len(ranked) - len(colors)} strateji")
     ax.axhline(RS_BALANCE, color="#555", linewidth=0.8, linestyle=":")
     ax.grid(True, color="#E8E2C8")
     ax.set_title(f"Doğrulama dönemi (görülmemiş veri) · ${RS_BALANCE:,.0f} · risk %{RS_RISK_PCT:g}/işlem",

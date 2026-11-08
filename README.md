@@ -284,3 +284,12 @@ mum serisinin ilk açılışının ötesinde gövdesi ≥ 0,5 ATR bir mum kapan�
 Stop süpürülen ucun 0,1 ATR ötesindedir; hedefler R cinsindendir (`tp_r`, örn. `[1,2]`). `kz: 1` sadece
 Londra (07–10 UTC) ve New York (12–16 UTC) seanslarında sinyal verir. Ayar örneği:
 `STRATEGY_PARAMS={"sweep_15m":{"tp_r":[1,3],"kz":1}}`
+
+## TradingView fikirleri — toplu test (deneysel)
+
+Her biri 15 dk (`_15m`) ve 1 saat (`_1h`) olarak: `ha_pb` (Heikin Ashi geri çekilme, gerçek fiyatlarla),
+`harmony` (Reversal Pressure), `impulse` (Momentum itki devamı), `diverg` (CCI/RSI uyumsuzluğu, pivot 5 mum gecikmeli),
+`ribbon` (ALMA trend şeridi), `tdseq` (TD Sequential 9/13), `cprofile` (Mum profili, fiyat baskısı modu).
+Hepsi yapısal stop + R hedefleri kullanır; yazarların tanımlamadığı ayrıntılar kod içindeki açıklamalarda yazılıdır.
+Toplu araştırma için:
+`RS_FAMILIES=ha_pb_15m,ha_pb_1h,harmony_15m,harmony_1h,impulse_15m,impulse_1h,diverg_15m,diverg_1h,ribbon_15m,ribbon_1h,tdseq_15m,tdseq_1h,cprofile_15m,cprofile_1h`

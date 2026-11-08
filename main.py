@@ -306,6 +306,19 @@ def send_telegram(text: str, reply_to: int = None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID tanimli degil! Mesaj:\n%s", text)
         return None
+    if len(text) > 3900:                          # Telegram siniri 4096: paragraf sinirlarindan bol
+        parts, cur = [], ""
+        for para in text.split("\n\n"):
+            if cur and len(cur) + len(para) + 2 > 3900:
+                parts.append(cur)
+                cur = ""
+            cur = f"{cur}\n\n{para}" if cur else para
+        parts.append(cur)
+        first = None
+        for part in parts:
+            mid = send_telegram(part[:4000], reply_to)
+            first = first or mid
+        return first
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
     if reply_to and reply_to > 0:
         payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
@@ -1089,6 +1102,300 @@ def sweep_levels(e, sign, atr, sw_sl, p):
     return float(sw_sl), r1 * risk / atr, r2 * risk / atr
 
 
+# ============================================================================
+# TOPLU TEST: TradingView fikirleri (yapisal stop + R hedefleri)
+# Hepsi sadece KAPANMIS mumlarla, gelecek bilgisi olmadan calisir. Donus: (long, short, stop)
+# ============================================================================
+def _swing_stop(L, H, A, i, sign, lb=12, lo=0.75, hi=3.0, C=None):
+    """Son lb mumun dibi/tepesi; risk [lo, hi] ATR araligina sikistirilir (BOSWaves mantigi)."""
+    e = C[i]
+    a = max(0, i - lb + 1)
+    raw = (e - L[a:i + 1].min()) if sign == 1 else (H[a:i + 1].max() - e)
+    risk = min(max(raw, lo * A[i]), hi * A[i])
+    return e - sign * risk
+
+
+def ha_pullback_arrays(d, params):
+    """Heikin Ashi geri cekilme (forexobroker 'C' versiyonu): yon HA'dan, seviyeler GERCEK mumlardan.
+    LONG: HA kapanis > HA-kapanis EMA50, onceki HA mumu kirmizi, bu HA mumu yesil. Stop = sinyal mumunun gercek dibi."""
+    O, H, L, C = (d[c].to_numpy().astype(float) for c in ("open", "high", "low", "close"))
+    n = len(C)
+    hc = (O + H + L + C) / 4.0
+    ho = np.empty(n)
+    ho[0] = (O[0] + C[0]) / 2.0
+    for i in range(1, n):
+        ho[i] = (ho[i - 1] + hc[i - 1]) / 2.0
+    ema = pd.Series(hc).ewm(span=int(params.get("ema", 50)), adjust=False).mean().to_numpy()
+    green, red = hc > ho, hc < ho
+    pg, pr = np.r_[False, green[:-1]], np.r_[False, red[:-1]]
+    l = (hc > ema) & pr & green
+    s = (hc < ema) & pg & red
+    stop = np.where(l, L, np.where(s, H, np.nan))
+    return l, s, stop
+
+
+def harmony_arrays(d, params):
+    """Reversal Pressure (Harmony Algo) yaklasik: fiyat onceki 63 kapanisin medyanindan >= 1.4 olcek uzaklasir
+    (olcek = max(IQR/1.349, ATR)), medyan+ATR dondurulur; yeni uc nokta kaniti sifirlar; ters yonde CUSUM birikimi
+    >= 1.2 dondurulmus ATR ve kapanis onceki mumun tepesinin (dibinin) otesinde -> sinyal. Hazirlik 24 mumda biter."""
+    win, ext, rec, exp_ = 63, float(params.get("ext", 1.4)), float(params.get("rec", 1.2)), 24
+    O, H, L, C, A = (d[c].to_numpy().astype(float) for c in ("open", "high", "low", "close", "atr"))
+    n = len(C)
+    cs = pd.Series(C).shift(1)
+    med = cs.rolling(win).median().to_numpy()
+    iqr = (cs.rolling(win).quantile(0.75) - cs.rolling(win).quantile(0.25)).to_numpy() / 1.349
+    patr = np.r_[np.nan, A[:-1]]
+    scale = np.fmax(iqr, patr)
+    l, s, stop = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    st = {1: None, -1: None}      # yon -> dict(ext, start, atr, S)
+    drift = 0.1
+    for i in range(1, n):
+        for sg in (1, -1):        # sg=1: asagi uzama -> LONG aranir
+            z = st[sg]
+            if z is not None and i - z["start"] > exp_:
+                z = st[sg] = None
+            if z is None:
+                if np.isfinite(scale[i]) and scale[i] > 0 and sg * (med[i] - C[i]) >= ext * scale[i]:
+                    st[sg] = {"ext": L[i] if sg == 1 else H[i], "start": i, "atr": patr[i], "S": 0.0}
+                continue
+            if (sg == 1 and L[i] < z["ext"]) or (sg == -1 and H[i] > z["ext"]):
+                z["ext"] = L[i] if sg == 1 else H[i]          # yeni ters uc: kanit sifirlanir
+                z["S"] = 0.0
+                continue
+            z["S"] = max(0.0, z["S"] + sg * (C[i] - C[i - 1]) / z["atr"] - drift)
+            if z["S"] >= rec and ((sg == 1 and C[i] > H[i - 1]) or (sg == -1 and C[i] < L[i - 1])):
+                if sg == 1:
+                    l[i] = True
+                else:
+                    s[i] = True
+                stop[i] = z["ext"] - sg * 0.1 * A[i]
+                st[sg] = None
+    both = l & s
+    l, s = l & ~both, s & ~both
+    return l, s, np.where(l | s, stop, np.nan)
+
+
+def impulse_arrays(d, params):
+    """Momentum Impulse Follow Through (Pineify) yaklasik: kapanis-kapanis hareketi onceki 60 mumun medyan/MAD
+    olcegine gore >= 3 sapma ve >= 2 olcek -> itki. Sonra 'kabul' sartlari (yas>=3, uzama>=0.25 itki, kalis>=%60,
+    verim>=0.25, geri verme<=0.5, ters gidis<=0.35 itki) ARDISIK 2 kapanista saglanirsa itki yonunde sinyal.
+    Fiyat baslangicin 0.10 itki otesine donerse iptal; 40 mumda sure dolar. Stop = itkiden beri en uc fiyat."""
+    O, H, L, C, A = (d[c].to_numpy().astype(float) for c in ("open", "high", "low", "close", "atr"))
+    n = len(C)
+    r = pd.Series(C).diff()
+    rp = r.shift(1)
+    med = rp.rolling(60).median()
+    mad = (rp - med).abs().rolling(60).median()       # yaklasik MAD (kayan medyan etrafinda)
+    rng_floor = (pd.Series(H - L).shift(1).rolling(60).median() * 0.1)
+    scale = np.fmax((1.4826 * mad).to_numpy(), rng_floor.to_numpy())
+    med, r = med.to_numpy(), r.to_numpy()
+    l, s, stop = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    ev = None
+    for i in range(1, n):
+        if np.isfinite(scale[i]) and scale[i] > 0 and np.isfinite(r[i]):
+            if abs(r[i] - med[i]) / scale[i] >= 3 and abs(r[i]) >= 2 * scale[i] and np.sign(r[i]) == np.sign(r[i] - med[i]):
+                sg = 1 if r[i] > 0 else -1
+                ev = {"sg": sg, "o": C[i - 1], "e": C[i], "imp": abs(r[i]), "t": i, "ok": 0,
+                      "mfe": 0.0, "adv": 0.0, "travel": 0.0, "beyond": 0, "ext": L[i] if sg == 1 else H[i]}
+                continue
+        if ev is None:
+            continue
+        sg, imp = ev["sg"], ev["imp"]
+        age = i - ev["t"]
+        if age > 40:
+            ev = None
+            continue
+        ev["ext"] = min(ev["ext"], L[i]) if sg == 1 else max(ev["ext"], H[i])
+        disp = sg * (C[i] - ev["e"])
+        ev["mfe"] = max(ev["mfe"], sg * ((H[i] if sg == 1 else L[i]) - ev["e"]))
+        ev["adv"] = max(ev["adv"], sg * (ev["e"] - (L[i] if sg == 1 else H[i])))
+        ev["travel"] += abs(C[i] - C[i - 1])
+        ev["beyond"] += int(disp > 0)
+        if sg * (ev["o"] - C[i]) >= 0.10 * imp:       # baslangicin otesine dondu -> iptal
+            ev = None
+            continue
+        eff = disp / ev["travel"] if ev["travel"] > 0 else 0.0
+        give = (ev["mfe"] - disp) / ev["mfe"] if ev["mfe"] > 0 else 1.0
+        good = (age >= 3 and disp >= 0.25 * imp and ev["beyond"] / age >= 0.60 and eff >= 0.25
+                and give <= 0.50 and ev["adv"] <= 0.35 * imp)
+        ev["ok"] = ev["ok"] + 1 if good else 0
+        if ev["ok"] >= 2:
+            if sg == 1:
+                l[i] = True
+            else:
+                s[i] = True
+            stop[i] = ev["ext"] - sg * 0.1 * A[i]
+            ev = None
+    return l, s, stop
+
+
+def _cci(d, n=20):
+    tp = (d["high"] + d["low"] + d["close"]) / 3.0
+    sma = tp.rolling(n).mean()
+    mad = tp.rolling(n).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    return ((tp - sma) / (0.015 * mad)).to_numpy()
+
+
+def divergence_arrays(d, params):
+    """CCI/RSI uyumsuzlugu (Deutz1): pivot 5 sol / 5 sag. Pivot ancak 5 mum SONRA kesinlesir -> sinyal o anda.
+    Boga: daha dusuk pivot dip + CCI (ve 'both' modunda RSI) daha yuksek. Stop = pivot dibi - 0.1 ATR."""
+    k = int(params.get("piv", 5))
+    need_rsi = params.get("mode", "cci") == "both"
+    H, L, C, A = (d[c].to_numpy().astype(float) for c in ("high", "low", "close", "atr"))
+    n = len(C)
+    cci = _cci(d, 20)
+    rsi = calc_rsi(d["close"].astype(float), 14).to_numpy()
+    l, s, stop = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    last_lo = last_hi = None
+    for i in range(2 * k, n):
+        j = i - k
+        lw, rw = slice(j - k, j), slice(j + 1, i + 1)
+        if L[j] < L[lw].min() and L[j] <= L[rw].min():
+            if last_lo is not None and L[j] < L[last_lo] and cci[j] > cci[last_lo] and (not need_rsi or rsi[j] > rsi[last_lo]):
+                l[i], stop[i] = True, L[j] - 0.1 * A[i]
+            last_lo = j
+        if H[j] > H[lw].max() and H[j] >= H[rw].max():
+            if last_hi is not None and H[j] > H[last_hi] and cci[j] < cci[last_hi] and (not need_rsi or rsi[j] < rsi[last_hi]):
+                if l[i]:
+                    l[i], stop[i] = False, np.nan
+                else:
+                    s[i], stop[i] = True, H[j] + 0.1 * A[i]
+            last_hi = j
+    return l, s, stop
+
+
+def _alma(x, n=34, offset=0.85, sigma=6.0):
+    m, sd = offset * (n - 1), n / sigma
+    w = np.exp(-((np.arange(n) - m) ** 2) / (2 * sd * sd))
+    w /= w.sum()
+    return pd.Series(x).rolling(n).apply(lambda v: float(np.dot(v, w)), raw=True).to_numpy()
+
+
+def ribbon_arrays(d, params):
+    """Trend Target Ribbon (BOSWaves): ALMA(34); egim = ALMA degisimi / (5 x ATR). Boga: egim > 0.08 ve kapanis
+    ALMA + 0.65 x stdev(20) ustunde. Durum degisince sinyal. Stop = son 12 mum dibi, risk 0.75-3 ATR'ye sikistirilir."""
+    H, L, C, A = (d[c].to_numpy().astype(float) for c in ("high", "low", "close", "atr"))
+    n = len(C)
+    al = _alma(C, 34)
+    lb, th, conf = 5, float(params.get("slope", 0.08)), 0.65
+    slope = (al - np.r_[np.full(lb, np.nan), al[:-lb]]) / (lb * A)
+    sd = pd.Series(C).rolling(20).std().to_numpy()
+    with np.errstate(invalid="ignore"):
+        bull = (slope > th) & (C > al + conf * sd)
+        bear = (slope < -th) & (C < al - conf * sd)
+    state = pd.Series(np.where(bull, 1.0, np.where(bear, -1.0, np.nan))).ffill().fillna(0).to_numpy()
+    prev = np.r_[0.0, state[:-1]]
+    l, s = (state == 1) & (prev != 1), (state == -1) & (prev != -1)
+    stop = np.full(n, np.nan)
+    for i in np.where(l | s)[0]:
+        if A[i] > 0:
+            stop[i] = _swing_stop(L, H, A, i, 1 if l[i] else -1, C=C)
+    return l, s, stop
+
+
+def td_arrays(d, params):
+    """TD Sequential (Dual Phase Reversal / DGT): kurulum = art arda 9 kapanis 4 mum oncesinin altinda (alis) /
+    ustunde (satis); yeni sayim sadece yon degisiminde baslar. mode '9q' = 9 tamamlaninca + mukemmellik (8. veya 9.
+    mumun dibi 6. ve 7.'nin diplerinden dusuk); mode '13' = kurulum sonrasi kapanis <= 2 mum onceki dip sayimi 13'e
+    ulasinca. Stop = son 9 mumun dibi, risk 0.75-3 ATR'ye sikistirilir."""
+    mode = str(params.get("mode", "9q"))
+    H, L, C, A = (d[c].to_numpy().astype(float) for c in ("high", "low", "close", "atr"))
+    n = len(C)
+    l, s, stop = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    bc = sc = 0                  # kurulum sayaclari
+    cd = {1: None, -1: None}     # geri sayim: yon -> sayac
+    for i in range(5, n):
+        dn, up = C[i] < C[i - 4], C[i] > C[i - 4]
+        bc = (bc + 1 if (bc > 0 or (C[i - 1] >= C[i - 5])) else 0) if dn else 0
+        sc = (sc + 1 if (sc > 0 or (C[i - 1] <= C[i - 5])) else 0) if up else 0
+        sig = 0
+        if bc == 9:
+            if mode == "9q" and min(L[i], L[i - 1]) <= min(L[i - 2], L[i - 3]):
+                sig = 1
+            cd[1], cd[-1] = 0, None
+        if sc == 9:
+            if mode == "9q" and max(H[i], H[i - 1]) >= max(H[i - 2], H[i - 3]):
+                sig = -1
+            cd[-1], cd[1] = 0, None
+        if mode == "13":
+            if cd[1] is not None and bc != 9 and C[i] <= L[i - 2]:
+                cd[1] += 1
+                if cd[1] >= 13:
+                    sig, cd[1] = 1, None
+            if cd[-1] is not None and sc != 9 and C[i] >= H[i - 2]:
+                cd[-1] += 1
+                if cd[-1] >= 13:
+                    sig, cd[-1] = -1, None
+        if bc == 9:
+            bc = 0                 # kurulum tamam; yeni kurulum yeniden yon degisimi ister
+        if sc == 9:
+            sc = 0
+        if sig and A[i] > 0:
+            (l if sig == 1 else s)[i] = True
+            stop[i] = _swing_stop(L, H, A, i, sig, lb=9, C=C)
+    return l, s, stop
+
+
+def candle_profile_arrays(d, params):
+    """Rolling Candle Profile (Zeiierman) 'fiyat baskisi' modu yaklasik: son 60 mum, yeniye artan agirlik.
+    Mum basina alim baskisi = (kapanis - dip), satim = (tepe - kapanis). Baskinlik = (A-S)/(A+S) >= 0.25;
+    60 mumluk aralik 12 banda bolunur, sinyal yonunde baskin >= 7 bant; fiyat yukselen EMA21 ustunde; ilk kez saglandiginda
+    sinyal, ayni yonde en az 6 mum ara. Stop = son 12 mum dibi, risk 0.75-3 ATR (yazar stop vermiyor)."""
+    win, nb, dom_th, min_b, gap = 60, 12, 0.25, int(params.get("bands", 7)), 6
+    O, H, L, C, A = (d[c].to_numpy().astype(float) for c in ("open", "high", "low", "close", "atr"))
+    n = len(C)
+    bp, sp = C - L, H - C
+    ema = pd.Series(C).ewm(span=21, adjust=False).mean().to_numpy()
+    w = np.arange(1, win + 1, dtype=float)
+    condl, conds = np.zeros(n, bool), np.zeros(n, bool)
+    for i in range(win, n):
+        a = i - win + 1
+        hh, ll = H[a:i + 1], L[a:i + 1]
+        b, s_ = bp[a:i + 1] * w, sp[a:i + 1] * w
+        tot = b.sum() + s_.sum()
+        if tot <= 0:
+            continue
+        dom = (b.sum() - s_.sum()) / tot
+        top, bot = hh.max(), ll.min()
+        if top <= bot:
+            continue
+        edges = np.linspace(bot, top, nb + 1)
+        rngc = np.maximum(hh - ll, 1e-12)
+        ov = np.clip(np.minimum(hh[:, None], edges[None, 1:]) - np.maximum(ll[:, None], edges[None, :-1]), 0, None) / rngc[:, None]
+        bb, ss = (ov * b[:, None]).sum(0), (ov * s_[:, None]).sum(0)
+        nbull, nbear = int((bb > ss * 1.1).sum()), int((ss > bb * 1.1).sum())
+        condl[i] = dom >= dom_th and nbull >= min_b and C[i] > ema[i] and ema[i] > ema[i - 1]
+        conds[i] = dom <= -dom_th and nbear >= min_b and C[i] < ema[i] and ema[i] < ema[i - 1]
+    l = condl & ~np.r_[False, condl[:-1]]
+    s = conds & ~np.r_[False, conds[:-1]]
+    for arr in (l, s):                          # ayni yonde en az 'gap' mum ara
+        last = -10**9
+        for i in np.where(arr)[0]:
+            if i - last < gap:
+                arr[i] = False
+            else:
+                last = i
+    stop = np.full(n, np.nan)
+    for i in np.where(l | s)[0]:
+        if A[i] > 0:
+            stop[i] = _swing_stop(L, H, A, i, 1 if l[i] else -1, C=C)
+    return l, s, stop
+
+
+STRUCT_FAMILIES = {"sweep": None, "ha_pb": ha_pullback_arrays, "harmony": harmony_arrays, "impulse": impulse_arrays,
+                   "diverg": divergence_arrays, "ribbon": ribbon_arrays, "tdseq": td_arrays,
+                   "cprofile": candle_profile_arrays}
+STRUCT_REASONS = {
+    "ha_pb": "📈 Heikin Ashi trend içi geri çekilme bitti (HA EMA50 {side}, ilk {col} HA mumu)",
+    "harmony": "📈 Aşırı uzamadan sonra kapanışla teyitli toparlanma (Reversal Pressure)",
+    "impulse": "📈 Güçlü itki hareketi ardından devam teyidi (Momentum Impulse)",
+    "diverg": "📈 Fiyat–CCI/RSI uyumsuzluğu (pivot 5 mum sonra kesinleşti)",
+    "ribbon": "📈 ALMA trend şeridi yön değiştirdi (Trend Target Ribbon)",
+    "tdseq": "📈 TD Sequential tükenme sayımı tamamlandı",
+    "cprofile": "📈 Mum profili baskınlığı + yükselen EMA21 (Candle Profile)",
+}
+
+
 def strategy_signal_arrays(family, d, params, btc_up, btc_dn, h1_close=None, h1_ema50=None):
     """Tum aileler icin tek giris noktasi. (long_, short, skor)."""
     adx = d["adx"].to_numpy()
@@ -1119,9 +1426,10 @@ def strategy_signal_arrays(family, d, params, btc_up, btc_dn, h1_close=None, h1_
                 l = l & (c > e200) & (up == 1)
                 s = s & (c < e200) & (dn == 1)
         l, s = np.nan_to_num(l, nan=0).astype(bool), np.nan_to_num(s, nan=0).astype(bool)
-    elif family == "sweep":
-        l, s, stop = sweep_signal_arrays(d, params)
-        d["sweep_sl"] = stop                      # yapisal stop (evaluate_strategy / research.simulate okur)
+    elif family in STRUCT_FAMILIES:
+        fn = sweep_signal_arrays if family == "sweep" else STRUCT_FAMILIES[family]
+        l, s, stop = fn(d, params)
+        d["struct_sl"] = stop                     # yapisal stop (evaluate_strategy / research.simulate okur)
     else:
         raise ValueError(f"bilinmeyen strateji ailesi: {family}")
     if family in ("breakout", "pullback") and int(params.get("st", 0)):
@@ -1154,6 +1462,34 @@ STRAT_DEFS = {
                   "params": {"htf": 60, "win": 12, "body": 0.5, "kz": 0, "tp_r": [1.0, 2.0], "be": 0.0}},
     "sweep_1h": {"family": "sweep", "tf": 60, "name": "HTF Sweep + CISD (4s)", "max_hours": 72,
                  "params": {"htf": 240, "win": 12, "body": 0.5, "kz": 0, "tp_r": [1.0, 2.0], "be": 0.0}},
+    "ha_pb_15m": {"family": "ha_pb", "tf": 15, "name": "Heikin Ashi geri çekilme", "max_hours": 24,
+                    "params": {'ema': 50, 'tp_r': [1.5, 1.5], 'be': 0.0}},
+    "ha_pb_1h": {"family": "ha_pb", "tf": 60, "name": "Heikin Ashi geri çekilme", "max_hours": 72,
+                    "params": {'ema': 50, 'tp_r': [1.5, 1.5], 'be': 0.0}},
+    "harmony_15m": {"family": "harmony", "tf": 15, "name": "Reversal Pressure", "max_hours": 24,
+                    "params": {'ext': 1.4, 'rec': 1.2, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "harmony_1h": {"family": "harmony", "tf": 60, "name": "Reversal Pressure", "max_hours": 72,
+                    "params": {'ext': 1.4, 'rec': 1.2, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "impulse_15m": {"family": "impulse", "tf": 15, "name": "Momentum itki devamı", "max_hours": 24,
+                    "params": {'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "impulse_1h": {"family": "impulse", "tf": 60, "name": "Momentum itki devamı", "max_hours": 72,
+                    "params": {'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "diverg_15m": {"family": "diverg", "tf": 15, "name": "CCI/RSI uyumsuzluğu", "max_hours": 24,
+                    "params": {'piv': 5, 'mode': 'cci', 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "diverg_1h": {"family": "diverg", "tf": 60, "name": "CCI/RSI uyumsuzluğu", "max_hours": 72,
+                    "params": {'piv': 5, 'mode': 'cci', 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "ribbon_15m": {"family": "ribbon", "tf": 15, "name": "ALMA trend şeridi", "max_hours": 24,
+                    "params": {'slope': 0.08, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "ribbon_1h": {"family": "ribbon", "tf": 60, "name": "ALMA trend şeridi", "max_hours": 72,
+                    "params": {'slope': 0.08, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "tdseq_15m": {"family": "tdseq", "tf": 15, "name": "TD Sequential", "max_hours": 24,
+                    "params": {'mode': '9q', 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "tdseq_1h": {"family": "tdseq", "tf": 60, "name": "TD Sequential", "max_hours": 72,
+                    "params": {'mode': '9q', 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "cprofile_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili", "max_hours": 24,
+                    "params": {'bands': 7, 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "cprofile_1h": {"family": "cprofile", "tf": 60, "name": "Mum profili", "max_hours": 72,
+                    "params": {'bands': 7, 'tp_r': [1.0, 2.0], 'be': 0.0}},
     "scalein_15m": {"family": "scalein", "tf": 15, "name": "Kademeli dönüş (eski sistem)", "max_hours": MAX_TRADE_HOURS,
                     "params": {}},
 }
@@ -1261,8 +1597,8 @@ def evaluate_strategy(sid, df, btc, h1=None, spec=None):
     e, atr = float(cur["close"]), float(cur["atr"])
     if not (atr > 0 and e > 0):
         return None
-    if fam == "sweep":
-        lv = sweep_levels(e, sign, atr, float(df["sweep_sl"].iloc[-1]), p)
+    if fam in STRUCT_FAMILIES:
+        lv = sweep_levels(e, sign, atr, float(df["struct_sl"].iloc[-1]), p)
         if lv is None:
             return None
         sl, tp1_atr, tp2_atr = lv
@@ -1280,9 +1616,11 @@ def evaluate_strategy(sid, df, btc, h1=None, spec=None):
             "sl_dist": sl_dist, "leverage": lev, "strategy": sid, "family": fam, "tf": spec["tf"],
             "tf_label": spec["tf_label"], "strategy_name": spec["name"], "max_hours": spec["max_hours"],
             "tp1_atr": tp1_atr, "tp2_atr": tp2_atr, "be_atr": be_atr, "st_confirm": bool(int(p.get("st", 0)))}
+    if fam in STRUCT_FAMILIES:
+        plan["tp_r"] = [float(x) for x in p.get("tp_r", (1, 2))]
     if fam == "sweep":
         plan["level"] = float(sl + sign * 0.1 * atr)   # suepurulen uc nokta
-        plan["htf"], plan["tp_r"] = int(p.get("htf", 60)), [float(x) for x in p.get("tp_r", (1, 2))]
+        plan["htf"] = int(p.get("htf", 60))
     if fam == "breakout":
         lb = int(p["lookback"])
         plan["level"] = float(df["high"].iloc[-lb - 1:-1].max() if sign == 1 else df["low"].iloc[-lb - 1:-1].min())
@@ -1350,6 +1688,10 @@ def build_message_single(ex, symbol, sig):
         side = "tepesi" if sig["direction"] == "SHORT" else "dibi"
         reason = (f"📈 Önceki {htf} mumunun {side} süpürüldü (uç {p(sig['level'])}) ve CISD ile yön değişti"
                   f" · TP {sig['tp_r'][0]:g}R / {sig['tp_r'][1]:g}R")
+    elif fam in STRUCT_REASONS:
+        lg = sig["direction"] == "LONG"
+        reason = STRUCT_REASONS[fam].format(side="üstünde" if lg else "altında", col="yeşil" if lg else "kırmızı")
+        reason += f" · TP {sig['tp_r'][0]:g}R / {sig['tp_r'][1]:g}R"
     elif fam == "supertrend":
         reason = (f"📈 SuperTrend ({ST_PERIOD},{ST_MULT:g}) {'yukarı' if sig['direction'] == 'LONG' else 'aşağı'} döndü"
                   f" · ADX {sig['adx']:.0f}")
