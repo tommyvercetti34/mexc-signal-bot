@@ -297,7 +297,7 @@ def with_retry(fn, *args, desc="istek", **kwargs):
     return None
 
 
-def get_top_symbols(ex):
+def get_top_symbols(ex, top_n=None):
     """USDT-margined perpetual (swap) piyasalarini 24s USDT hacmine gore siralar."""
     markets = ex.markets or with_retry(ex.load_markets, desc="load_markets") or {}
     candidates = {
@@ -320,7 +320,7 @@ def get_top_symbols(ex):
             ranked.append((sym, float(qv)))
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in ranked[:TOP_N_SYMBOLS]]
+    return [s for s, _ in ranked[:(top_n or TOP_N_SYMBOLS)]]
 
 
 def fetch_closed_ohlcv(ex, symbol):
@@ -949,8 +949,16 @@ def main():
     markets_loaded_at = 0.0
     last_monitor = 0.0
 
+    if _env("RUN_BACKTEST", False, bool):
+        try:
+            import backtest
+            threading.Thread(target=backtest.run_and_report, args=(sys.modules[__name__],), daemon=True).start()
+            log.info("Backtest arka planda baslatildi")
+        except Exception as e:
+            log.error("Backtest baslatilamadi (backtest.py repoda mi?): %s", e)
+
     if SEND_STARTUP_MESSAGE:
-        extra = f", {len(TRADES['open'])} açık işlem takipte" if TRACK_TRADES and TRADES["open"] else ""
+        extra =f", {len(TRADES['open'])} açık işlem takipte" if TRACK_TRADES and TRADES["open"] else ""
         send_telegram(f"🤖 Sinyal botu başlatıldı ({TF_LABEL}, MEXC Futures{extra}).")
 
     next_scan = datetime.now(timezone.utc) if RUN_SCAN_ON_START else next_scan_time()
