@@ -1402,6 +1402,14 @@ def main():
         except Exception as e:
             log.error("Backtest baslatilamadi (backtest.py repoda mi?): %s", e)
 
+    if _env("RUN_RESEARCH", False, bool):
+        try:
+            import research
+            threading.Thread(target=research.run_and_report, args=(sys.modules[__name__],), daemon=True).start()
+            log.info("Strateji arastirmasi arka planda baslatildi")
+        except Exception as e:
+            log.error("Arastirma baslatilamadi (research.py repoda mi?): %s", e)
+
     if SEND_STARTUP_MESSAGE:
         extra =f", {len(TRADES['open'])} açık işlem takipte" if TRACK_TRADES and TRADES["open"] else ""
         send_telegram(f"🤖 Sinyal botu başlatıldı ({TF_LABEL}, MEXC Futures{extra}).")
