@@ -122,15 +122,10 @@ def _dir_list(long_, short, score, start=WARMUP):
 
 
 def sig_breakout(bot, d, p):
-    n = p["lookback"]
-    hh = d["high"].rolling(n).max().shift(1).to_numpy()
-    ll = d["low"].rolling(n).min().shift(1).to_numpy()
-    c, e200, adx = d["close"].to_numpy(), d["ema200"].to_numpy(), d["adx"].to_numpy()
-    up, dn = d["btc_up"].to_numpy(), d["btc_dn"].to_numpy()
-    with np.errstate(invalid="ignore"):
-        long_ = (c > hh) & (c > e200) & (adx >= 20) & (up == 1)
-        short = (c < ll) & (c < e200) & (adx >= 20) & (dn == 1)
-    return _dir_list(long_, short, adx)
+    """Canli botla AYNI fonksiyon: bot.breakout_signal_arrays."""
+    long_, short = bot.breakout_signal_arrays(d, p["lookback"], bot.BO_ADX_MIN, d["btc_up"].to_numpy(),
+                                              d["btc_dn"].to_numpy())
+    return _dir_list(long_, short, d["adx"].to_numpy())
 
 
 def sig_pullback(bot, d, p):
@@ -250,7 +245,6 @@ def simulate(bot, symbol, d, sigs, p, max_bars):
 def portfolio(bot, trades, start, end):
     """Risk bazli boyutlama: notional = bakiye x risk% / stop mesafesi; kaldirac <= LEVERAGE."""
     max_open = RS_MAX_OPEN or bot.MAX_OPEN_TRADES or 10**6
-    lev_cap = bot.LEVERAGE
     tr = sorted([t for t in trades if start <= t["entry_time"] < end], key=lambda t: (t["entry_time"], -t["score"]))
     equity, open_pos, done, levs = RS_BALANCE, [], [], []
     curve = [(start, equity)]
@@ -267,11 +261,12 @@ def portfolio(bot, trades, start, end):
         if len(open_pos) >= max_open or any(q["symbol"] == t["symbol"] for q in open_pos):
             continue
         notional = equity * RS_RISK_PCT / 100 / t["sl_dist"]
-        margin = notional / lev_cap
+        lev_i = bot.safe_leverage(t["sl_dist"])           # canli botla ayni: stop likidasyondan once gelsin
+        margin = notional / lev_i
         used = sum(q["margin"] for q in open_pos)
         if used + margin > equity:                # teminat yetmezse kucult
             margin = max(0.0, equity - used)
-            notional = margin * lev_cap
+            notional = margin * lev_i
         if notional <= 1:
             continue
         pnl = max(notional * (t["ret"] - t["fee"]), -margin)

@@ -62,7 +62,8 @@ TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = _env("TELEGRAM_CHAT_ID", "")          # kanal icin: -100xxxxxxxxxx veya @kanaladi
 
 # --- Tarama ---
-TIMEFRAME = _env("TIMEFRAME", "15m")
+STRATEGY = _env("STRATEGY", "breakout").lower()          # breakout = trend kirilimi (arastirmayi gecen), reversal = eski donus sistemi
+TIMEFRAME = _env("TIMEFRAME", "1h" if STRATEGY == "breakout" else "15m")
 TOP_N_SYMBOLS = _env("TOP_N_SYMBOLS", 50, int)            # 24s hacme gore ilk N USDT perpetual
 MIN_QUOTE_VOLUME_USDT = _env("MIN_QUOTE_VOLUME_USDT", 5_000_000, float)
 EXCLUDE_SYMBOLS = [s.strip().upper() for s in _env("EXCLUDE_SYMBOLS", "").split(",") if s.strip()]  # orn: "USDC,PEPE"
@@ -89,7 +90,18 @@ ST_MULT = _env("ST_MULT", 3.0, float)
 LEVERAGE = _env("LEVERAGE", 15, int)
 MARGIN_MODE = _env("MARGIN_MODE", "Isolated")
 
-# --- Kademeli alim (scale-in) ---
+# --- Trend kirilimi (STRATEGY=breakout) - arastirmada dogrulamayi gecen ayarlar ---
+BO_LOOKBACK = _env("BO_LOOKBACK", 20, int)                # kac mumluk tepe/dip kirilimi
+BO_ADX_MIN = _env("BO_ADX_MIN", 20.0, float)              # en az trend gucu
+BO_SL_ATR = _env("BO_SL_ATR", 2.5, float)                 # stop = giris -/+ bu kadar ATR
+BO_TP1_ATR = _env("BO_TP1_ATR", 2.0, float)               # Hedef 1 (%50 kapat)
+BO_TP2_ATR = _env("BO_TP2_ATR", 5.0, float)               # Hedef 2 (kalan)
+BO_BE_ATR = _env("BO_BE_ATR", 1.0, float)                 # bu kadar ATR karda stop girise (0 = kapali)
+BO_MAX_HOURS = _env("BO_MAX_HOURS", 72.0, float)          # en uzun islem suresi
+RISK_PCT = _env("RISK_PCT", 1.0, float)                   # islem basina risk: stop olursa bakiyenin %'si
+BTC_REGIME_EMA = _env("BTC_REGIME_EMA", 50, int)          # BTC 4 saatlik kapanis bu EMA'nin ustu = yukari rejim
+
+# --- Kademeli alim (scale-in, STRATEGY=reversal) ---
 # Giris 1 = sinyal mumunun kapanisi. Giris 2/3 = altindaki destek (SHORT'ta ustundeki direnc) seviyeleri.
 # Stop = son kademenin dayandigi destegin altinda. Her sinyalde 15x likidasyon kontrolu yapilir.
 ENTRY_LEVELS = _env("ENTRY_LEVELS", 3, int)               # 1 = tek giris
@@ -483,6 +495,7 @@ def add_indicators(df):
     df["k"], df["d"] = calc_stoch_rsi(df["close"], RSI_PERIOD, STOCH_PERIOD, STOCH_K_SMOOTH, STOCH_D_SMOOTH)
     df["vwap"] = calc_vwap(df, VWAP_ANCHOR_TZ)
     df["st"], df["st_dir"] = calc_supertrend(df, ST_PERIOD, ST_MULT)
+    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
     df["ema_fast"] = df["close"].ewm(span=CHART_EMA_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=CHART_EMA_SLOW, adjust=False).mean()
     return df
@@ -577,6 +590,11 @@ def render_chart(ex, symbol, df, sig):
         ax.text(x1 + 0.3, label_y[i], f" {label} {fmt_price(ex, symbol, price)} ", color="white", fontsize=7.5,
                 va="center", ha="left", fontweight="bold",
                 bbox=dict(boxstyle="square,pad=0.25", facecolor=color, edgecolor="none"))
+    if sig.get("strategy") == "breakout" and sig.get("level"):
+        x_lvl = max(0, n - 1 - BO_LOOKBACK)
+        ax.hlines(sig["level"], x_lvl, n - 1, colors="#616161", linewidth=1.0, linestyles=":")
+        ax.text(x_lvl, sig["level"], f" kırılım seviyesi ({BO_LOOKBACK} mum) ", fontsize=7, color="#616161",
+                va="bottom", ha="left")
     # sinyal mumu isareti
     ax.annotate("▲" if sig["direction"] == "LONG" else "▼",
                 (x0, d["low"].iloc[-1] if sig["direction"] == "LONG" else d["high"].iloc[-1]),
@@ -879,8 +897,8 @@ def st_result(s, fees=True):
     return net, ws, sum(s["filled"])
 
 
-def evaluate(df):
-    """Son kapanmis mum icin sinyal + kademe plani; yoksa None."""
+def evaluate_reversal(df):
+    """Donus sistemi: son kapanmis mum icin sinyal + kademe plani; yoksa None."""
     if len(df) < 3:
         return None
     prev, cur = df.iloc[-2], df.iloc[-1]
@@ -902,6 +920,142 @@ def evaluate(df):
         tp1=tp1_e1, tp=tp2_e1, tp1_full=tp1_full, tp2_full=tp2_full, sl_pct=plan["sl_avg_pct"],
     )
     return plan
+
+
+# ----------------------------------------------------------------------------
+# TREND KIRILIMI (STRATEGY=breakout) - research.py ile AYNI fonksiyon kullanilir
+# ----------------------------------------------------------------------------
+def breakout_signal_arrays(d, lookback, adx_min, btc_up, btc_dn):
+    """Vektorel kirilim sinyali. LONG: kapanis onceki N mumun tepesinin ustunde + EMA200 ustu + ADX>=min
+    + BTC 4s yukari rejim. SHORT: tersi. (long_, short) bool dizileri doner."""
+    hh = d["high"].rolling(lookback).max().shift(1).to_numpy()
+    ll = d["low"].rolling(lookback).min().shift(1).to_numpy()
+    c, e200, adx = d["close"].to_numpy(), d["ema200"].to_numpy(), d["adx"].to_numpy()
+    up, dn = np.asarray(btc_up), np.asarray(btc_dn)
+    with np.errstate(invalid="ignore"):
+        long_ = (c > hh) & (c > e200) & (adx >= adx_min) & (up == 1)
+        short = (c < ll) & (c < e200) & (adx >= adx_min) & (dn == 1) & ~long_
+    return np.nan_to_num(long_, nan=0).astype(bool), np.nan_to_num(short, nan=0).astype(bool)
+
+
+def safe_leverage(sl_dist):
+    """Stop, likidasyondan once gelecek sekilde en yuksek kaldirac (en fazla LEVERAGE)."""
+    room = sl_dist * (1 + LIQ_BUFFER_PCT / 100.0 + 0.25) + MMR_PCT / 100.0   # stop mesafesi + %25 pay + bakim teminati
+    return max(1, min(LEVERAGE, int(1.0 / room)))
+
+
+_btc_cache = {"t": 0.0, "val": None}
+
+
+def btc_regime(ex):
+    """BTC/USDT 4 saatlik SON KAPANMIS mumun kapanisi EMA'nin ustunde mi? (up, dn) - 10 dk onbellek."""
+    if time.time() - _btc_cache["t"] < 600 and _btc_cache["val"] is not None:
+        return _btc_cache["val"]
+    sym = next((s for s in (ex.markets or {}) if s.startswith("BTC/USDT")), "BTC/USDT:USDT")
+    raw = with_retry(ex.fetch_ohlcv, sym, "4h", limit=300, desc="btc 4h")
+    if not raw:
+        return None
+    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = df[df["ts"] + 4 * 3600_000 <= int(time.time() * 1000)]
+    if len(df) < BTC_REGIME_EMA + 5:
+        return None
+    close = df["close"].astype(float)
+    ema = close.ewm(span=BTC_REGIME_EMA, adjust=False).mean()
+    val = (int(close.iloc[-1] > ema.iloc[-1]), int(close.iloc[-1] < ema.iloc[-1]))
+    _btc_cache.update(t=time.time(), val=val)
+    return val
+
+
+def evaluate_breakout(df, btc):
+    """Son kapanmis 1 saatlik mum icin kirilim sinyali + plan; yoksa None."""
+    if btc is None or len(df) < max(220, BO_LOOKBACK + 5):
+        return None
+    n = len(df)
+    up = np.zeros(n)
+    dn = np.zeros(n)
+    up[-1], dn[-1] = btc
+    long_, short = breakout_signal_arrays(df, BO_LOOKBACK, BO_ADX_MIN, up, dn)
+    if not (long_[-1] or short[-1]):
+        return None
+    cur = df.iloc[-1]
+    direction = "LONG" if long_[-1] else "SHORT"
+    sign = 1 if direction == "LONG" else -1
+    e, atr = float(cur["close"]), float(cur["atr"])
+    if not (atr > 0 and e > 0):
+        return None
+    sl = e - sign * BO_SL_ATR * atr
+    sl_dist = abs(e - sl) / e
+    if sl_dist < 0.002 or sl_dist > 0.08:
+        return None
+    lev = safe_leverage(sl_dist)
+    plan = {"direction": direction, "sign": sign, "entry": e, "entries": [e], "weights": [1.0], "supports": [],
+            "used_support": False, "compressed": False, "sl": sl, "atr": atr, "avg_full": e,
+            "liq_full": liq_price(e, sign, lev), "sl_avg_pct": sl_dist * 100, "sl_e1_pct": sl_dist * 100,
+            "sl_dist": sl_dist, "leverage": lev, "strategy": "breakout",
+            "level": float(df["high"].iloc[-BO_LOOKBACK - 1:-1].max() if sign == 1 else df["low"].iloc[-BO_LOOKBACK - 1:-1].min())}
+    s = new_state(plan, tp1_atr=BO_TP1_ATR, tp2_atr=BO_TP2_ATR, tp1_frac=0.5, move_be=True, be_atr=BO_BE_ATR)
+    tp1, tp2 = st_targets(s)
+    plan.update(candle_ts=cur["ts"], adx=float(cur["adx"]), k=float(cur["k"]), d=float(cur["d"]),
+                vwap=float(cur["vwap"]), tp1=tp1, tp=tp2, tp1_full=tp1, tp2_full=tp2, sl_pct=sl_dist * 100)
+    return plan
+
+
+def evaluate(df, btc=None):
+    """Secili stratejiye gore sinyal + plan."""
+    if STRATEGY == "breakout":
+        return evaluate_breakout(df, btc)
+    return evaluate_reversal(df)
+
+
+def size_position(sig):
+    """Pozisyon buyuklugu. breakout: risk bazli (stop olursa bakiyenin RISK_PCT'si);
+    reversal: bakiye x slot x kademe agirliklari."""
+    bal = current_balance()
+    slot = bal * SLOT_FRACTION
+    if sig.get("strategy") == "breakout":
+        lev = sig["leverage"]
+        notional = bal * RISK_PCT / 100.0 / sig["sl_dist"]
+        margin = notional / lev
+        used = sum(t.get("margin") or 0 for t in TRADES["open"])
+        cap = min(slot, max(0.0, bal - used))
+        if margin > cap:
+            margin = cap
+            notional = margin * lev
+        sig.update(balance=bal, slot=slot, margins=[margin], notional=notional,
+                   risk_usd=notional * sig["sl_dist"])
+    else:
+        _, total, margins = plan_margin()
+        sig.update(balance=bal, slot=slot, margins=margins, notional=total * LEVERAGE, leverage=LEVERAGE)
+    return sig
+
+
+def build_message_breakout(ex, symbol, sig):
+    base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0])
+    p = lambda v: fmt_price(ex, symbol, v)
+    lev = sig["leverage"]
+    margin = sig["margins"][0]
+    kind = "yukarı" if sig["direction"] == "LONG" else "aşağı"
+    msg = (
+        "🎯 YENİ KRİPTO SİNYALİ · Trend kırılımı\n"
+        f"📌 Coin: {base}/USDT\n"
+        f"📊 Yön: {sig['direction']}\n"
+        f"⚙️ İşlem Türü: {MARGIN_MODE} · {lev}x\n"
+        f"🕒 Zaman Dilimi: {TF_LABEL}\n"
+        f"📈 Son {BO_LOOKBACK} mumun {'tepesi' if sig['sign'] == 1 else 'dibi'} ({p(sig['level'])}) {kind} kırıldı · ADX {sig['adx']:.0f}\n"
+        f"🟢 Giriş: {p(sig['entry'])} (piyasa)\n"
+        f"🔴 Stop: {p(sig['sl'])} (%{sig['sl_dist'] * 100:.2f} · {lev}x ile ~%{sig['sl_dist'] * 100 * lev:.0f})\n"
+        f"☠️ Tahmini likidasyon: {p(sig['liq_full'])}\n"
+        f"🎯 Hedef 1 (%50 kapat): {p(sig['tp1'])}\n"
+        f"🎯 Hedef 2 (kalan): {p(sig['tp'])}\n"
+    )
+    if BO_BE_ATR > 0:
+        msg += f"🛡 Fiyat {BO_BE_ATR:g} ATR lehe gidince stop girişe çekilir\n"
+    rr = abs(sig["tp"] - sig["entry"]) / abs(sig["entry"] - sig["sl"])
+    msg += f"⚖️ Risk/Reward (Hedef 2): {rr:.1f}R\n"
+    msg += (f"💵 Teminat: {_usd(margin)} → pozisyon {_usd(sig['notional'])} · "
+            f"stop olursa -{_usd(sig['risk_usd'])} (bakiyenin %{sig['risk_usd'] / sig['balance'] * 100:.1f} kadarı)\n")
+    msg += f"⚙️ Kaldıraç: {lev}x\n📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ"
+    return msg
 
 
 def fmt_price(ex, symbol, price):
@@ -1079,6 +1233,7 @@ def dashboard_data():
                 "sl": st_["sl"], "tp": tp2, "tp1": tp1, "tp1_done": st_["tp1_done"],
                 "filled": sum(st_["filled"]), "levels": len(st_["entries"]), "filled_weight": w,
                 "last_price": last, "opened_ms": t["opened_ms"], "margin": t.get("margin"),
+                "leverage": t.get("leverage", LEVERAGE), "strategy": t.get("strategy", "reversal"),
                 "pnl_pct": (sign * (last - avg) / avg * 100) if last else None,
             })
         return {
@@ -1089,6 +1244,9 @@ def dashboard_data():
                 "timeframe": TF_LABEL, "leverage": LEVERAGE, "margin_mode": MARGIN_MODE,
                 "rr": f"TP {TP1_ATR:g}/{TP2_ATR:g} ATR", "levels": len(LADDER_WEIGHTS), "supertrend": USE_SUPERTREND,
                 "weights": [round(x * 100) for x in LADDER_WEIGHTS], "level_mode": LEVEL_MODE,
+                "strategy": STRATEGY, "risk_pct": RISK_PCT,
+                "strategy_label": (f"Trend kırılımı · {BO_LOOKBACK} mum · stop {BO_SL_ATR:g} ATR · TP {BO_TP1_ATR:g}/{BO_TP2_ATR:g} ATR · risk %{RISK_PCT:g}"
+                                   if STRATEGY == "breakout" else "Dönüş sistemi (kademeli)"),
                 "persistent": _gist_enabled(), "dry_run": DRY_RUN,
                 "account_balance": ACCOUNT_BALANCE, "balance": current_balance(),
                 "margin_pct": SLOT_FRACTION * LADDER_ALLOC * 100, "max_open": MAX_OPEN_TRADES,
@@ -1108,7 +1266,10 @@ def register_trade(ex, symbol, sig, message_id):
     trade = {
         "symbol": symbol, "coin": f"{base}/USDT", "direction": sig["direction"],
         "entry": sig["entry"], "sl": sig["sl"], "tp": sig["tp"], "liq_full": sig.get("liq_full"),
-        "state": new_state(sig),
+        "state": (new_state(sig, tp1_atr=BO_TP1_ATR, tp2_atr=BO_TP2_ATR, tp1_frac=0.5, move_be=True, be_atr=BO_BE_ATR)
+                  if sig.get("strategy") == "breakout" else new_state(sig)),
+        "strategy": sig.get("strategy", "reversal"), "leverage": sig.get("leverage", LEVERAGE),
+        "max_hours": BO_MAX_HOURS if sig.get("strategy") == "breakout" else MAX_TRADE_HOURS,
         "opened_ms": int(opened.timestamp() * 1000),
         "last_checked_ms": int(opened.timestamp() * 1000),
         "message_id": message_id,
@@ -1153,7 +1314,7 @@ def _money_signed(v):
 def trade_usd(t, net):
     if not t.get("margin"):
         return None
-    return max(t["margin"] * LEVERAGE * net, -t["margin"])
+    return max(t["margin"] * t.get("leverage", LEVERAGE) * net, -t["margin"])
 
 
 def _fill_message(ex, t, idx):
@@ -1223,7 +1384,8 @@ def _close_message(ex, t, now_ms):
     net, ws, nf = st_result(s)
     n = len(s["entries"])
     pnl = net / ws * 100                          # dolan pozisyona gore % (fiyat bazli)
-    lev = pnl * LEVERAGE
+    L = t.get("leverage", LEVERAGE)
+    lev = pnl * L
     usd = trade_usd(t, net)
     st = TRADES["stats"]
     total = st["tp"] + st["sl"]
@@ -1240,9 +1402,9 @@ def _close_message(ex, t, now_ms):
         f"{head}\n"
         f"📌 Coin: {t['coin']}\n"
         f"📊 Yön: {t['direction']}\n"
-        f"🟢 Ortalama giriş: {p(avg)} ({nf}/{n} kademe)\n"
-        f"🏁 Son çıkış: {p(s['exit'])}\n"
-        f"{'💰' if net >= 0 else '📉'} Sonuç: {_signed(pnl, 2)} ({LEVERAGE}x ile ~{_signed(lev, 1)})\n"
+        + (f"🟢 Giriş: {p(avg)}\n" if n == 1 else f"🟢 Ortalama giriş: {p(avg)} ({nf}/{n} kademe)\n")
+        + f"🏁 Son çıkış: {p(s['exit'])}\n"
+        f"{'💰' if net >= 0 else '📉'} Sonuç: {_signed(pnl, 2)} ({L}x ile ~{_signed(lev, 1)})\n"
     )
     if usd is not None:
         msg += f"💵 {_money_signed(usd)} · Bakiye: {_usd(current_balance())}\n"
@@ -1283,7 +1445,8 @@ def check_trade(ex, t):
                 break
         t["last_price"] = float(raw[-1][4])
     now_ms = int(time.time() * 1000)
-    if not s["closed"] and MAX_TRADE_HOURS > 0 and now_ms - t["opened_ms"] > MAX_TRADE_HOURS * 3600_000 \
+    max_h = t.get("max_hours", MAX_TRADE_HOURS)
+    if not s["closed"] and max_h > 0 and now_ms - t["opened_ms"] > max_h * 3600_000 \
             and t.get("last_price"):
         close_market(s, t["last_price"])
         events.append(("EXPIRED", t["last_price"], None))
@@ -1326,7 +1489,8 @@ def monitor_trades(ex):
                     "tp": t.get("tp"), "entry1": s["entries"][0], "filled": nf, "levels": len(s["entries"]),
                     "filled_weight": ws, "tp1_hit": s["tp1_done"],
                     "pnl_pct": round(net / ws * 100, 4), "pos_ret_pct": round(net * 100, 4), "net": True,
-                    "leverage": LEVERAGE, "opened_ms": t["opened_ms"], "closed_ms": now_ms,
+                    "leverage": t.get("leverage", LEVERAGE), "strategy": t.get("strategy", "reversal"),
+                    "opened_ms": t["opened_ms"], "closed_ms": now_ms,
                     "margin": t.get("margin"), "usd": round(usd, 4) if usd is not None else None,
                 })
             remote = True
@@ -1351,7 +1515,13 @@ def scan(ex):
     symbols = get_top_symbols(ex)
     if not symbols:
         raise RuntimeError("Sembol listesi alinamadi (borsa erisimi?)")
-    log.info("Tarama basladi: %d sembol, %s bos slot", len(symbols), free if free < 10**6 else "sinirsiz")
+    btc = None
+    if STRATEGY == "breakout":
+        btc = btc_regime(ex)
+        if btc is None:
+            raise RuntimeError("BTC 4s rejimi alinamadi")
+    log.info("Tarama basladi: %d sembol, %s bos slot%s", len(symbols), free if free < 10**6 else "sinirsiz",
+             f" | BTC rejim: {'YUKARI' if btc[0] else 'ASAGI' if btc[1] else 'NOTR'}" if btc else "")
 
     # 1) Tum coinleri tara, sinyalleri topla
     candidates = []
@@ -1365,7 +1535,7 @@ def scan(ex):
             if df is None:
                 continue
             dfi = add_indicators(df)
-            sig = evaluate(dfi)
+            sig = evaluate(dfi, btc)
             if sig:
                 candidates.append((sym, sig, dfi))
                 log.info("ADAY %s %s | ADX=%.1f K=%.1f D=%.1f", sym, sig["direction"], sig["adx"], sig["k"], sig["d"])
@@ -1380,10 +1550,13 @@ def scan(ex):
             log.info("Slot dolu, atlanan sinyal: %s %s (ADX %.1f)", sym, sig["direction"], sig["adx"])
             continue
         try:
-            slot, total, margins = plan_margin()
-            sig.update(balance=current_balance(), slot=slot, margins=margins)
-            msg = build_message(ex, sym, sig)
-            log.info("SINYAL %s %s | ADX=%.1f teminat=$%.0f", sym, sig["direction"], sig["adx"], total)
+            size_position(sig)
+            if sum(sig["margins"]) <= 1:
+                log.info("Teminat yetersiz, sinyal atlandi: %s", sym)
+                continue
+            msg = build_message_breakout(ex, sym, sig) if sig.get("strategy") == "breakout" else build_message(ex, sym, sig)
+            log.info("SINYAL %s %s | ADX=%.1f teminat=$%.0f pozisyon=$%.0f", sym, sig["direction"], sig["adx"],
+                     sum(sig["margins"]), sig.get("notional", 0))
 
             msg_id = None
             if SEND_CHART:
@@ -1414,6 +1587,7 @@ def next_scan_time():
 
 
 def main():
+    log.info("Strateji: %s | risk %%%g/islem | BTC rejim EMA%d (4s)", STRATEGY, RISK_PCT, BTC_REGIME_EMA)
     log.info("Bot basliyor | TF=%s TOP_N=%d ADX>%.0f Lev=%dx Kademe=%s (%s) TP=%g/%g ATR Slot=%d ST=%s DRY_RUN=%s",
              TIMEFRAME, TOP_N_SYMBOLS, ADX_THRESHOLD, LEVERAGE,
              "/".join(f"{w * 100:.0f}" for w in LADDER_WEIGHTS), LEVEL_MODE, TP1_ATR, TP2_ATR,
@@ -1445,7 +1619,8 @@ def main():
 
     if SEND_STARTUP_MESSAGE:
         extra =f", {len(TRADES['open'])} açık işlem takipte" if TRACK_TRADES and TRADES["open"] else ""
-        send_telegram(f"🤖 Sinyal botu başlatıldı ({TF_LABEL}, MEXC Futures{extra}).")
+        strat = "Trend kırılımı" if STRATEGY == "breakout" else "Dönüş sistemi"
+        send_telegram(f"🤖 Sinyal botu başlatıldı · {strat} · {TF_LABEL} · MEXC Futures{extra}.")
 
     next_scan = datetime.now(timezone.utc) if RUN_SCAN_ON_START else next_scan_time()
     log.info("Ilk tarama: %s", next_scan.astimezone(DISPLAY_TZ).strftime("%H:%M:%S"))
@@ -1643,6 +1818,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   }
 
   function usd(t, st){
+    // risk bazli islemler: botun gercek $ sonucunu girilen bakiyeye oranla
+    if (t.usd != null && t.strategy === "breakout") return t.usd * st.bal / (S.data?.bot.account_balance || st.bal);
     const lev = t.leverage || (S.data?.bot.leverage ?? 15);
     const notional = st.margin * lev;
     let v = notional * (t.pos_ret_pct ?? t.pnl_pct*(t.filled_weight??1)) / 100;
@@ -1663,7 +1840,9 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     if (!S.data) return;
     const d = S.data, st = settings();
     const b = d.bot;
-    $("cfg").textContent = `${b.timeframe} · ${b.leverage}x ${b.margin_mode} · ${b.levels} kademe ${(b.weights||[]).join("/")} · ${b.rr} · en fazla ${b.max_open} işlem · SuperTrend ${b.supertrend?"açık":"kapalı"}${b.dry_run?" · DRY_RUN":""}`;
+    $("cfg").textContent = b.strategy === "breakout"
+      ? `${b.timeframe} · ${b.strategy_label} · en fazla ${b.max_open} işlem${b.dry_run?" · DRY_RUN":""}`
+      : `${b.timeframe} · ${b.leverage}x ${b.margin_mode} · ${b.levels} kademe ${(b.weights||[]).join("/")} · ${b.rr} · en fazla ${b.max_open} işlem · SuperTrend ${b.supertrend?"açık":"kapalı"}${b.dry_run?" · DRY_RUN":""}`;
     $("persistWarn").style.display = b.persistent ? "none" : "block";
     const ok = b.last_scan_ok !== false;
     $("statusDot").className = "dot " + (ok ? "ok" : "err");
@@ -1746,12 +1925,12 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     $("openCount").textContent = `(${open.length}${S.data.bot.max_open ? " / " + S.data.bot.max_open + " slot" : ""})`;
     if (!open.length){ $("openTbl").innerHTML = '<tr><td class="empty">Şu an açık işlem yok</td></tr>'; return; }
     const lev = S.data.bot.leverage;
-    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">${lev}x</th><th class="r">Süre</th></tr></thead><tbody>` +
+    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">Kaldıraçlı</th><th class="r">Süre</th></tr></thead><tbody>` +
       open.slice().sort((a,b)=>b.opened_ms-a.opened_ms).map(t => {
         const p = t.pnl_pct;
         return `<tr><td>${fmtTime(t.opened_ms)}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td>
           <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.last_price)}</td><td class="r">${price(t.sl)}</td><td class="r">${t.tp1_done ? "✓ alındı" : price(t.tp1)}</td><td class="r">${price(t.tp)}</td>
-          <td>${t.filled}/${t.levels}</td><td class="r ${cls(p)}">${p==null?"—":pct(p)}</td><td class="r ${cls(p)}">${p==null?"—":pct(p*lev,1)}</td>
+          <td>${t.filled}/${t.levels}</td><td class="r ${cls(p)}">${p==null?"—":pct(p)}</td><td class="r ${cls(p)}">${p==null?"—":pct(p*(t.leverage||lev),1)}</td>
           <td class="r">${dur(S.data.now_ms - t.opened_ms)}</td></tr>`;
       }).join("") + "</tbody>";
   }
