@@ -110,6 +110,18 @@ set DRY_RUN=true && python main.py   # Windows CMD
 | `SIGNAL_COOLDOWN_MIN` | 60 | Aynı coin için tekrar sinyal bekleme süresi (dk) |
 | `VWAP_ANCHOR_TZ` | UTC | VWAP'ın günlük sıfırlandığı saat dilimi (TradingView varsayılanı UTC) |
 | `SCAN_DELAY_SEC` | 15 | Mum kapanışından kaç sn sonra taransın |
+| `USE_SUPERTREND` | true | LONG için SuperTrend yukarı (yeşil), SHORT için aşağı (kırmızı) olmalı |
+| `ST_PERIOD` / `ST_MULT` | 10 / 3 | SuperTrend ayarları |
+| `ENTRY_LEVELS` | 3 | Kademe sayısı (`1` → tek giriş) |
+| `ENTRY_STEP_ATR` | 0.5 | Kademeler arası mesafe (ATR cinsinden) |
+| `ENTRY_WEIGHTS` | 33,33,34 | Her kademenin pozisyondaki % payı |
+| `NOTIFY_ENTRY_FILLS` | true | 2./3. kademe dolunca mesaj gönder |
+| `TRACK_TRADES` | true | Sinyalleri izle, TP / Stop olunca mesaj gönder |
+| `MAX_TRADE_HOURS` | 48 | Bu süre içinde TP/Stop gelmezse "süre doldu" diye kapat |
+| `ONE_TRADE_PER_SYMBOL` | true | Açık işlem varken aynı coine yeni sinyal verme |
+| `SEND_CHART` | true | Sinyalle birlikte grafik görseli gönder (`false` → sadece metin) |
+| `CHART_BARS` | 80 | Grafikte gösterilen mum sayısı |
+| `CHART_EMA_FAST` / `CHART_EMA_SLOW` | 50 / 200 | Grafikteki EMA çizgileri (sadece görsel, sinyali etkilemez) |
 | `DRY_RUN` | false | `true` → Telegram'a göndermez |
 | `SEND_STARTUP_MESSAGE` | true | Açılışta Telegram'a bilgi mesajı |
 
@@ -122,7 +134,11 @@ Her 15 dakikalık mum kapandıktan ~15 sn sonra, **sadece kapanmış mumlar** ü
 1. **ADX(14) ≥ 25** değilse → coin atlanır.
 2. **Stoch RSI (14,14,3,3)**: K çizgisi D'yi **20'nin altında yukarı** keserse LONG adayı, **80'in üstünde aşağı** keserse SHORT adayı.
 3. **VWAP filtresi**: LONG için kapanış VWAP üstünde, SHORT için altında olmalı.
-4. **Giriş** = sinyal mumunun kapanışı · **Stop** = Giriş ∓ 1.5×ATR(14) · **Hedef** = Giriş ± 1.5×Risk.
+4. **SuperTrend (10,3)** sinyal yönüyle aynı yönde olmalı.
+5. **Kademeli giriş:** Giriş 1 = sinyal mumunun kapanışı, Giriş 2 = Giriş 1 ∓ 0.5×ATR, Giriş 3 = Giriş 1 ∓ 1.0×ATR.
+   **Stop** = Giriş 1 ∓ 1.5×ATR(14) ve **Hedef** = Giriş 1 ± 1.5×Risk; ikisi de kademelerden bağımsız olarak **sabit** kalır.
+   Sadece 1. kademe dolarsa R:R 1.5 olur, üçü de dolarsa ortalama iyileştiği için R:R ~2.8'e çıkar.
+6. **Takip:** Bot dakikada bir 1 dakikalık mumlara bakar. Kademe dolunca, TP veya Stop olunca orijinal sinyal mesajına yanıt olarak bildirim gönderir. Aynı dakikada hem TP hem Stop görülürse temkinli davranıp Stop sayar.
 
 Mesajdaki "**%X zarar**", fiyatın stopa kadar hareket yüzdesidir. 15x kaldıraçta teminat kaybı bunun yaklaşık 15 katıdır (örn. %1 stop ≈ %15 teminat kaybı).
 
@@ -132,5 +148,5 @@ Mesajdaki "**%X zarar**", fiyatın stopa kadar hareket yüzdesidir. 15x kaldıra
 
 - Bu bir sinyal aracıdır, yatırım tavsiyesi değildir. Gerçek parayla kullanmadan önce stratejiyi TradingView'da geriye dönük test et veya birkaç hafta `DRY_RUN` / küçük pozisyonla izle.
 - Not: Stoch RSI dipte yukarı kesişim (dönüş sinyali) ile "fiyat VWAP üstünde" (trend) şartı aynı anda nadiren oluşur. Bu da sinyal sayısını azaltır. Bu sana verdiğin kuralların bilinçli sonucudur: az ama filtrelenmiş sinyal.
-- Render'ın dosya sistemi kalıcı değildir; bot yeniden başlarsa "cooldown" hafızası sıfırlanır (zararsız).
+- Render'ın dosya sistemi kalıcı değildir. Açık işlemler `trades.json`'a yazılır; uygulama yeniden başlarsa korunur ama **yeni deploy** yapılırsa silinir. Deploy'u açık işlem yokken yap; yoksa o işlemlerin TP/Stop mesajı gelmez.
 - Loglarda sürekli `Ag hatasi` görürsen MEXC o bölgeden erişimi kısıtlıyor olabilir; Render'da bölgeyi Frankfurt/Singapur seç.
