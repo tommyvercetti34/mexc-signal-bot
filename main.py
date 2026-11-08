@@ -1643,6 +1643,10 @@ def evaluate_strategy(sid, df, btc, h1=None, spec=None):
         lb = int(p["lookback"])
         plan["level"] = float(df["high"].iloc[-lb - 1:-1].max() if sign == 1 else df["low"].iloc[-lb - 1:-1].min())
         plan["lookback"] = lb
+    try:                                          # sadece etiket: SuperTrend yonu sinyalle ayni mi? (kurali degistirmez)
+        plan["st_agree"] = bool(int(cur["st_dir"]) == sign)
+    except (KeyError, ValueError, TypeError):
+        plan["st_agree"] = None
     s = new_state(plan, tp1_atr=tp1_atr, tp2_atr=tp2_atr, tp1_frac=0.5, move_be=True, be_atr=be_atr)
     tp1, tp2 = st_targets(s)
     plan.update(candle_ts=cur["ts"], adx=float(cur["adx"]), k=float(cur["k"]), d=float(cur["d"]),
@@ -1710,6 +1714,8 @@ def build_message_single(ex, symbol, sig):
         lg = sig["direction"] == "LONG"
         reason = STRUCT_REASONS[fam].format(side="üstünde" if lg else "altında", col="yeşil" if lg else "kırmızı")
         reason += f" · TP {sig['tp_r'][0]:g}R / {sig['tp_r'][1]:g}R"
+        if sig.get("st_agree") is not None:
+            reason += " · SuperTrend " + ("aynı yönde ✓" if sig["st_agree"] else "ters yönde ✗")
     elif fam == "supertrend":
         reason = (f"📈 SuperTrend ({ST_PERIOD},{ST_MULT:g}) {'yukarı' if sig['direction'] == 'LONG' else 'aşağı'} döndü"
                   f" · ADX {sig['adx']:.0f}")
@@ -1946,7 +1952,7 @@ def has_open_trade(symbol):
 
 
 def register_trade(ex, symbol, sig, message_id):
-    opened = sig["candle_ts"] + timedelta(minutes=TF_MINUTES)   # sinyal mumunun kapanis ani = giris ani
+    opened = sig["candle_ts"] + timedelta(minutes=int(sig.get("tf") or TF_MINUTES))   # sinyal mumunun KAPANISI = giris ani (stratejinin kendi TF'i)
     base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0]) if ex.markets else symbol
     trade = {
         "symbol": symbol, "coin": f"{base}/USDT", "direction": sig["direction"],
@@ -1961,6 +1967,7 @@ def register_trade(ex, symbol, sig, message_id):
         "last_checked_ms": int(opened.timestamp() * 1000),
         "message_id": message_id,
         "margin": sum(sig["margins"]) if sig.get("margins") else None,   # toplam butce teminati ($)
+        "st_agree": sig.get("st_agree"),
     }
     with _trade_lock:
         TRADES["open"].append(trade)
@@ -2180,6 +2187,7 @@ def monitor_trades(ex):
                     "family": t.get("family", "scalein"),
                     "opened_ms": t["opened_ms"], "closed_ms": now_ms,
                     "margin": t.get("margin"), "usd": round(usd, 4) if usd is not None else None,
+                    "st_agree": t.get("st_agree"),
                 })
             remote = True
             log.info("ISLEM KAPANDI %s %s -> %s (%.2f%%)", t["symbol"], t["direction"], s["outcome"], net / ws * 100)
@@ -2659,10 +2667,17 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   }
 
   function renderStrategies(rows){
-    const names = S.data.bot.strategy_names || {};
+    const names = Object.assign({}, S.data.bot.strategy_names || {});
     const by = {};
     rows.forEach(t => { const k = t.strategy || "scalein_15m"; (by[k] ??= []).push(t); });
-    const keys = Object.keys(by);
+    rows.forEach(t => {                               // SuperTrend etiketi: ayni islemler iki alt gruba ayrilir
+      if (t.st_agree === true || t.st_agree === false){
+        const k = (t.strategy || "") + (t.st_agree ? "|st1" : "|st0");
+        (by[k] ??= []).push(t);
+      }
+    });
+    Object.keys(by).forEach(k => { const [b, v] = k.split("|"); if (v) names[k] = "  ↳ " + (names[b] || b) + (v === "st1" ? " · SuperTrend aynı yönde" : " · SuperTrend ters"); });
+    const keys = Object.keys(by).sort();
     const card = $("stratCard");
     if (!keys.length){ card.style.display = "none"; return; }
     card.style.display = "block";
