@@ -1080,9 +1080,12 @@ FLIP_MODES = {
     "sabit": "Tüm teminatla pozisyon, SuperTrend dönünce (mum kapanışı) ters",
     "risk": "Stop SuperTrend çizgisinde ve çizgiyi TAKİP ediyor; stop olursa kayıp ≈ bakiyenin %{riskp}",
     "stop": "Tüm teminatla pozisyon + sabit stop (bakiyenin %{riskp})",
+    "trail": "Tüm teminatla pozisyon, stop SuperTrend çizgisinde ve çizgiyi TAKİP ediyor",
 }
 
 
+ACTIVE_FLIP_MODES = [m.strip() for m in _env("RS_FLIP_MODES", "sabit,risk,stop").split(",") if m.strip() in FLIP_MODES] \
+    or list(FLIP_MODES)
 RS_FLIP_COMPOUND = _env("RS_FLIP_COMPOUND", "true").lower() in ("1", "true", "yes", "evet")
 
 
@@ -1135,7 +1138,7 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
         cur = dirs[i]
         flipped = np.isfinite(prev) and np.isfinite(cur) and cur != prev
         prev = cur
-        if pos and mode == "risk" and np.isfinite(line[i]):   # iz suren stop: cizgi lehe gittikce stop da gelir
+        if pos and mode in ("risk", "trail") and np.isfinite(line[i]):   # iz suren stop: cizgi lehe gittikce stop da gelir
             stop = max(stop, line[i]) if pos == 1 else min(stop, line[i])
         if not flipped:
             continue
@@ -1151,6 +1154,11 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
                 continue
             risk_usd = RS_FLIP_RISK * base / RS_FLIP_MARGIN
             notional = min(risk_usd / dist, cap)
+            stop = line[i]
+        elif mode == "trail":                    # tum teminatla pozisyon, stop SuperTrend cizgisinde ve takip ediyor
+            if not np.isfinite(line[i]):
+                continue
+            notional = cap
             stop = line[i]
         elif mode == "stop":
             notional = cap
@@ -1196,7 +1204,7 @@ def run_flip(bot, ex=None, progress=None):
         sts = {b: bot.calc_supertrend(fr, per, mult) for b, fr in frames.items()}
         lines = {b: np.asarray(v[0], float) for b, v in sts.items()}
         dirs = {b: np.asarray(v[1], float) for b, v in sts.items()}
-        for (mode, fname, tk) in [(m, f, t) for m in FLIP_MODES for f, t in FLIP_FEES]:
+        for (mode, fname, tk) in [(m, f, t) for m in ACTIVE_FLIP_MODES for f, t in FLIP_FEES]:
             row = {"v": vname, "f": fname, "m": mode, "coins": {}}
             for half, (a, z) in (("h1", (t0, mid)), ("h2", (mid, t1 + pd.Timedelta(minutes=1)))):
                 agg = {"n": 0, "fees": 0.0, "net": 0.0, "liqs": 0, "pnls": []}
@@ -1224,7 +1232,7 @@ def format_flip_report(bot, res, coins, t0, mid, t1, days):
            f"{RS_FLIP_LEV:g}x · {'BİLEŞİK (kâr sonraki işleme eklenir)' if RS_FLIP_COMPOUND else 'sabit teminat'} · "
            f"kayma %{RS_FLIP_SLIP * 100:g}/emir · funding hariç · her yarı ${RS_FLIP_MARGIN:,.0f} ile başlar · "
            f"tutarlar TÜM coinlerin toplam kâr/zararı", ""]
-    for mode, desc in FLIP_MODES.items():
+    for mode, desc in [(m, FLIP_MODES[m]) for m in ACTIVE_FLIP_MODES]:
         out.append(f"■ {desc.replace('{riskp}', f'{RS_FLIP_RISK / RS_FLIP_MARGIN * 100:g}')}")
         for fname, _ in FLIP_FEES:
             rows = [r for r in res if r["m"] == mode and r["f"] == fname]
