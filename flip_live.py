@@ -183,6 +183,28 @@ class LighterBook:
             raise RuntimeError("Lighter emir defteri bos")
         return bids, asks
 
+    def trades(self, limit=100):
+        """Son islemler: [(anahtar, ts_ms, fiyat)]. Lighter grafigi islem fiyatlarindan cizilir; mumlari bundan kurariz."""
+        if self.market_id is None:
+            self.resolve()
+        j = self._get("/api/v1/recentTrades", market_id=self.market_id, limit=limit)
+        rows = (j.get("trades") or j.get("data") or []) if isinstance(j, dict) else (j or [])
+        out = []
+        for t in rows:
+            try:
+                ts = int(float(t.get("timestamp") or t.get("time") or t.get("ts") or 0))
+                if ts <= 0:
+                    continue
+                if ts < 10**12:
+                    ts *= 1000                     # saniye -> ms
+                elif ts > 10**14:
+                    ts //= 1000                    # mikrosaniye -> ms
+                key = t.get("trade_id") or t.get("tx_hash") or f"{ts}:{t.get('price')}:{t.get('size')}"
+                out.append((str(key), ts, float(t["price"])))
+            except Exception:
+                continue
+        return out
+
 
 def walk(levels, notional_usd):
     """Defteri yuruyerek notional_usd'lik market emrinin ortalama dolum fiyati. (fiyat, doldu_mu)"""
@@ -203,6 +225,7 @@ def _save(bot, remote=False):
         S["trades"] = S["trades"][-3000:]
         S["orders"] = S["orders"][-6000:]
         S["spreads"] = S["spreads"][-3000:]
+        S["tc"] = {str(k): v for k, v in TC.items()}
         payload = json.dumps(S, ensure_ascii=False, default=float)
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -322,10 +345,15 @@ def on_bar(bot, df, book_src, t_close):
             S["stop"] = max(S["stop"], ln) if S["pos"] == 1 else min(S["stop"], ln)
         if not flipped:
             return
+        S["last_flip"] = {"t": int((t_close or time.time()) * 1000), "dir": cur, "close": close, "line": ln,
+                          "src": CANDLE_SRC.get("name"), "own": CANDLE_SRC.get("own", 0)}
+        bot.log.info("Flip donus: %s · kapanis %.1f · cizgi %.1f · mum kaynagi %s",
+                     "LONG" if cur == 1 else "SHORT", close, ln, CANDLE_SRC.get("name"))
         if S["pos"]:
             _close(bot, book, "flip", close, t_close)
         if not S["halted"]:
             _open(bot, book, cur, ln, close, t_close)
+
     _save(bot, remote=True)
 
 
@@ -407,6 +435,8 @@ def summary():
         "delay_s": float(np.mean([o["ms"] for o in od if o["ms"]]) / 1000) if any(o["ms"] for o in od) else None,
         "curve": curve[-2000:], "trades": tr[-40:][::-1], "current": cur,
         "candles": CANDLE_SRC.get("name"), "own_candles": CANDLE_SRC.get("own", 0),
+        "trade_candles": own_trade_df()[1], "trade_gaps": _SEEN["gaps"], "trade_polls": _SEEN["polls"],
+        "trade_err": _SEEN.get("err"), "last_flip": S.get("last_flip"),
         "upnl": upnl, "last_bid": LAST.get("bid"), "last_ask": LAST.get("ask"), "last_t": LAST.get("t"),
     }
 
@@ -417,7 +447,7 @@ def report_text():
         eq, start, peak = S["eq"], S["start_eq"], S["peak"]
     hours = (time.time() * 1000 - S["started"]) / 3600000
     pct = lambda x: f"%{x * 100:.4f}"
-    lines = [f"🔁 LIGHTER KÂĞIT TAKİP · {FLIP_SYMBOL} 1 dk · SuperTrend({FLIP_ST_PERIOD},{FLIP_ST_MULT:g}) · "
+    lines = [f"🔁 LIGHTER KÂĞIT TAKİP · {FLIP_SYMBOL} 1 dk · SuperTrend({FLIP_ST_PERIOD},{FLIP_ST_MULT:g}) · " +
              (f"TÜM TEMİNAT" if FLIP_SIZING == "full" else f"risk %{FLIP_RISK_PCT:g}") + f" · {FLIP_LEV:g}x" + (f" · TP %{FLIP_TP_ROE:g}" if FLIP_TP_ROE > 0 else "") + (" · 🛑 ACİL FREN AKTİF" if S["halted"] else ""),
              f"⏱ {hours:.1f} saat · {len(tr)} işlem · bakiye ${eq:,.2f} (başlangıç ${start:,.0f}, "
              f"{(eq / start - 1) * 100:+.1f}%) · zirveden düşüş %{(1 - eq / peak) * 100:.1f}"]
@@ -447,7 +477,9 @@ def report_text():
                      f"ort. kayıp ${p[p <= 0].mean() if (p <= 0).any() else 0:.2f} · stop ile kapanan "
                      f"%{np.mean([t['why'] == 'stop' for t in tr]) * 100:.0f}")
     src = CANDLE_SRC.get("name") or "?"
-    if src == "MEXC" and CANDLE_SRC.get("own"):
+    if src == "Lighter işlemleri":
+        src = f"Lighter'daki gerçek işlem fiyatları (son {CANDLE_SRC.get('own', 0)} dk, grafikle aynı kaynak)"
+    elif src == "MEXC" and CANDLE_SRC.get("own"):
         src = f"Lighter defterinden kurulan mumlar (son {CANDLE_SRC['own']} dk) + MEXC (fiyat farkı düzeltilmiş)"
     lines.append(f"🕯 Sinyal mumları: {src}")
     lines.append("Gerçek para kullanılmıyor; dolumlar Lighter'ın gerçek emir defterinden hesaplanıyor. Funding hariç.")
@@ -477,10 +509,76 @@ def record_mid(book):
         c[1], c[2], c[3], c[4] = max(c[1], mid), min(c[2], mid), mid, c[4] + 1
 
 
+FLIP_OWN_MIN = _env("FLIP_OWN_MIN", 90, int)              # bu kadar kesintisiz islem-mumu olunca SADECE onlar kullanilir
+TC = {}                                                    # Lighter islemlerinden mumlar: dakika_ms -> [o, h, l, c, adet]
+_SEEN = {"keys": set(), "order": [], "gaps": 0, "polls": 0}
+
+
+def record_trades(book_src):
+    """Lighter'daki gercek islem fiyatlarindan 1 dk mum kur (Lighter grafigiyle ayni kaynak)."""
+    rows = book_src.trades(100)
+    if not rows:
+        return 0
+    rows.sort(key=lambda r: (r[1], r[0]))
+    new = [r for r in rows if r[0] not in _SEEN["keys"]]
+    _SEEN["polls"] += 1
+    if _SEEN["order"] and len(new) == len(rows) and len(rows) >= 100:
+        _SEEN["gaps"] += 1                         # 100 islemin hepsi yeni: arada kacirilmis islem olabilir
+    for key, ts, px in new:
+        _SEEN["keys"].add(key)
+        _SEEN["order"].append(key)
+        m = ts // 60_000 * 60_000
+        c = TC.get(m)
+        if c is None:
+            TC[m] = [px, px, px, px, 1]
+        else:
+            c[1], c[2], c[3], c[4] = max(c[1], px), min(c[2], px), px, c[4] + 1
+    if len(_SEEN["order"]) > 5000:
+        for k in _SEEN["order"][:-3000]:
+            _SEEN["keys"].discard(k)
+        _SEEN["order"] = _SEEN["order"][-3000:]
+    cutoff = int(time.time() * 1000) - 400 * 60_000
+    for k in [k for k in TC if k < cutoff]:
+        TC.pop(k, None)
+    return len(new)
+
+
+def own_trade_df():
+    """Kapanmis islem-mumlari; son dakikaya kadar kesintisiz kac dakika oldugu ile."""
+    now_ms = int(time.time() * 1000)
+    last = now_ms // 60_000 * 60_000 - 60_000              # son kapanmis dakika
+    if last not in TC:
+        return None, 0
+    keys, k, prev = [], last, None
+    miss = 0
+    while k >= last - 400 * 60_000:
+        if k in TC:
+            miss = 0
+        else:
+            miss += 1
+            if miss > 2:                                   # 2 dk'dan uzun bosluk = kesinti
+                break
+        keys.append(k)
+        k -= 60_000
+    keys = keys[::-1]
+    while keys and keys[0] not in TC:
+        keys.pop(0)
+    rows = []
+    for k in keys:
+        if k in TC:
+            o, h, l, c, _ = TC[k]
+        else:                                              # islem olmayan dakika: onceki kapanistan duz mum
+            o = h = l = c = rows[-1][4]
+        rows.append((k, o, h, l, c))
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close"])
+    return df, len(df)
+
+
 def hybrid_candles(df):
-    """MEXC mumlarini Lighter'a gore kaydir; Lighter defterinden kurdugumuz dakikalar varsa onlari kullan."""
+    """MEXC mumlarini Lighter'a gore kaydir; Lighter'dan kurdugumuz dakikalar (once islem, yoksa defter ortasi) yerine konur."""
     now_ms = int(time.time() * 1000)
     own = {k: v for k, v in MID.items() if k + 60_000 <= now_ms and v[4] >= 5}
+    own.update({k: v for k, v in TC.items() if k + 60_000 <= now_ms})
     if not own:
         return df, 0
     d = df.copy()
@@ -500,7 +598,7 @@ def hybrid_candles(df):
 
 def _candles(bot, ex, book_src=None):
     """Sinyal mumlari: once Lighter (islem yapilan yer), olmazsa MEXC."""
-    if book_src is not None and (CANDLE_SRC["name"] != "MEXC" or time.time() - CANDLE_SRC.get("t", 0) > 1800):
+    if book_src is not None and (CANDLE_SRC["name"] in (None, "Lighter") or time.time() - CANDLE_SRC.get("t", 0) > 1800):
         try:
             df = book_src.candles()
             if CANDLE_SRC["name"] != "Lighter":
@@ -514,8 +612,18 @@ def _candles(bot, ex, book_src=None):
                 bot.log.warning("Lighter mumlari alinamadi (%s); sinyal MEXC mumlarindan", e)
                 bot.send_telegram(f"⚠️ Lighter mum verisi alınamadı ({e}); sinyal MEXC mumlarından hesaplanacak. "
                                   "Fiyat farkı yüzünden dönüşler grafikle birebir örtüşmeyebilir.")
+    own, n_own = own_trade_df()
+    if own is not None and n_own >= FLIP_OWN_MIN:
+        if CANDLE_SRC.get("name") != "Lighter işlemleri":
+            CANDLE_SRC["name"] = "Lighter işlemleri"
+            bot.log.info("Flip sinyal mumlari: Lighter islemlerinden (%d dk)", n_own)
+        CANDLE_SRC["own"] = n_own
+        return own
+    if CANDLE_SRC.get("name") not in ("MEXC", None):
+        bot.log.warning("Lighter islem mumlari yetersiz (%d dk); sinyal yine MEXC+Lighter karmasindan", n_own)
+        CANDLE_SRC["name"] = "MEXC"
     df = _candles_mexc(bot, ex)
-    if df is not None and MID:
+    if df is not None and (MID or TC):
         df, n = hybrid_candles(df)
         CANDLE_SRC["own"] = n
     return df
@@ -538,6 +646,8 @@ def _candles_mexc(bot, ex):
 def run(bot, ex_factory):
     log = bot.log
     _load(bot)
+    for k, v in (S.get("tc") or {}).items():            # yeniden baslatmada islem-mumlari kaybolmasin
+        TC.setdefault(int(k), list(v))
     if _env("FLIP_RESET", False, bool):
         S.clear()
         S.update(_new_state())
@@ -564,6 +674,13 @@ def run(bot, ex_factory):
                 except Exception as e:
                     S["errors"] = S.get("errors", 0) + 1
                     log.warning("Flip stop kontrolu hatasi: %s", e)
+                try:
+                    record_trades(book_src)
+                except Exception as e:
+                    _SEEN["err"] = str(e)[:160]
+                    if not _SEEN.get("warned"):
+                        _SEEN["warned"] = True
+                        log.warning("Lighter islem verisi alinamadi: %s", e)
                 time.sleep(min(FLIP_POLL_SEC, max(0.2, nxt - time.time())))
             t_close = int(time.time() // 60) * 60.0         # biten mumun kapanis ani
             df = _candles(bot, ex, book_src)
