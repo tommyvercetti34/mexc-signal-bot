@@ -121,28 +121,43 @@ class LighterBook:
         return out
 
     def candles(self, n=300):
-        """Lighter 1 dk mumlari (kapanmis). Alan adlari/zaman birimi farkli olabilir: esnek ayristirma."""
+        """Lighter 1 dk mumlari (kapanmis). Format/zaman birimi farkli olabilir: birkac istek bicimi denenir."""
         if self.market_id is None:
             self.resolve()
         now_ms = int(time.time() * 1000)
-        rows = None
-        for unit in (1, 1000):                    # once milisaniye, olmazsa saniye
+        now_s = now_ms // 1000
+        tries = [
+            dict(resolution="1m", start_timestamp=now_ms - (n + 5) * 60_000, end_timestamp=now_ms, count_back=n),
+            dict(resolution="1m", start_timestamp=now_s - (n + 5) * 60, end_timestamp=now_s, count_back=n),
+            dict(resolution="1m", start_timestamp=now_ms - (n + 5) * 60_000, end_timestamp=now_ms, count_back=n,
+                 set_timestamp_to_end="true"),
+            dict(resolution="1", start_timestamp=now_s - (n + 5) * 60, end_timestamp=now_s, count_back=n),
+        ]
+        if getattr(self, "_ok_try", None) is not None:
+            tries = [tries[self._ok_try]] + tries
+        rows, last = None, ""
+        for k, p in enumerate(tries):
             try:
-                j = self._get("/api/v1/candlesticks", market_id=self.market_id, resolution="1m",
-                              start_timestamp=(now_ms - (n + 5) * 60_000) // unit, end_timestamp=now_ms // unit,
-                              count_back=n)
-            except Exception:
+                r = self.http.get(f"{LIGHTER_URL}/api/v1/candlesticks", params=dict(market_id=self.market_id, **p), timeout=8)
+                last = f"HTTP {r.status_code}: {r.text[:180]}"
+                if r.status_code >= 300:
+                    continue
+                j = r.json()
+            except Exception as ex:
+                last = str(ex)[:180]
                 continue
-            rows = j.get("candlesticks") or j.get("candles") or (j if isinstance(j, list) else None)
+            rows = (j.get("candlesticks") or j.get("candles") or j.get("c") or j.get("data")) if isinstance(j, dict) else j
             if rows:
+                if getattr(self, "_ok_try", None) is None:
+                    self._ok_try = k
                 break
         if not rows:
-            raise RuntimeError("Lighter mum verisi bos")
+            raise RuntimeError(f"Lighter mum verisi bos · son cevap: {last}")
         out = []
         for c in rows:
             if isinstance(c, dict):
-                ts = c.get("timestamp", c.get("t", c.get("start_timestamp")))
-                o, h, l, cl = (c.get(k, c.get(k[0])) for k in ("open", "high", "low", "close"))
+                ts = c.get("timestamp", c.get("t", c.get("start_timestamp", c.get("time"))))
+                o, h, l, cl = (c.get(k2, c.get(k2[0])) for k2 in ("open", "high", "low", "close"))
             else:
                 ts, o, h, l, cl = c[:5]
             ts = int(float(ts))
@@ -152,7 +167,7 @@ class LighterBook:
         df = df.sort_values("ts").reset_index(drop=True)
         df = df[df["ts"] + 60_000 <= now_ms].reset_index(drop=True)
         if len(df) < 50 or (df["high"] < df["low"]).any():
-            raise RuntimeError("Lighter mum verisi gecersiz")
+            raise RuntimeError(f"Lighter mum verisi gecersiz ({len(df)} mum)")
         return df
 
     def book(self):
@@ -430,7 +445,7 @@ CANDLE_SRC = {"name": None}
 
 def _candles(bot, ex, book_src=None):
     """Sinyal mumlari: once Lighter (islem yapilan yer), olmazsa MEXC."""
-    if book_src is not None and CANDLE_SRC["name"] != "MEXC":
+    if book_src is not None and (CANDLE_SRC["name"] != "MEXC" or time.time() - CANDLE_SRC.get("t", 0) > 1800):
         try:
             df = book_src.candles()
             if CANDLE_SRC["name"] != "Lighter":
@@ -438,6 +453,7 @@ def _candles(bot, ex, book_src=None):
                 bot.log.info("Flip sinyal mumlari: Lighter")
             return df
         except Exception as e:
+            CANDLE_SRC["t"] = time.time()
             if CANDLE_SRC["name"] is None:
                 CANDLE_SRC["name"] = "MEXC"
                 bot.log.warning("Lighter mumlari alinamadi (%s); sinyal MEXC mumlarindan", e)
