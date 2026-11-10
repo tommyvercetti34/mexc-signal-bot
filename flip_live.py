@@ -290,6 +290,31 @@ def sample_spread(book_src):
 
 
 # ---------------------------------------------------------------------------- rapor
+def summary():
+    """Dashboard icin ozet (JSON)."""
+    if not S:
+        return {"enabled": False}
+    with _lock:
+        tr, od, sp = list(S["trades"]), list(S["orders"]), list(S["spreads"])
+        cur = {"pos": S["pos"], "entry": S["entry"], "stop": S["stop"], "notional": S["notional"], "opened": S["opened"]}
+        eq, start, peak, halted, started = S["eq"], S["start_eq"], S["peak"], S["halted"], S["started"]
+    costs = [o["cost"] for o in od]
+    by = {k: [o["cost"] for o in od if o["k"] == k] for k in ("giris", "flip_cikis", "stop")}
+    curve = [[started, start]] + [[t["c"], t["eq"]] for t in tr]
+    return {
+        "enabled": True, "symbol": FLIP_SYMBOL, "st": [FLIP_ST_PERIOD, FLIP_ST_MULT], "risk": FLIP_RISK_PCT, "lev": FLIP_LEV,
+        "max_dd": FLIP_MAX_DD_PCT, "halted": halted, "started": started, "eq": eq, "start": start, "peak": peak,
+        "dd": (1 - eq / peak) * 100 if peak else 0.0, "n_trades": len(tr), "n_orders": len(od),
+        "win": float(np.mean([t["pnl"] > 0 for t in tr]) * 100) if tr else None,
+        "avg_cost": float(np.mean(costs)) if costs else None, "threshold": BREAKEVEN_PCT,
+        "cost_by": {k: (float(np.mean(v)) if v else None, len(v)) for k, v in by.items()},
+        "half_spread": float(np.mean([s["hs"] for s in sp])) if sp else None,
+        "impact": float(np.mean([s["imp"] for s in sp])) if sp else None,
+        "delay_s": float(np.mean([o["ms"] for o in od if o["ms"]]) / 1000) if any(o["ms"] for o in od) else None,
+        "curve": curve[-2000:], "trades": tr[-40:][::-1], "current": cur,
+    }
+
+
 def report_text():
     with _lock:
         tr, od, sp = list(S["trades"]), list(S["orders"]), list(S["spreads"])

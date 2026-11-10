@@ -228,6 +228,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         key = parse_qs(url.query).get("key", [""])[0]
         try:
+            if url.path == "/api/flip":
+                if DASHBOARD_KEY and key != DASHBOARD_KEY:
+                    return self._send(403, b"{}", "application/json")
+                try:
+                    import flip_live
+                    data = flip_live.summary()
+                except Exception as e:
+                    data = {"enabled": False, "error": str(e)}
+                return self._send(200, json.dumps(data, ensure_ascii=False, default=float).encode(),
+                                  "application/json; charset=utf-8")
             if url.path == "/flip":                   # Lighter kagit takip anlik raporu
                 if DASHBOARD_KEY and key != DASHBOARD_KEY:
                     return self._send(403, "Yetkisiz: ?key=... gerekli".encode(), "text/plain; charset=utf-8")
@@ -2741,6 +2751,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   .b-long{background:var(--good-bg);color:var(--good)} .b-short{background:var(--bad-bg);color:var(--bad)}
   .pos{color:var(--good)} .neg{color:var(--bad)}
   .empty{color:var(--muted);text-align:center;padding:24px 8px}
+  #flipCost td,#flipCost th{white-space:normal}
   .foot{color:var(--muted);font-size:12px;margin-top:18px;line-height:1.6}
   .warnbar{background:var(--warn-bg);color:var(--warn);border-radius:10px;padding:8px 12px;font-size:13px;margin-bottom:14px;display:none}
 </style>
@@ -2765,6 +2776,16 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <label>Bakiye $ <input type="number" id="bal" value="2000" min="1" step="100"></label>
     <label>Teminat/işlem % <input type="number" id="mpct" value="10" min="0.5" max="100" step="0.5"></label>
     <label><input type="checkbox" id="fees" checked> Komisyon (~%0,06)</label>
+  </div>
+
+  <div class="card" id="flipCard" style="margin-bottom:16px;display:none">
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔁 Lighter kâğıt takip <small id="flipSub"></small></h2>
+    <div class="kpis" id="flipKpis" style="margin-bottom:12px"></div>
+    <div class="grid2" style="margin-bottom:12px;grid-template-columns:3fr 2fr">
+      <div><div class="chartbox"><canvas id="flipChart" aria-label="Kâğıt takip bakiye eğrisi"></canvas></div></div>
+      <div class="tablewrap"><table id="flipCost"></table></div>
+    </div>
+    <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="flipTbl"></table></div>
   </div>
 
   <div class="kpis" id="kpis"></div>
@@ -3023,8 +3044,56 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     document.querySelectorAll("#ofilter button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); S.outcome = b.dataset.o; render();
   });
 
+  // ---- Lighter kagit takip
+  let flipChart = null;
+  const fpct = v => v == null ? "—" : "%" + (v*100).toLocaleString("tr-TR",{minimumFractionDigits:4, maximumFractionDigits:4});
+  async function loadFlip(){
+    try{
+      const r = await fetch("/api/flip" + (KEY ? "?key="+encodeURIComponent(KEY) : ""), {cache:"no-store"});
+      if (!r.ok) return;
+      const F = await r.json();
+      const card = $("flipCard");
+      if (!F.enabled){ card.style.display = "none"; return; }
+      card.style.display = "block";
+      const hrs = (Date.now() - F.started) / 3600000;
+      $("flipSub").textContent = `${F.symbol} 1 dk · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
+      const ok = F.avg_cost != null && F.avg_cost < F.threshold;
+      const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
+      const pnl = F.eq - F.start;
+      $("flipKpis").innerHTML =
+        tile("Kâğıt bakiye", money(F.eq,false), `${money(pnl)} (${(pnl/F.start*100).toFixed(1)}%)`, cls(pnl)) +
+        tile("Emir başı maliyet", fpct(F.avg_cost), F.avg_cost==null ? "henüz emir yok" : (ok ? "✅ eşiğin altında" : "❌ eşiğin üstünde") + ` · eşik ${fpct(F.threshold)}`, F.avg_cost==null ? "" : (ok ? "pos" : "neg")) +
+        tile("İşlem", F.n_trades, F.win==null ? "" : `kazanan %${F.win.toFixed(0)}`) +
+        tile("Zirveden düşüş", "%" + F.dd.toFixed(1), `acil fren %${F.max_dd}`, F.dd > F.max_dd*0.75 ? "neg" : "") +
+        tile("Yarım spread", fpct(F.half_spread), F.delay_s==null ? "" : `gecikme ort. ${F.delay_s.toFixed(1)} sn`);
+      const cb = F.cost_by || {};
+      const row = (n,k) => cb[k] ? `<tr><td>${n}</td><td class="r">${fpct(cb[k][0])}</td><td class="r">${cb[k][1]}</td></tr>` : "";
+      $("flipCost").innerHTML = `<thead><tr><th>Maliyet kalemi</th><th class="r">Ortalama</th><th class="r">Emir</th></tr></thead><tbody>` +
+        row("Giriş (mum kapanışına göre)","giris") + row("Dönüş çıkışı (kapanışa göre)","flip_cikis") + row("Stop çıkışı (stop seviyesine göre)","stop") +
+        `<tr><td>Defterde yarım poz. emir etkisi</td><td class="r">${fpct(F.impact)}</td><td class="r"></td></tr>` +
+        (F.current && F.current.pos ? `<tr><td colspan="3"><b>Açık kâğıt pozisyon:</b> ${F.current.pos==1?"LONG":"SHORT"} · giriş ${F.current.entry.toLocaleString("tr-TR")} · stop ${Number(F.current.stop).toLocaleString("tr-TR")} · ${money(F.current.notional,false)}</td></tr>` : "") +
+        `</tbody>`;
+      $("flipTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Yön</th><th class="r">Giriş</th><th class="r">Çıkış</th><th class="r">Pozisyon</th><th>Neden</th><th class="r">K/Z</th><th class="r">Bakiye</th></tr></thead><tbody>` +
+        (F.trades.length ? F.trades.map(t => `<tr><td>${fmtTime(t.c)}</td><td>${t.dir==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${t.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(t.notional,false)}</td><td>${t.why==="stop"?"Stop (çizgi)":"SuperTrend dönüşü"}</td><td class="r ${cls(t.pnl)}"><b>${money(t.pnl)}</b></td><td class="r">${money(t.eq,false)}</td></tr>`).join("")
+          : `<tr><td class="empty" colspan="8">Henüz kapanan kâğıt işlem yok</td></tr>`) + "</tbody>";
+      if (window.Chart){
+        const line = css("--accent"), grid = css("--line"), ink2 = css("--ink2");
+        const data = F.curve.map(([x,y]) => ({x, y}));
+        const cfg = {type:"line", data:{datasets:[{data, borderColor:line, backgroundColor:line, borderWidth:2, pointRadius:0, stepped:"after", fill:false}]},
+          options:{responsive:true, maintainAspectRatio:false, animation:false, parsing:false, interaction:{mode:"index", intersect:false},
+            scales:{x:{type:"linear", grid:{display:false}, ticks:{color:ink2, maxTicksLimit:6, callback:v=>fmtTime(v)}},
+                    y:{grid:{color:grid}, ticks:{color:ink2, callback:v=>"$"+Number(v).toLocaleString("tr-TR")}}},
+            plugins:{legend:{display:false}, tooltip:{callbacks:{title:i=>fmtTime(i[0].raw.x), label:i=>"Bakiye: "+money(i.raw.y,false)}}}}};
+        if (flipChart) flipChart.destroy();
+        flipChart = new Chart($("flipChart"), cfg);
+      }
+    }catch(e){ /* kagit takip opsiyonel */ }
+  }
+
   load();
+  loadFlip();
   setInterval(load, 60000);
+  setInterval(loadFlip, 30000);
 })();
 </script>
 </body>
