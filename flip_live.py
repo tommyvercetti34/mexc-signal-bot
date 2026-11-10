@@ -187,9 +187,8 @@ def _load(bot):
     S.update(_new_state())
     if data:
         S.update(data)
-        S["pos"] = 0                                     # yeniden baslatmada acik kagit pozisyon kapatilmis sayilir
-        S["stop"] = None
-        S["prev_dir"] = None
+        # acik kagit pozisyon KORUNUR: stop kontrolu kaldigi yerden devam eder; yon bilgisi pozisyondan alinir
+        S["prev_dir"] = S["pos"] if S.get("pos") else None
         S["last_bar"] = None
 
 
@@ -226,7 +225,7 @@ def _close(bot, book, reason, ref_price, t_ref):
                           f"({S['peak']:.2f}$ → {S['eq']:.2f}$). Yeni işlem açılmıyor. Sıfırlamak için FLIP_RESET=true.")
 
 
-def _open(bot, book, direction, line, ref_price, t_ref):
+def _open(bot, book, direction, line, ref_price, t_ref, kind="giris"):
     bids, asks = book
     mid = (bids[0][0] + asks[0][0]) / 2
     side_levels = asks if direction == 1 else bids
@@ -238,7 +237,7 @@ def _open(bot, book, direction, line, ref_price, t_ref):
     notional = min(risk_usd / dist, S["eq"] * FLIP_LEV)
     fill, ok = walk(side_levels, notional)
     delay = int((time.time() - t_ref) * 1000) if t_ref else 0
-    _record_order("giris", direction, ref_price, fill, (asks[0][0] - bids[0][0]) / 2 / mid, ok, delay)
+    _record_order(kind, direction, ref_price, fill, (asks[0][0] - bids[0][0]) / 2 / mid, ok, delay)
     S["eq"] -= notional * FLIP_FEE
     S.update(pos=direction, entry=fill, notional=notional, stop=float(line), opened=int(time.time() * 1000))
 
@@ -253,7 +252,7 @@ def on_bar(bot, df, book_src, t_close):
         if prev is None and FLIP_ENTER_ON_START and not S["pos"] and not S["halted"]:
             # baslangicta bir sonraki donusu beklemeden mevcut SuperTrend yonunde gir (stop = guncel cizgi)
             S["prev_dir"] = cur
-            _open(bot, book_src.book(), cur, ln, close, t_close)
+            _open(bot, book_src.book(), cur, ln, close, t_close, kind="baslangic")
             if S["pos"]:
                 bot.send_telegram(f"🔁 Kâğıt takip mevcut yönde başladı: {'LONG' if cur == 1 else 'SHORT'} · giriş "
                                   f"{S['entry']:,.1f} · stop (SuperTrend çizgisi) {S['stop']:,.1f} · pozisyon ${S['notional']:,.0f}")
@@ -329,6 +328,7 @@ def summary():
         tr, od, sp = list(S["trades"]), list(S["orders"]), list(S["spreads"])
         cur = {"pos": S["pos"], "entry": S["entry"], "stop": S["stop"], "notional": S["notional"], "opened": S["opened"]}
         eq, start, peak, halted, started = S["eq"], S["start_eq"], S["peak"], S["halted"], S["started"]
+    od = [o for o in od if o["k"] != "baslangic"]
     costs = [o["cost"] for o in od]
     by = {k: [o["cost"] for o in od if o["k"] == k] for k in ("giris", "flip_cikis", "stop", "tp")}
     curve = [[started, start]] + [[t["c"], t["eq"]] for t in tr]
@@ -356,6 +356,7 @@ def report_text():
              f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x" + (f" · TP %{FLIP_TP_ROE:g}" if FLIP_TP_ROE > 0 else "") + (" · 🛑 ACİL FREN AKTİF" if S["halted"] else ""),
              f"⏱ {hours:.1f} saat · {len(tr)} işlem · bakiye ${eq:,.2f} (başlangıç ${start:,.0f}, "
              f"{(eq / start - 1) * 100:+.1f}%) · zirveden düşüş %{(1 - eq / peak) * 100:.1f}"]
+    od = [o for o in od if o["k"] != "baslangic"]       # baslangic girisi donus aninda degil: maliyete katilmaz
     if od:
         c = np.array([o["cost"] for o in od])
         for k, name in (("giris", "Giriş (mum kapanışına göre)"), ("flip_cikis", "Dönüş çıkışı (kapanışa göre)"),

@@ -2788,6 +2788,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="flipTbl"></table></div>
   </div>
 
+  <h2 style="font-size:15px;margin:6px 0 10px;font-weight:620">📡 Sinyal botu (MEXC stratejileri: kırılım, mum profili, SuperTrend 1s) <small style="font-weight:400;color:var(--muted)">· Lighter kâğıt takipten ayrı</small></h2>
   <div class="kpis" id="kpis"></div>
 
   <div class="grid2">
@@ -2807,12 +2808,12 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-bottom:16px">
-    <h2>Açık işlemler <small id="openCount"></small></h2>
+    <h2>Sinyal botu (MEXC stratejileri) · açık işlemler <small id="openCount"></small></h2>
     <div class="tablewrap"><table id="openTbl"></table></div>
   </div>
 
   <div class="card">
-    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Kapanan işlemler <small id="closedCount"></small>
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Sinyal botu · kapanan işlemler <small id="closedCount"></small>
       <span class="spacer"></span>
       <span class="seg" id="ofilter"><button data-o="ALL" class="on">Tümü</button><button data-o="TP">Kârlı</button><button data-o="SL">Stop</button><button data-o="EXPIRED">Süre doldu</button></span>
     </h2>
@@ -3073,9 +3074,11 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
         `<tr><td>Defterde yarım poz. emir etkisi</td><td class="r">${fpct(F.impact)}</td><td class="r"></td></tr>` +
         (F.current && F.current.pos ? `<tr><td colspan="3"><b>Açık kâğıt pozisyon:</b> ${F.current.pos==1?"LONG":"SHORT"} · giriş ${F.current.entry.toLocaleString("tr-TR")} · stop ${Number(F.current.stop).toLocaleString("tr-TR")} · ${money(F.current.notional,false)}</td></tr>` : "") +
         `</tbody>`;
-      $("flipTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Yön</th><th class="r">Giriş</th><th class="r">Çıkış</th><th class="r">Pozisyon</th><th>Neden</th><th class="r">K/Z</th><th class="r">Bakiye</th></tr></thead><tbody>` +
+      const cp = F.current && F.current.pos ? F.current : null;
+      const openRow = cp ? `<tr style="background:var(--warn-bg)"><td><b>AÇIK</b> · ${fmtTime(cp.opened)}</td><td>${cp.pos==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${cp.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">stop ${Number(cp.stop).toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(cp.notional,false)}</td><td>Pozisyon açık</td><td class="r">—</td><td class="r"></td></tr>` : "";
+      $("flipTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Yön</th><th class="r">Giriş</th><th class="r">Çıkış</th><th class="r">Pozisyon</th><th>Neden</th><th class="r">K/Z</th><th class="r">Bakiye</th></tr></thead><tbody>` + openRow +
         (F.trades.length ? F.trades.map(t => `<tr><td>${fmtTime(t.c)}</td><td>${t.dir==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${t.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(t.notional,false)}</td><td>${t.why==="tp" ? "🎯 TP (teminatta %" + (F.tp_roe||50) + ")" : t.why==="stop" ? (t.pnl>0 ? "Takip eden stop · kâr alındı" : "Takip eden stop") : "SuperTrend dönüşü"}</td><td class="r ${cls(t.pnl)}"><b>${money(t.pnl)}</b></td><td class="r">${money(t.eq,false)}</td></tr>`).join("")
-          : `<tr><td class="empty" colspan="8">Henüz kapanan kâğıt işlem yok</td></tr>`) + "</tbody>";
+          : (cp ? "" : `<tr><td class="empty" colspan="8">Henüz kapanan kâğıt işlem yok</td></tr>`)) + "</tbody>";
       if (window.Chart){
         const line = css("--accent"), grid = css("--line"), ink2 = css("--ink2");
         const data = F.curve.map(([x,y]) => ({x, y}));
