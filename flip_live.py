@@ -387,6 +387,10 @@ def summary():
         tr, od, sp = list(S["trades"]), list(S["orders"]), list(S["spreads"])
         cur = {"pos": S["pos"], "entry": S["entry"], "stop": S["stop"], "notional": S["notional"], "opened": S["opened"]}
         eq, start, peak, halted, started = S["eq"], S["start_eq"], S["peak"], S["halted"], S["started"]
+    upnl = None
+    if cur["pos"] and LAST.get("bid"):          # canli K/Z: pozisyonu simdi kapatsak (long -> en iyi alis)
+        px = LAST["bid"] if cur["pos"] == 1 else LAST["ask"]
+        upnl = cur["notional"] * cur["pos"] * (px / cur["entry"] - 1)
     od = [o for o in od if o["k"] != "baslangic"]
     costs = [o["cost"] for o in od]
     by = {k: [o["cost"] for o in od if o["k"] == k] for k in ("giris", "flip_cikis", "stop", "tp")}
@@ -403,6 +407,7 @@ def summary():
         "delay_s": float(np.mean([o["ms"] for o in od if o["ms"]]) / 1000) if any(o["ms"] for o in od) else None,
         "curve": curve[-2000:], "trades": tr[-40:][::-1], "current": cur,
         "candles": CANDLE_SRC.get("name"), "own_candles": CANDLE_SRC.get("own", 0),
+        "upnl": upnl, "last_bid": LAST.get("bid"), "last_ask": LAST.get("ask"), "last_t": LAST.get("t"),
     }
 
 
@@ -454,10 +459,14 @@ CANDLE_SRC = {"name": None}
 MID = {}                                                   # dakika_ms -> [acilis, yuksek, dusuk, kapanis, ornek_sayisi]
 
 
+LAST = {}                                                  # son defter: en iyi alis/satis ve zaman (canli K/Z icin)
+
+
 def record_mid(book):
     """Her defter cekisinde orta fiyati o dakikanin mumuna ekle (Lighter fiyatlariyla kendi 1 dk mumlarimiz)."""
     bids, asks = book
     mid = (bids[0][0] + asks[0][0]) / 2
+    LAST.update(bid=bids[0][0], ask=asks[0][0], t=int(time.time() * 1000))
     m = int(time.time() // 60 * 60_000)
     c = MID.get(m)
     if c is None:

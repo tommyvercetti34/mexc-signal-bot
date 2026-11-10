@@ -3061,9 +3061,10 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       $("flipSub").textContent = `${F.symbol} 1 dk · ${csrc} · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x` + (F.tp_roe ? ` · TP %${F.tp_roe}` : "") + ` · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
       const ok = F.avg_cost != null && F.avg_cost < F.threshold;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
-      const pnl = F.eq - F.start;
+      const up = F.upnl == null ? 0 : F.upnl;
+      const pnl = F.eq + up - F.start;
       $("flipKpis").innerHTML =
-        tile("Kâğıt bakiye", money(F.eq,false), `${money(pnl)} (${(pnl/F.start*100).toFixed(1)}%)`, cls(pnl)) +
+        tile("Kâğıt bakiye (canlı)", money(F.eq + up,false), `${money(pnl)} (${(pnl/F.start*100).toFixed(2)}%)` + (F.upnl != null ? ` · açık işlem ${money(F.upnl)}` : ""), cls(pnl)) +
         tile("Emir başı maliyet", fpct(F.avg_cost), F.avg_cost==null ? "henüz emir yok" : (ok ? "✅ eşiğin altında" : "❌ eşiğin üstünde") + ` · eşik ${fpct(F.threshold)}`, F.avg_cost==null ? "" : (ok ? "pos" : "neg")) +
         tile("İşlem", F.n_trades, F.win==null ? "" : `kazanan %${F.win.toFixed(0)}`) +
         tile("Zirveden düşüş", "%" + F.dd.toFixed(1), `acil fren %${F.max_dd}`, F.dd > F.max_dd*0.75 ? "neg" : "") +
@@ -3076,7 +3077,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
         (F.current && F.current.pos ? `<tr><td colspan="3"><b>Açık kâğıt pozisyon:</b> ${F.current.pos==1?"LONG":"SHORT"} · giriş ${F.current.entry.toLocaleString("tr-TR")} · stop ${Number(F.current.stop).toLocaleString("tr-TR")} · ${money(F.current.notional,false)}</td></tr>` : "") +
         `</tbody>`;
       const cp = F.current && F.current.pos ? F.current : null;
-      const openRow = cp ? `<tr style="background:var(--warn-bg)"><td><b>AÇIK</b> · ${fmtTime(cp.opened)}</td><td>${cp.pos==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${cp.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">stop ${Number(cp.stop).toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(cp.notional,false)}</td><td>Pozisyon açık</td><td class="r">—</td><td class="r"></td></tr>` : "";
+      const openRow = cp ? `<tr style="background:var(--warn-bg)"><td><b>AÇIK</b> · ${fmtTime(cp.opened)}</td><td>${cp.pos==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${cp.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">stop ${Number(cp.stop).toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(cp.notional,false)}</td><td>Pozisyon açık · anlık ${F.last_bid ? ((cp.pos==1?F.last_bid:F.last_ask).toLocaleString("tr-TR",{maximumFractionDigits:1})) : "—"}</td><td class="r ${cls(F.upnl||0)}"><b>${F.upnl==null ? "—" : money(F.upnl)}</b></td><td class="r">${money(F.eq + (F.upnl||0),false)}</td></tr>` : "";
       $("flipTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Yön</th><th class="r">Giriş</th><th class="r">Çıkış</th><th class="r">Pozisyon</th><th>Neden</th><th class="r">K/Z</th><th class="r">Bakiye</th></tr></thead><tbody>` + openRow +
         (F.trades.length ? F.trades.map(t => `<tr><td>${fmtTime(t.c)}</td><td>${t.dir==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${t.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(t.notional,false)}</td><td>${t.why==="tp" ? "🎯 TP (teminatta %" + (F.tp_roe||50) + ")" : t.why==="stop" ? (t.pnl>0 ? "Takip eden stop · kâr alındı" : "Takip eden stop") : "SuperTrend dönüşü"}</td><td class="r ${cls(t.pnl)}"><b>${money(t.pnl)}</b></td><td class="r">${money(t.eq,false)}</td></tr>`).join("")
           : (cp ? "" : `<tr><td class="empty" colspan="8">Henüz kapanan kâğıt işlem yok</td></tr>`)) + "</tbody>";
@@ -3097,7 +3098,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   load();
   loadFlip();
   setInterval(load, 60000);
-  setInterval(loadFlip, 30000);
+  setInterval(loadFlip, 5000);
 })();
 </script>
 </body>
