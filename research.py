@@ -1075,6 +1075,7 @@ FLIP_VARIANTS = [("ST(7,2)", 7, 2.0), ("ST(10,3)", 10, 3.0), ("ST(10,5)", 10, 5.
                  ("ST(20,8)", 20, 8.0), ("ST(30,10)", 30, 10.0)]
 FLIP_FEES = [(x.split(":")[0], float(x.split(":")[1])) for x in
              _env("RS_FLIP_FEES", "Lighter 0/0:0,MEXC web %0.016:0.00016,Hyperliquid %0.045:0.00045").split(",")]
+FLIP_SLIPS = [float(x) for x in _env("RS_FLIP_SLIPS", "").split(",") if x.strip()] or [None]   # orn "0,0.00002,0.00005"
 RS_FLIP_RISK = _env("RS_FLIP_RISK", 10.0, float)             # 'risk' ve 'stop' modlarinda islem basi en fazla kayip ($)
 FLIP_MODES = {
     "sabit": "Tüm teminatla pozisyon, SuperTrend dönünce (mum kapanışı) ters",
@@ -1089,16 +1090,17 @@ ACTIVE_FLIP_MODES = [m.strip() for m in _env("RS_FLIP_MODES", "sabit,risk,stop")
 RS_FLIP_COMPOUND = _env("RS_FLIP_COMPOUND", "true").lower() in ("1", "true", "yes", "evet")
 
 
-def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
+def flip_sim2(bot, d, line, dirs, taker, start, end, mode, slip=None):
     """Tek coin, tek pozisyon, her zaman SuperTrend yonunde. Bilesik: kazanc/kayip sonraki isleme eklenir.
     sabit: teminat x kaldirac pozisyon, cikis = SuperTrend donusu (mum KAPANISI) -> ters ac.
     risk : stop = SuperTrend cizgisi ve cizgi her mum TAKIP edilir (sadece lehe); pozisyon, stop olursa kayip
            = bakiyenin (RS_FLIP_RISK / RS_FLIP_MARGIN) kadari olacak buyuklukte. Stop olunca bir sonraki donusu bekler.
     stop : sabit pozisyon + sabit $ stop (bakiyeyle orantili).
     Likidasyon: fiyat girisin (1/kaldirac - bakim) kadar tersine giderse teminat gider."""
+    SLIP = RS_FLIP_SLIP if slip is None else slip
     lev = RS_FLIP_LEV
     liq_frac = 1.0 / lev - bot.MMR_PCT / 100.0
-    H, L, C = (d[c].to_numpy() for c in ("high", "low", "close"))
+    O, H, L, C = (d[c].to_numpy() for c in ("open", "high", "low", "close"))
     ct = d["close_time"]
     idx = np.where(((ct >= start) & (ct < end)).to_numpy())[0]
     eq = RS_FLIP_MARGIN
@@ -1113,7 +1115,7 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
             pnl = -margin
             liqs += 1
         else:
-            exit_px = px * (1 - pos * RS_FLIP_SLIP)
+            exit_px = px * (1 - pos * SLIP)
             pnl = notional * pos * (exit_px / entry - 1)
             fees += notional * taker
             pnl -= notional * taker
@@ -1134,7 +1136,8 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
                                                             and pos * (stop / entry - 1) > -liq_frac):
                 close_at(worst, liq=True)
             elif np.isfinite(stop) and ((pos == 1 and L[i] <= stop) or (pos == -1 and H[i] >= stop)):
-                close_at(stop)
+                # mum stopun OTESINDE acildiysa (bosluk / cizgi fiyatin ustune cikti) dolum acilis fiyatindan
+                close_at(min(stop, O[i]) if pos == 1 else max(stop, O[i]))
         cur = dirs[i]
         flipped = np.isfinite(prev) and np.isfinite(cur) and cur != prev
         prev = cur
@@ -1145,7 +1148,7 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
         if pos:
             close_at(C[i])
         want = int(cur)
-        e = C[i] * (1 + want * RS_FLIP_SLIP)
+        e = C[i] * (1 + want * SLIP)
         base = eq if RS_FLIP_COMPOUND else RS_FLIP_MARGIN
         cap = min(base, eq) * lev
         if mode == "risk":
@@ -1204,12 +1207,14 @@ def run_flip(bot, ex=None, progress=None):
         sts = {b: bot.calc_supertrend(fr, per, mult) for b, fr in frames.items()}
         lines = {b: np.asarray(v[0], float) for b, v in sts.items()}
         dirs = {b: np.asarray(v[1], float) for b, v in sts.items()}
-        for (mode, fname, tk) in [(m, f, t) for m in ACTIVE_FLIP_MODES for f, t in FLIP_FEES]:
+        for (mode, fname, tk, sl) in [(m, f, t, s) for m in ACTIVE_FLIP_MODES for f, t in FLIP_FEES for s in FLIP_SLIPS]:
+            if len(FLIP_SLIPS) > 1:
+                fname = f"{fname} · kayma %{sl * 100:g}"
             row = {"v": vname, "f": fname, "m": mode, "coins": {}}
             for half, (a, z) in (("h1", (t0, mid)), ("h2", (mid, t1 + pd.Timedelta(minutes=1)))):
                 agg = {"n": 0, "fees": 0.0, "net": 0.0, "liqs": 0, "pnls": []}
                 for b, fr in frames.items():
-                    s = flip_sim2(bot, fr, lines[b], dirs[b], tk, a, z, mode)
+                    s = flip_sim2(bot, fr, lines[b], dirs[b], tk, a, z, mode, slip=sl)
                     for k in ("n", "fees", "net", "liqs", "pnls"):
                         agg[k] += s[k]
                     agg["dd"] = max(agg.get("dd", 0.0), s["dd"])
@@ -1230,11 +1235,11 @@ def format_flip_report(bot, res, coins, t0, mid, t1, days):
            f"🗓 {f(t0)} → {f(t1)} ({days:.0f} gün) · {', '.join(coins)} (her coin ayrı ${RS_FLIP_MARGIN:,.0f} teminat, "
            f"başlangıçta en fazla ${cap:,.0f} pozisyon)",
            f"{RS_FLIP_LEV:g}x · {'BİLEŞİK (kâr sonraki işleme eklenir)' if RS_FLIP_COMPOUND else 'sabit teminat'} · "
-           f"kayma %{RS_FLIP_SLIP * 100:g}/emir · funding hariç · her yarı ${RS_FLIP_MARGIN:,.0f} ile başlar · "
+           f"kayma %{RS_FLIP_SLIP * 100:g}/emir (aksi yazmadıkça) · funding hariç · her yarı ${RS_FLIP_MARGIN:,.0f} ile başlar · "
            f"tutarlar TÜM coinlerin toplam kâr/zararı", ""]
     for mode, desc in [(m, FLIP_MODES[m]) for m in ACTIVE_FLIP_MODES]:
         out.append(f"■ {desc.replace('{riskp}', f'{RS_FLIP_RISK / RS_FLIP_MARGIN * 100:g}')}")
-        for fname, _ in FLIP_FEES:
+        for fname in dict.fromkeys(r["f"] for r in res if r["m"] == mode):
             rows = [r for r in res if r["m"] == mode and r["f"] == fname]
             best = max(rows, key=lambda r: r["h1"]["net"])          # ayar 1. yarida secilir...
             out.append(f"  {fname}:")
