@@ -378,6 +378,15 @@ def with_retry(fn, *args, desc="istek", **kwargs):
     return None
 
 
+STOCK_BASES = {   # MEXC'deki hisse/emtia/endeks kontratlari (kripto degil) - otomatik haric
+    "NVIDIA", "TESLA", "APPLE", "AMAZON", "GOOGLE", "GOOGL", "MICROSOFT", "META", "NETFLIX", "COINBASE", "MSTR",
+    "MICROSTRATEGY", "AMD", "INTEL", "PALANTIR", "ROBINHOOD", "HOOD", "CRCL", "CIRCLE", "SOXL", "SPY", "QQQ", "TSLA",
+    "NVDA", "AAPL", "AMZN", "MSFT", "COIN", "SNDK", "MU", "SKHYNIX", "SAMSUNG", "TSM", "AVGO", "ORCL", "BABA",
+    "XAU", "XAG", "GOLD", "SILVER", "OIL", "CL", "BZ", "BRENT", "WTI", "NATGAS", "COPPER", "USDJPY", "EURUSD",
+    "SP500", "NAS100", "US30", "SPX", "NDX",
+}
+
+
 def get_top_symbols(ex, top_n=None):
     """USDT-margined perpetual (swap) piyasalarini 24s USDT hacmine gore siralar."""
     markets = ex.markets or with_retry(ex.load_markets, desc="load_markets") or {}
@@ -386,6 +395,8 @@ def get_top_symbols(ex, top_n=None):
         if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
         and m.get("settle") == "USDT" and m.get("active", True)
         and m.get("base", "").upper() not in EXCLUDE_SYMBOLS
+        and not m.get("base", "").upper().endswith("STOCK")     # hisse senedi kontratlari (SKHYSTOCK vb.)
+        and m.get("base", "").upper() not in STOCK_BASES
     }
     tickers = with_retry(ex.fetch_tickers, desc="fetch_tickers") or {}
 
@@ -2357,6 +2368,7 @@ def due_timeframes(t=None):
 # PIYASA ANLIK GORUNTUSU: acik pozisyon (OI) + fonlama + fiyat, saatte bir, ilk 30 coin
 # Ileride OI / fonlama stratejilerini test edebilmek icin veri biriktirir (gecmis OI bedava alinamiyor).
 # ============================================================================
+SIGNAL_WHEN_FULL = _env("SIGNAL_WHEN_FULL", "true").lower() in ("1", "true", "yes", "evet")   # slot doluyken de sinyal gonder
 SNAPSHOT = _env("SNAPSHOT", "true").lower() in ("1", "true", "yes", "evet")
 SNAPSHOT_TOP = _env("SNAPSHOT_TOP", 30, int)
 _snap = {"hour": None, "rows": [], "day": None}
@@ -2450,9 +2462,10 @@ def scan(ex, due=None):
     if not strategies:
         return
     free = (MAX_OPEN_TRADES - len(TRADES["open"])) if (TRACK_TRADES and MAX_OPEN_TRADES > 0) else 10**6
-    if free <= 0:
+    if free <= 0 and not SIGNAL_WHEN_FULL:
         log.info("Tarama atlandi: %d/%d islem slotu dolu", len(TRADES["open"]), MAX_OPEN_TRADES)
         return
+    free = max(free, 0)
     symbols = get_top_symbols(ex)
     if not symbols:
         raise RuntimeError("Sembol listesi alinamadi (borsa erisimi?)")
@@ -2505,9 +2518,10 @@ def scan(ex, due=None):
 
     # 2) Bos slot kadarini gonder: once buyuk zaman dilimi, sonra trend gucu (ADX)
     candidates.sort(key=lambda c: (c[1].get("tf", 0), c[1]["adx"]), reverse=True)
-    found = 0
+    found = extra = 0
     for sym, sig, dfi in candidates:
-        if found >= free:
+        is_extra = found >= free                  # slot dolu: sinyal yine gider ama bot takip etmez
+        if is_extra and not SIGNAL_WHEN_FULL:
             log.info("Slot dolu, atlanan sinyal: %s %s %s", sig["strategy"], sym, sig["direction"])
             continue
         try:
@@ -2516,6 +2530,9 @@ def scan(ex, due=None):
                 log.info("Teminat yetersiz, sinyal atlandi: %s", sym)
                 continue
             msg = build_message(ex, sym, sig) if sig.get("family") == "scalein" else build_message_single(ex, sym, sig)
+            if is_extra:
+                msg = (f"📢 EK SİNYAL · {MAX_OPEN_TRADES}/{MAX_OPEN_TRADES} slot dolu, bot bu işlemi TAKİP ETMİYOR "
+                       f"(istersen elle açabilirsin; stop/hedef mesajı gelmez)\n\n" + msg)
             log.info("SINYAL %s %s %s | ADX=%.1f teminat=$%.0f pozisyon=$%.0f", sig["strategy"], sym, sig["direction"],
                      sig["adx"], sum(sig["margins"]), sig.get("notional", 0))
             msg_id = None
@@ -2529,14 +2546,17 @@ def scan(ex, due=None):
             if msg_id:
                 _last_signal[sym] = datetime.now(timezone.utc)
                 STATE["signals_sent"] += 1
+                if is_extra:
+                    extra += 1
+                    continue
                 found += 1
                 if TRACK_TRADES:
                     register_trade(ex, sym, sig, msg_id)
         except Exception as e:
             log.exception("%s gonderilirken hata: %s", sym, e)
 
-    log.info("Tarama bitti: %d aday, %d sinyal, %.1f sn | acik islem: %d/%d", len(candidates), found,
-             time.time() - t0, len(TRADES["open"]), MAX_OPEN_TRADES)
+    log.info("Tarama bitti: %d aday, %d sinyal (+%d takipsiz ek), %.1f sn | acik islem: %d/%d", len(candidates), found,
+             extra, time.time() - t0, len(TRADES["open"]), MAX_OPEN_TRADES)
 
 
 def scan_step_minutes():

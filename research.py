@@ -69,7 +69,7 @@ WARMUP = 220                                           # EMA200 isinmasi
 # ============================================================================
 def fetch_15m(bot, ex, symbol, days, tf_min=15, min_bars=2000):
     tf_ms = tf_min * 60_000
-    code = {15: "15m", 60: "1h", 240: "4h"}[tf_min]
+    code = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 60: "1h", 240: "4h"}[tf_min]
     since = int((datetime.now(timezone.utc) - timedelta(days=days + 4)).timestamp() * 1000)
     now_ms = int(time.time() * 1000)
     rows = []
@@ -651,6 +651,8 @@ def run_and_report(bot):
         return run_combo_and_report(bot)
     if RS_MODE == "funding":
         return run_funding_and_report(bot)
+    if RS_MODE == "flip":
+        return run_flip_and_report(bot)
     try:
         what = (f"uzun vade 4 saat, {RS_LONG_DAYS} gün, sabit coin listesi, {len(active_families())} strateji"
                 if RS_MODE == "long4h" else f"{RS_DAYS} gün, {RS_TOP_N} coin, {len(FAMILIES)} strateji ailesi")
@@ -918,7 +920,7 @@ def universe_symbols(bot, ex_data):
                 base = (m.get("base") or "").upper()
                 if not (m.get("swap") and m.get("linear") and m.get("quote") == "USDT") or not base:
                     continue
-                if base in _STABLE or base in bot.EXCLUDE_SYMBOLS or base.endswith("STOCK") or not m.get("active", True):
+                if base in _STABLE or base in bot.EXCLUDE_SYMBOLS or base.endswith("STOCK") or base in bot.STOCK_BASES or not m.get("active", True):
                     continue
                 qv = t.get("quoteVolume") or 0
                 ranked.append((float(qv), base))
@@ -1056,3 +1058,201 @@ def run_funding_and_report(bot):
     except Exception as e:
         log.exception("Fonlama arastirmasi hatasi: %s", e)
         bot.send_telegram(f"⚠️ Fonlama araştırması çalıştırılamadı: {e}")
+
+
+
+# ============================================================================
+# SUREKLI DON-CEVIR MODU (RS_MODE=flip): sabit teminat, tek pozisyon, 1 dk grafikte SuperTrend
+# yon degistirince ters pozisyona gec (stop-and-reverse). Her zaman piyasada.
+# ============================================================================
+RS_FLIP_SYMBOLS = _env("RS_FLIP_SYMBOLS", "BTC,ETH,SOL")
+RS_FLIP_DAYS = _env("RS_FLIP_DAYS", 30, int)
+RS_FLIP_TF = _env("RS_FLIP_TF", 1, int)
+RS_FLIP_MARGIN = _env("RS_FLIP_MARGIN", 500, float)
+RS_FLIP_LEV = _env("RS_FLIP_LEV", 25, float)
+RS_FLIP_SLIP = _env("RS_FLIP_SLIP", 0.0001, float)          # her market emirde kayma (1 baz puan)
+FLIP_VARIANTS = [("ST(7,2)", 7, 2.0), ("ST(10,3)", 10, 3.0), ("ST(10,5)", 10, 5.0), ("ST(14,4)", 14, 4.0),
+                 ("ST(20,8)", 20, 8.0), ("ST(30,10)", 30, 10.0)]
+FLIP_FEES = [(x.split(":")[0], float(x.split(":")[1])) for x in
+             _env("RS_FLIP_FEES", "Lighter 0/0:0,MEXC web %0.016:0.00016,Hyperliquid %0.045:0.00045").split(",")]
+RS_FLIP_RISK = _env("RS_FLIP_RISK", 10.0, float)             # 'risk' ve 'stop' modlarinda islem basi en fazla kayip ($)
+FLIP_MODES = {
+    "sabit": "Tüm teminatla pozisyon, SuperTrend dönünce (mum kapanışı) ters",
+    "risk": "Stop SuperTrend çizgisinde ve çizgiyi TAKİP ediyor; stop olursa kayıp ≈ bakiyenin %{riskp}",
+    "stop": "Tüm teminatla pozisyon + sabit stop (bakiyenin %{riskp})",
+}
+
+
+RS_FLIP_COMPOUND = _env("RS_FLIP_COMPOUND", "true").lower() in ("1", "true", "yes", "evet")
+
+
+def flip_sim2(bot, d, line, dirs, taker, start, end, mode):
+    """Tek coin, tek pozisyon, her zaman SuperTrend yonunde. Bilesik: kazanc/kayip sonraki isleme eklenir.
+    sabit: teminat x kaldirac pozisyon, cikis = SuperTrend donusu (mum KAPANISI) -> ters ac.
+    risk : stop = SuperTrend cizgisi ve cizgi her mum TAKIP edilir (sadece lehe); pozisyon, stop olursa kayip
+           = bakiyenin (RS_FLIP_RISK / RS_FLIP_MARGIN) kadari olacak buyuklukte. Stop olunca bir sonraki donusu bekler.
+    stop : sabit pozisyon + sabit $ stop (bakiyeyle orantili).
+    Likidasyon: fiyat girisin (1/kaldirac - bakim) kadar tersine giderse teminat gider."""
+    lev = RS_FLIP_LEV
+    liq_frac = 1.0 / lev - bot.MMR_PCT / 100.0
+    H, L, C = (d[c].to_numpy() for c in ("high", "low", "close"))
+    ct = d["close_time"]
+    idx = np.where(((ct >= start) & (ct < end)).to_numpy())[0]
+    eq = RS_FLIP_MARGIN
+    pos, entry, notional, stop, margin = 0, 0.0, 0.0, np.nan, 0.0
+    fees = 0.0
+    n = liqs = 0
+    rets, curve = [], [eq]
+
+    def close_at(px, liq=False):
+        nonlocal eq, fees, n, pos, liqs
+        if liq:
+            pnl = -margin
+            liqs += 1
+        else:
+            exit_px = px * (1 - pos * RS_FLIP_SLIP)
+            pnl = notional * pos * (exit_px / entry - 1)
+            fees += notional * taker
+            pnl -= notional * taker
+        before = eq + notional * taker            # giris komisyonu zaten dusulmustu
+        eq += pnl
+        rets.append((eq - before) / before if before > 0 else -1.0)
+        curve.append(eq)
+        n += 1
+        pos = 0
+
+    prev = dirs[idx[0] - 1] if len(idx) and idx[0] > 0 else np.nan
+    for i in idx:
+        if eq <= 1:
+            break                                 # hesap bitti
+        if pos:
+            worst = L[i] if pos == 1 else H[i]
+            if pos * (worst / entry - 1) <= -liq_frac and not (np.isfinite(stop) and pos * (stop - worst) >= 0
+                                                            and pos * (stop / entry - 1) > -liq_frac):
+                close_at(worst, liq=True)
+            elif np.isfinite(stop) and ((pos == 1 and L[i] <= stop) or (pos == -1 and H[i] >= stop)):
+                close_at(stop)
+        cur = dirs[i]
+        flipped = np.isfinite(prev) and np.isfinite(cur) and cur != prev
+        prev = cur
+        if pos and mode == "risk" and np.isfinite(line[i]):   # iz suren stop: cizgi lehe gittikce stop da gelir
+            stop = max(stop, line[i]) if pos == 1 else min(stop, line[i])
+        if not flipped:
+            continue
+        if pos:
+            close_at(C[i])
+        want = int(cur)
+        e = C[i] * (1 + want * RS_FLIP_SLIP)
+        base = eq if RS_FLIP_COMPOUND else RS_FLIP_MARGIN
+        cap = min(base, eq) * lev
+        if mode == "risk":
+            dist = abs(e - line[i]) / e if np.isfinite(line[i]) else 0
+            if dist <= 0.0002:
+                continue
+            risk_usd = RS_FLIP_RISK * base / RS_FLIP_MARGIN
+            notional = min(risk_usd / dist, cap)
+            stop = line[i]
+        elif mode == "stop":
+            notional = cap
+            stop = e * (1 - want * (RS_FLIP_RISK * base / RS_FLIP_MARGIN) / notional)
+        else:
+            notional = cap
+            stop = np.nan
+        margin = notional / lev
+        pos, entry = want, e
+        fees += notional * taker
+        eq -= notional * taker
+    if pos and len(idx) and eq > 1:
+        close_at(C[idx[-1]])
+    c = np.array(curve)
+    return {"n": n, "fees": fees, "net": eq - RS_FLIP_MARGIN, "liqs": liqs, "pnls": rets,
+            "final": eq, "dd": float(((np.maximum.accumulate(c) - c) / np.maximum.accumulate(c)).max() * 100) if len(c) else 0.0}
+
+
+def run_flip(bot, ex=None, progress=None):
+    ex = ex or make_exchange(bot)
+    if not ex.markets:
+        bot.with_retry(ex.load_markets, desc="load_markets")
+    frames = {}
+    for b in [x.strip().upper() for x in RS_FLIP_SYMBOLS.split(",") if x.strip()]:
+        sym = f"{b}/USDT:USDT"
+        if sym not in (ex.markets or {}):
+            continue
+        df = fetch_15m(bot, ex, sym, RS_FLIP_DAYS, tf_min=RS_FLIP_TF, min_bars=500)
+        if df is None:
+            continue
+        df = df.copy()
+        df["close_time"] = pd.to_datetime(df["ts"], utc=True) + pd.Timedelta(minutes=RS_FLIP_TF) \
+            if not pd.api.types.is_numeric_dtype(df["ts"]) else pd.to_datetime(df["ts"] + RS_FLIP_TF * 60000, unit="ms", utc=True)
+        frames[b] = df
+    if not frames:
+        raise RuntimeError(f"{RS_FLIP_TF} dk veri alınamadı")
+    t0 = max(fr["close_time"].iloc[min(200, len(fr) - 1)] for fr in frames.values())
+    t1 = min(fr["close_time"].iloc[-1] for fr in frames.values())
+    mid = t0 + (t1 - t0) / 2
+    days = max((t1 - t0).total_seconds() / 86400, 1e-9)
+    res = []
+    for vname, per, mult in FLIP_VARIANTS:
+        sts = {b: bot.calc_supertrend(fr, per, mult) for b, fr in frames.items()}
+        lines = {b: np.asarray(v[0], float) for b, v in sts.items()}
+        dirs = {b: np.asarray(v[1], float) for b, v in sts.items()}
+        for (mode, fname, tk) in [(m, f, t) for m in FLIP_MODES for f, t in FLIP_FEES]:
+            row = {"v": vname, "f": fname, "m": mode, "coins": {}}
+            for half, (a, z) in (("h1", (t0, mid)), ("h2", (mid, t1 + pd.Timedelta(minutes=1)))):
+                agg = {"n": 0, "fees": 0.0, "net": 0.0, "liqs": 0, "pnls": []}
+                for b, fr in frames.items():
+                    s = flip_sim2(bot, fr, lines[b], dirs[b], tk, a, z, mode)
+                    for k in ("n", "fees", "net", "liqs", "pnls"):
+                        agg[k] += s[k]
+                    agg["dd"] = max(agg.get("dd", 0.0), s["dd"])
+                    row["coins"].setdefault(b, 0.0)
+                    row["coins"][b] += s["net"]
+                row[half] = agg
+            allp = np.array(row["h1"]["pnls"] + row["h2"]["pnls"])
+            row["t"] = float(allp.mean() / (allp.std(ddof=1) / np.sqrt(len(allp)))) if len(allp) > 2 and allp.std(ddof=1) > 0 else 0.0
+            row["passed"] = row["h1"]["net"] > 0 and row["h2"]["net"] > 0 and row["t"] >= RS_MIN_T
+            res.append(row)
+    return res, list(frames), t0, mid, t1, days
+
+
+def format_flip_report(bot, res, coins, t0, mid, t1, days):
+    f = lambda t: t.tz_convert(bot.DISPLAY_TZ).strftime("%d.%m %H:%M")
+    cap = RS_FLIP_MARGIN * RS_FLIP_LEV
+    out = [f"🔁 SÜREKLİ GİR-ÇIK TESTİ · {RS_FLIP_TF} dk · SuperTrend dönünce ters pozisyon",
+           f"🗓 {f(t0)} → {f(t1)} ({days:.0f} gün) · {', '.join(coins)} (her coin ayrı ${RS_FLIP_MARGIN:,.0f} teminat, "
+           f"başlangıçta en fazla ${cap:,.0f} pozisyon)",
+           f"{RS_FLIP_LEV:g}x · {'BİLEŞİK (kâr sonraki işleme eklenir)' if RS_FLIP_COMPOUND else 'sabit teminat'} · "
+           f"kayma %{RS_FLIP_SLIP * 100:g}/emir · funding hariç · her yarı ${RS_FLIP_MARGIN:,.0f} ile başlar · "
+           f"tutarlar TÜM coinlerin toplam kâr/zararı", ""]
+    for mode, desc in FLIP_MODES.items():
+        out.append(f"■ {desc.replace('{riskp}', f'{RS_FLIP_RISK / RS_FLIP_MARGIN * 100:g}')}")
+        for fname, _ in FLIP_FEES:
+            rows = [r for r in res if r["m"] == mode and r["f"] == fname]
+            best = max(rows, key=lambda r: r["h1"]["net"])          # ayar 1. yarida secilir...
+            out.append(f"  {fname}:")
+            for r in rows:
+                n = r["h1"]["n"] + r["h2"]["n"]
+                mark = " ◀ 1. yarının en iyisi" if r is best else ""
+                liq = r["h1"]["liqs"] + r["h2"]["liqs"]
+                out.append(f"   {r['v']}: 1.yarı ${r['h1']['net']:+,.0f} · 2.yarı ${r['h2']['net']:+,.0f} · "
+                           f"{n / max(len(coins), 1) / days:.0f} işlem/gün/coin · maks düşüş %{max(r['h1'].get('dd', 0), r['h2'].get('dd', 0)):.0f}"
+                           f" · t {r['t']:.2f}{' · ⚠️' + str(liq) + ' likidasyon' if liq else ''}{mark}")
+            ok = best["h2"]["net"] > 0 and best["t"] >= RS_MIN_T
+            out.append(f"   → Seçilen {best['v']} görmediği 2. yarıda ${best['h2']['net']:+,.0f} "
+                       f"{'✅ tuttu' if ok else '❌ tutmadı'}")
+        out.append("")
+    out.append(f"Ayar seçimi: her senaryoda en iyi SuperTrend ayarı SADECE 1. yarıya bakılarak seçildi, "
+               f"2. yarı onun dürüst sınavı. ✅ için 2. yarıda artı ve t ≥ {RS_MIN_T:g} gerekir.")
+    return "\n".join(out)
+
+
+def run_flip_and_report(bot):
+    try:
+        bot.send_telegram(f"🔁 Sürekli gir-çık testi başladı: {RS_FLIP_TF} dk, {RS_FLIP_SYMBOLS}, {RS_FLIP_DAYS} gün. 5-15 dakika sürebilir...")
+        res, coins, t0, mid, t1, days = run_flip(bot)
+        rep = format_flip_report(bot, res, coins, t0, mid, t1, days)
+        log.info("Flip testi bitti\n%s", rep)
+        bot.send_telegram(rep)
+    except Exception as e:
+        log.exception("Flip testi hatasi: %s", e)
+        bot.send_telegram(f"⚠️ Sürekli gir-çık testi çalıştırılamadı: {e}")
