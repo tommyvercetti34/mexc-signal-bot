@@ -74,6 +74,9 @@ class LighterBook:
         self.log = log
         self.market_id = None
         self.http = requests.Session()
+        self.http.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                                                "Chrome/126.0 Safari/537.36", "Accept": "application/json",
+                                  "Origin": "https://app.lighter.xyz", "Referer": "https://app.lighter.xyz/"})
 
     def _get(self, path, **params):
         r = self.http.get(f"{LIGHTER_URL}{path}", params=params, timeout=8)
@@ -341,10 +344,12 @@ def _take_profit(bot, tp):
 
 
 def check_stop(bot, book_src):
+    book = book_src.book()
+    record_mid(book)                              # kendi Lighter mumlarimiz icin her cekiste orta fiyat
     with _lock:
         if not S["pos"] or S["stop"] is None:
             return False
-        bids, asks = book = book_src.book()
+        bids, asks = book
         best = bids[0][0] if S["pos"] == 1 else asks[0][0]
         hit = (S["pos"] == 1 and best <= S["stop"]) or (S["pos"] == -1 and best >= S["stop"])
         if hit:
@@ -397,6 +402,7 @@ def summary():
         "impact": float(np.mean([s["imp"] for s in sp])) if sp else None,
         "delay_s": float(np.mean([o["ms"] for o in od if o["ms"]]) / 1000) if any(o["ms"] for o in od) else None,
         "curve": curve[-2000:], "trades": tr[-40:][::-1], "current": cur,
+        "candles": CANDLE_SRC.get("name"), "own_candles": CANDLE_SRC.get("own", 0),
     }
 
 
@@ -435,12 +441,52 @@ def report_text():
         lines.append(f"💰 Kazanan %{(p > 0).mean() * 100:.0f} · ort. kazanç ${p[p > 0].mean() if (p > 0).any() else 0:.2f} · "
                      f"ort. kayıp ${p[p <= 0].mean() if (p <= 0).any() else 0:.2f} · stop ile kapanan "
                      f"%{np.mean([t['why'] == 'stop' for t in tr]) * 100:.0f}")
+    src = CANDLE_SRC.get("name") or "?"
+    if src == "MEXC" and CANDLE_SRC.get("own"):
+        src = f"Lighter defterinden kurulan mumlar (son {CANDLE_SRC['own']} dk) + MEXC (fiyat farkı düzeltilmiş)"
+    lines.append(f"🕯 Sinyal mumları: {src}")
     lines.append("Gerçek para kullanılmıyor; dolumlar Lighter'ın gerçek emir defterinden hesaplanıyor. Funding hariç.")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------- dongu
 CANDLE_SRC = {"name": None}
+MID = {}                                                   # dakika_ms -> [acilis, yuksek, dusuk, kapanis, ornek_sayisi]
+
+
+def record_mid(book):
+    """Her defter cekisinde orta fiyati o dakikanin mumuna ekle (Lighter fiyatlariyla kendi 1 dk mumlarimiz)."""
+    bids, asks = book
+    mid = (bids[0][0] + asks[0][0]) / 2
+    m = int(time.time() // 60 * 60_000)
+    c = MID.get(m)
+    if c is None:
+        MID[m] = [mid, mid, mid, mid, 1]
+        for k in [k for k in MID if k < m - 400 * 60_000]:
+            MID.pop(k, None)
+    else:
+        c[1], c[2], c[3], c[4] = max(c[1], mid), min(c[2], mid), mid, c[4] + 1
+
+
+def hybrid_candles(df):
+    """MEXC mumlarini Lighter'a gore kaydir; Lighter defterinden kurdugumuz dakikalar varsa onlari kullan."""
+    now_ms = int(time.time() * 1000)
+    own = {k: v for k, v in MID.items() if k + 60_000 <= now_ms and v[4] >= 5}
+    if not own:
+        return df, 0
+    d = df.copy()
+    idx = {int(t): i for i, t in enumerate(d["ts"].astype("int64"))}
+    diffs = [own[k][3] - d.at[idx[k], "close"] for k in own if k in idx]
+    basis = float(np.median(diffs)) if diffs else 0.0
+    for c in ("open", "high", "low", "close"):
+        d[c] = d[c] + basis
+    n = 0
+    for k, v in own.items():
+        if k in idx:
+            i = idx[k]
+            d.at[i, "open"], d.at[i, "high"], d.at[i, "low"], d.at[i, "close"] = v[0], v[1], v[2], v[3]
+            n += 1
+    return d, n
 
 
 def _candles(bot, ex, book_src=None):
@@ -459,7 +505,11 @@ def _candles(bot, ex, book_src=None):
                 bot.log.warning("Lighter mumlari alinamadi (%s); sinyal MEXC mumlarindan", e)
                 bot.send_telegram(f"⚠️ Lighter mum verisi alınamadı ({e}); sinyal MEXC mumlarından hesaplanacak. "
                                   "Fiyat farkı yüzünden dönüşler grafikle birebir örtüşmeyebilir.")
-    return _candles_mexc(bot, ex)
+    df = _candles_mexc(bot, ex)
+    if df is not None and MID:
+        df, n = hybrid_candles(df)
+        CANDLE_SRC["own"] = n
+    return df
 
 
 def _candles_mexc(bot, ex):

@@ -3057,7 +3057,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       if (!F.enabled){ card.style.display = "none"; return; }
       card.style.display = "block";
       const hrs = (Date.now() - F.started) / 3600000;
-      $("flipSub").textContent = `${F.symbol} 1 dk · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x` + (F.tp_roe ? ` · TP %${F.tp_roe}` : "") + ` · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
+      const csrc = F.candles === "Lighter" ? "Lighter mumları" : (F.own_candles ? `Lighter defter mumları ${F.own_candles} dk + MEXC` : "MEXC mumları");
+      $("flipSub").textContent = `${F.symbol} 1 dk · ${csrc} · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x` + (F.tp_roe ? ` · TP %${F.tp_roe}` : "") + ` · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
       const ok = F.avg_cost != null && F.avg_cost < F.threshold;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
       const pnl = F.eq - F.start;
