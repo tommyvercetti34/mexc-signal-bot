@@ -48,6 +48,7 @@ FLIP_MAX_DD_PCT = _env("FLIP_MAX_DD_PCT", 20.0, float)
 FLIP_POLL_SEC = _env("FLIP_POLL_SEC", 3.0, float)
 FLIP_REPORT_HOURS = _env("FLIP_REPORT_HOURS", 6.0, float)
 FLIP_TRADE_MSGS = _env("FLIP_TRADE_MSGS", False, bool)
+FLIP_ENTER_ON_START = _env("FLIP_ENTER_ON_START", True, bool)   # baslangicta mevcut yonde hemen gir
 LIGHTER_URL = _env("LIGHTER_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
 LIGHTER_MARKET = _env("LIGHTER_MARKET", "")                # bos = otomatik bul
 STATE_FILE = "flip_state.json"
@@ -248,6 +249,15 @@ def on_bar(bot, df, book_src, t_close):
     cur, ln, close = int(dirs[-1]), float(line[-1]), float(df["close"].iloc[-1])
     with _lock:
         prev = S.get("prev_dir")
+        if prev is None and FLIP_ENTER_ON_START and not S["pos"] and not S["halted"]:
+            # baslangicta bir sonraki donusu beklemeden mevcut SuperTrend yonunde gir (stop = guncel cizgi)
+            S["prev_dir"] = cur
+            _open(bot, book_src.book(), cur, ln, close, t_close)
+            if S["pos"]:
+                bot.send_telegram(f"🔁 Kâğıt takip mevcut yönde başladı: {'LONG' if cur == 1 else 'SHORT'} · giriş "
+                                  f"{S['entry']:,.1f} · stop (SuperTrend çizgisi) {S['stop']:,.1f} · pozisyon ${S['notional']:,.0f}")
+            _save(bot, remote=True)
+            return
         flipped = prev is not None and cur != prev
         book = book_src.book() if flipped else None       # once defter (hata olursa durum degismesin)
         S["prev_dir"] = cur
