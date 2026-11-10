@@ -1075,6 +1075,7 @@ FLIP_VARIANTS = [("ST(7,2)", 7, 2.0), ("ST(10,3)", 10, 3.0), ("ST(10,5)", 10, 5.
                  ("ST(20,8)", 20, 8.0), ("ST(30,10)", 30, 10.0)]
 FLIP_FEES = [(x.split(":")[0], float(x.split(":")[1])) for x in
              _env("RS_FLIP_FEES", "Lighter 0/0:0,MEXC web %0.016:0.00016,Hyperliquid %0.045:0.00045").split(",")]
+RS_FLIP_TP_ROE = _env("RS_FLIP_TP_ROE", 0.0, float)         # >0: teminatta bu kadar % kar olunca kapat (orn 50)
 FLIP_SLIPS = [float(x) for x in _env("RS_FLIP_SLIPS", "").split(",") if x.strip()] or [None]   # orn "0,0.00002,0.00005"
 RS_FLIP_RISK = _env("RS_FLIP_RISK", 10.0, float)             # 'risk' ve 'stop' modlarinda islem basi en fazla kayip ($)
 FLIP_MODES = {
@@ -1138,6 +1139,17 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode, slip=None):
             elif np.isfinite(stop) and ((pos == 1 and L[i] <= stop) or (pos == -1 and H[i] >= stop)):
                 # mum stopun OTESINDE acildiysa (bosluk / cizgi fiyatin ustune cikti) dolum acilis fiyatindan
                 close_at(min(stop, O[i]) if pos == 1 else max(stop, O[i]))
+            elif RS_FLIP_TP_ROE > 0:              # teminat uzerinden ROE hedefi (limit emir, kayma yok)
+                tp = entry * (1 + pos * RS_FLIP_TP_ROE / 100 / lev)
+                if (pos == 1 and H[i] >= tp) or (pos == -1 and L[i] <= tp):
+                    px = max(tp, O[i]) if pos == 1 else min(tp, O[i])
+                    exit_px = px
+                    pnl = notional * pos * (exit_px / entry - 1)
+                    eq += pnl
+                    rets.append(pnl / (eq - pnl) if eq - pnl > 0 else 0.0)
+                    curve.append(eq)
+                    n += 1
+                    pos = 0
         cur = dirs[i]
         flipped = np.isfinite(prev) and np.isfinite(cur) and cur != prev
         prev = cur
@@ -1234,6 +1246,7 @@ def format_flip_report(bot, res, coins, t0, mid, t1, days):
     out = [f"🔁 SÜREKLİ GİR-ÇIK TESTİ · {RS_FLIP_TF} dk · SuperTrend dönünce ters pozisyon",
            f"🗓 {f(t0)} → {f(t1)} ({days:.0f} gün) · {', '.join(coins)} (her coin ayrı ${RS_FLIP_MARGIN:,.0f} teminat, "
            f"başlangıçta en fazla ${cap:,.0f} pozisyon)",
+           (f"🎯 TP: teminatta %{RS_FLIP_TP_ROE:g} kâr (fiyatta %{RS_FLIP_TP_ROE / RS_FLIP_LEV:g}) olunca kapat · " if RS_FLIP_TP_ROE > 0 else "") +
            f"{RS_FLIP_LEV:g}x · {'BİLEŞİK (kâr sonraki işleme eklenir)' if RS_FLIP_COMPOUND else 'sabit teminat'} · "
            f"kayma %{RS_FLIP_SLIP * 100:g}/emir (aksi yazmadıkça) · funding hariç · her yarı ${RS_FLIP_MARGIN:,.0f} ile başlar · "
            f"tutarlar TÜM coinlerin toplam kâr/zararı", ""]
