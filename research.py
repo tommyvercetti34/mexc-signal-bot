@@ -267,6 +267,9 @@ def fmt_params(fam, p):
 # ============================================================================
 # SIMULASYON
 # ============================================================================
+FILL_STATS = {}      # limit giris: sid -> [sinyal, dolan]
+
+
 def simulate(bot, symbol, d, sigs, p, max_bars):
     """Her sinyal: tek giris, stop = sl*ATR, Hedef1'de %50 kapat + stop girise, Hedef2'de kalan.
     Canli botun islem motoru (bot.process_bar) kullanilir."""
@@ -287,24 +290,48 @@ def simulate(bot, symbol, d, sigs, p, max_bars):
         else:
             sl = e - sign * p["sl"] * atr
             tp1_atr, tp2_atr = p["tp"][0], p["tp"][1]
+        entry_fee, i0, fill_bar = RS_TAKER, i, None
+        if p.get("entry") == "limit":             # LIMIT (maker) giris: sinyal kapanisindan off*ATR geride, N mum gecerli
+            st_ = FILL_STATS.setdefault(p.get("_sid", "?"), [0, 0])
+            st_[0] += 1
+            lim = e - sign * float(p.get("lim_atr", 0.0)) * atr
+            tp1_lvl = e + sign * tp1_atr * atr
+            for jj in range(i + 1, min(len(d), i + 1 + int(p.get("lim_bars", 2)))):
+                if (sign == 1 and L[jj] < lim) or (sign == -1 and H[jj] > lim):   # fiyat limitin OTESINE gecti -> doldu
+                    fill_bar = jj
+                    break
+                if (sign == 1 and H[jj] >= tp1_lvl) or (sign == -1 and L[jj] <= tp1_lvl):
+                    break                         # dolmadan hedefe kosti -> islem kacti
+            if fill_bar is None:
+                continue
+            st_[1] += 1
+            tp2_lvl = e + sign * tp2_atr * atr    # stop ve hedefler sinyaldeki MUTLAK seviyelerde kalir
+            tp1_atr, tp2_atr = sign * (tp1_lvl - lim) / atr, sign * (tp2_lvl - lim) / atr
+            e, entry_fee, i0 = lim, RS_MAKER, fill_bar
         sl_dist = abs(e - sl) / e
-        if sl_dist < 0.002 or sl_dist > 0.08:
+        if sl_dist < 0.002 or sl_dist > 0.08 or tp1_atr <= 0:
             continue
         plan = {"direction": direction, "sign": sign, "entries": [e], "weights": [1.0], "sl": sl, "atr": atr}
-        s = bot.new_state(plan, tp1_atr=tp1_atr, tp2_atr=tp2_atr, tp1_frac=0.5, move_be=True, taker=RS_TAKER,
+        s = bot.new_state(plan, tp1_atr=tp1_atr, tp2_atr=tp2_atr, tp1_frac=0.5, move_be=True, taker=entry_fee,
                           be_atr=p.get("be", 0.0))
-        j = i
-        for j in range(i + 1, min(len(d), i + 1 + max_bars)):
+        if fill_bar is not None:                  # dolum mumu: sadece stop kontrolu (hedef sayilmaz, temkinli)
+            bot.process_bar(s, (e if sign == 1 else H[fill_bar]), (L[fill_bar] if sign == 1 else e),
+                            maker=RS_MAKER, taker=RS_TAKER)
+        j = i0
+        for j in range(i0 + 1, min(len(d), i0 + 1 + max_bars)):
+            if s["closed"]:
+                j -= 1
+                break
             bot.process_bar(s, H[j], L[j], maker=RS_MAKER, taker=RS_TAKER)
             if s["closed"]:
                 break
         if not s["closed"]:
-            if j - i >= max_bars:
+            if j - i0 >= max_bars:
                 bot.close_market(s, float(C[j]), taker=RS_TAKER)
             else:
                 continue
         out.append({"symbol": symbol, "direction": direction, "score": score, "outcome": s["outcome"],
-                    "entry_time": pd.Timestamp(ct[i]), "exit_time": pd.Timestamp(ct[j]),
+                    "entry_time": pd.Timestamp(ct[i0]), "exit_time": pd.Timestamp(ct[max(j, i0)]),
                     "ret": s["ret"], "fee": s["fee"], "sl_dist": sl_dist})
     return out
 
@@ -852,7 +879,13 @@ def run_combo_and_report(bot):
 RS_FUND_DAYS = _env("RS_FUND_DAYS", 365, int)
 RS_UNIVERSE = _env("RS_UNIVERSE", "binance").lower()          # binance | mexc | list (RS_SYMBOLS)
 RS_UNIVERSE_N = _env("RS_UNIVERSE_N", 30, int)
-FUND_STRATS = ["cprofile_15m", "cprofile_fund_15m", "fundrev_1h"]
+FUND_STRATS = [x.strip() for x in _env("RS_FUND_STRATS", "cprofile_15m,cprofile_fund_15m,fundrev_1h").split(",") if x.strip()]
+ENTRY_VARIANTS = {            # strateji@varyant -> giris turu
+    "mkt": ({}, "market giriş"),
+    "lim0": ({"entry": "limit", "lim_atr": 0.0, "lim_bars": 2}, "limit giriş: sinyal fiyatı, 2 mum"),
+    "lim25": ({"entry": "limit", "lim_atr": 0.25, "lim_bars": 4}, "limit giriş: 0,25 ATR geride, 4 mum"),
+    "lim50": ({"entry": "limit", "lim_atr": 0.5, "lim_bars": 4}, "limit giriş: 0,5 ATR geride, 4 mum"),
+}
 _STABLE = {"USDC", "FDUSD", "TUSD", "USDE", "DAI", "BUSD", "USDP", "USD1", "RLUSD", "PYUSD"}
 FUND_KEEP = ["ts", "open", "high", "low", "close", "atr", "adx", "st_dir", "close_time",
              "fund", "fund_p90", "fund_p10", "fund_ts"]
@@ -885,7 +918,7 @@ def universe_symbols(bot, ex_data):
                 base = (m.get("base") or "").upper()
                 if not (m.get("swap") and m.get("linear") and m.get("quote") == "USDT") or not base:
                     continue
-                if base in _STABLE or base in bot.EXCLUDE_SYMBOLS or not m.get("active", True):
+                if base in _STABLE or base in bot.EXCLUDE_SYMBOLS or base.endswith("STOCK") or not m.get("active", True):
                     continue
                 qv = t.get("quoteVolume") or 0
                 ranked.append((float(qv), base))
@@ -950,9 +983,12 @@ def run_funding(bot, ex=None, progress=None):
     mid = t0 + (t1 - t0) / 2
     end = t1 + pd.Timedelta(minutes=1)
     rows = []
-    for sid in FUND_STRATS:
+    FILL_STATS.clear()
+    for full_sid in FUND_STRATS:
+        sid, _, var = full_sid.partition("@")
         base = bot.STRAT_DEFS[sid]
-        p = dict(base["params"])
+        vparams, vlabel = ENTRY_VARIANTS.get(var or "mkt", ({}, var))
+        p = dict(base["params"], **vparams, _sid=full_sid)
         max_bars = int(base["max_hours"] * 60 / base["tf"])
         trades = []
         for sym, fr in data.items():
@@ -962,8 +998,10 @@ def run_funding(bot, ex=None, progress=None):
         h1, h2, full = portfolio(bot, trades, t0, mid), portfolio(bot, trades, mid, end), portfolio(bot, trades, t0, end)
         passed = (h1["n"] >= 30 and h2["n"] >= 30 and h1["pf"] >= 1.1 and h2["pf"] >= 1.1
                   and full["t"] >= RS_MIN_T and full["max_dd"] <= 20)
-        rows.append({"sid": sid, "name": f"{base['name']} ({bot.TF_LABELS[base['tf']]})", "h1": h1, "h2": h2,
-                     "full": full, "passed": passed})
+        fs = FILL_STATS.get(full_sid)
+        rows.append({"sid": full_sid, "name": f"{base['name']} ({bot.TF_LABELS[base['tf']]})" + (f" · {vlabel}" if var else ""),
+                     "h1": h1, "h2": h2, "full": full, "passed": passed,
+                     "fill": (fs[1], fs[0]) if fs else None})
     return rows, src, cover, len(data), t0, mid, t1
 
 
@@ -986,10 +1024,16 @@ def format_funding_report(bot, rows, src, cover, n, t0, mid, t1):
                 f"   1. yarı ({f(t0)}–{f(mid)}): {line(r['h1'])}",
                 f"   2. yarı ({f(mid)}–{f(t1)}): {line(r['h2'])}",
                 f"   Tümü: işlem başı {r['full']['avg_r']:+.2f}R · t = {r['full']['t']:.2f} · "
-                f"LONG ${r['full']['long']:+,.0f} · SHORT ${r['full']['short']:+,.0f}", ""]
-    base, filt = rows[0], rows[1]
-    out.append(f"🔎 Fonlama filtresinin etkisi (tümü): {base['full']['n']} → {filt['full']['n']} işlem, "
-               f"işlem başı {base['full']['avg_r']:+.2f}R → {filt['full']['avg_r']:+.2f}R")
+                f"LONG ${r['full']['long']:+,.0f} · SHORT ${r['full']['short']:+,.0f}"]
+        if r.get("fill"):
+            fl, sg = r["fill"]
+            out.append(f"   Limit emir dolma oranı: %{fl / sg * 100 if sg else 0:.0f} ({fl}/{sg} sinyal; dolmayanlar işlem kaçtı)")
+        out.append("")
+    ids = [r["sid"] for r in rows]
+    if "cprofile_15m" in ids and "cprofile_fund_15m" in ids:
+        base, filt = rows[ids.index("cprofile_15m")], rows[ids.index("cprofile_fund_15m")]
+        out.append(f"🔎 Fonlama filtresinin etkisi (tümü): {base['full']['n']} → {filt['full']['n']} işlem, "
+                   f"işlem başı {base['full']['avg_r']:+.2f}R → {filt['full']['avg_r']:+.2f}R")
     out.append("")
     out.append(f"Geçti şartı: iki yarıda da ≥30 işlem ve PF ≥ 1.1, tümünde t ≥ {RS_MIN_T:g} ve maks. düşüş ≤ %20.")
     out.append("⚠️ Coin listesi BUGÜNÜN hacmine göre seçildi (geçmişte popüler olmayanlar da var olabilir). "
