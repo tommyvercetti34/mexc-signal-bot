@@ -49,6 +49,7 @@ FLIP_POLL_SEC = _env("FLIP_POLL_SEC", 3.0, float)
 FLIP_REPORT_HOURS = _env("FLIP_REPORT_HOURS", 6.0, float)
 FLIP_TRADE_MSGS = _env("FLIP_TRADE_MSGS", False, bool)
 FLIP_ENTER_ON_START = _env("FLIP_ENTER_ON_START", True, bool)   # baslangicta mevcut yonde hemen gir
+FLIP_TP_ROE = _env("FLIP_TP_ROE", 50.0, float)            # teminatta % kar olunca limit emirle kapat (0 = kapali)
 LIGHTER_URL = _env("LIGHTER_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
 LIGHTER_MARKET = _env("LIGHTER_MARKET", "")                # bos = otomatik bul
 STATE_FILE = "flip_state.json"
@@ -272,6 +273,20 @@ def on_bar(bot, df, book_src, t_close):
     _save(bot, remote=True)
 
 
+def _take_profit(bot, tp):
+    """Limit TP (maker): defterde bekleyen emir fiyat gelince TP seviyesinden dolar; kayma ve komisyon yok."""
+    pos = S["pos"]
+    S["orders"].append({"t": int(time.time() * 1000), "k": "tp", "side": -pos, "ref": tp, "fill": tp,
+                        "cost": 0.0, "hs": 0.0, "full": True, "ms": 0})
+    pnl = S["notional"] * pos * (tp / S["entry"] - 1)
+    S["eq"] += pnl
+    S["trades"].append({"o": S["opened"], "c": int(time.time() * 1000), "dir": pos, "entry": S["entry"], "exit": tp,
+                        "notional": S["notional"], "pnl": pnl, "why": "tp", "eq": S["eq"]})
+    S["pos"], S["stop"], S["notional"] = 0, None, 0.0
+    S["peak"] = max(S["peak"], S["eq"])
+    bot.send_telegram(f"🎯 Kâğıt TP: teminatta %{FLIP_TP_ROE:g} kâr alındı · {pnl:+.2f}$ · bakiye {S['eq']:.2f}$")
+
+
 def check_stop(bot, book_src):
     with _lock:
         if not S["pos"] or S["stop"] is None:
@@ -281,6 +296,12 @@ def check_stop(bot, book_src):
         hit = (S["pos"] == 1 and best <= S["stop"]) or (S["pos"] == -1 and best >= S["stop"])
         if hit:
             _close(bot, book, "stop", S["stop"], None)
+        elif FLIP_TP_ROE > 0:
+            tp = S["entry"] * (1 + S["pos"] * FLIP_TP_ROE / 100 / FLIP_LEV)
+            # limit satis (long) en iyi ALIS fiyati TP'ye ulasinca dolar; short icin en iyi SATIS
+            if (S["pos"] == 1 and bids[0][0] >= tp) or (S["pos"] == -1 and asks[0][0] <= tp):
+                _take_profit(bot, tp)
+                hit = True
     if hit:
         _save(bot, remote=True)
     return hit
@@ -309,11 +330,11 @@ def summary():
         cur = {"pos": S["pos"], "entry": S["entry"], "stop": S["stop"], "notional": S["notional"], "opened": S["opened"]}
         eq, start, peak, halted, started = S["eq"], S["start_eq"], S["peak"], S["halted"], S["started"]
     costs = [o["cost"] for o in od]
-    by = {k: [o["cost"] for o in od if o["k"] == k] for k in ("giris", "flip_cikis", "stop")}
+    by = {k: [o["cost"] for o in od if o["k"] == k] for k in ("giris", "flip_cikis", "stop", "tp")}
     curve = [[started, start]] + [[t["c"], t["eq"]] for t in tr]
     return {
         "enabled": True, "symbol": FLIP_SYMBOL, "st": [FLIP_ST_PERIOD, FLIP_ST_MULT], "risk": FLIP_RISK_PCT, "lev": FLIP_LEV,
-        "max_dd": FLIP_MAX_DD_PCT, "halted": halted, "started": started, "eq": eq, "start": start, "peak": peak,
+        "max_dd": FLIP_MAX_DD_PCT, "tp_roe": FLIP_TP_ROE, "halted": halted, "started": started, "eq": eq, "start": start, "peak": peak,
         "dd": (1 - eq / peak) * 100 if peak else 0.0, "n_trades": len(tr), "n_orders": len(od),
         "win": float(np.mean([t["pnl"] > 0 for t in tr]) * 100) if tr else None,
         "avg_cost": float(np.mean(costs)) if costs else None, "threshold": BREAKEVEN_PCT,
@@ -332,13 +353,13 @@ def report_text():
     hours = (time.time() * 1000 - S["started"]) / 3600000
     pct = lambda x: f"%{x * 100:.4f}"
     lines = [f"🔁 LIGHTER KÂĞIT TAKİP · {FLIP_SYMBOL} 1 dk · SuperTrend({FLIP_ST_PERIOD},{FLIP_ST_MULT:g}) · "
-             f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x" + (" · 🛑 ACİL FREN AKTİF" if S["halted"] else ""),
+             f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x" + (f" · TP %{FLIP_TP_ROE:g}" if FLIP_TP_ROE > 0 else "") + (" · 🛑 ACİL FREN AKTİF" if S["halted"] else ""),
              f"⏱ {hours:.1f} saat · {len(tr)} işlem · bakiye ${eq:,.2f} (başlangıç ${start:,.0f}, "
              f"{(eq / start - 1) * 100:+.1f}%) · zirveden düşüş %{(1 - eq / peak) * 100:.1f}"]
     if od:
         c = np.array([o["cost"] for o in od])
         for k, name in (("giris", "Giriş (mum kapanışına göre)"), ("flip_cikis", "Dönüş çıkışı (kapanışa göre)"),
-                        ("stop", "Stop çıkışı (stop seviyesine göre)")):
+                        ("stop", "Stop çıkışı (stop seviyesine göre)"), ("tp", "TP (limit, kaymasız)")):
             cc = [o["cost"] for o in od if o["k"] == k]
             if cc:
                 lines.append(f"   {name}: ort. maliyet {pct(np.mean(cc))} ({len(cc)} emir)")

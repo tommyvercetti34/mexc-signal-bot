@@ -1073,6 +1073,9 @@ RS_FLIP_LEV = _env("RS_FLIP_LEV", 25, float)
 RS_FLIP_SLIP = _env("RS_FLIP_SLIP", 0.0001, float)          # her market emirde kayma (1 baz puan)
 FLIP_VARIANTS = [("ST(7,2)", 7, 2.0), ("ST(10,3)", 10, 3.0), ("ST(10,5)", 10, 5.0), ("ST(14,4)", 14, 4.0),
                  ("ST(20,8)", 20, 8.0), ("ST(30,10)", 30, 10.0)]
+if _env("RS_FLIP_STS", ""):                   # orn "5:1.5,5:2,7:1.5,7:2" -> sadece bu ayarlar
+    FLIP_VARIANTS = [(f"ST({int(a)},{float(b):g})", int(a), float(b)) for a, b in
+                     (x.split(":") for x in _env("RS_FLIP_STS", "").split(",") if ":" in x)]
 FLIP_FEES = [(x.split(":")[0], float(x.split(":")[1])) for x in
              _env("RS_FLIP_FEES", "Lighter 0/0:0,MEXC web %0.016:0.00016,Hyperliquid %0.045:0.00045").split(",")]
 RS_FLIP_TP_ROE = _env("RS_FLIP_TP_ROE", 0.0, float)         # >0: teminatta bu kadar % kar olunca kapat (orn 50)

@@ -3056,7 +3056,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       if (!F.enabled){ card.style.display = "none"; return; }
       card.style.display = "block";
       const hrs = (Date.now() - F.started) / 3600000;
-      $("flipSub").textContent = `${F.symbol} 1 dk · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
+      $("flipSub").textContent = `${F.symbol} 1 dk · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x` + (F.tp_roe ? ` · TP %${F.tp_roe}` : "") + ` · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
       const ok = F.avg_cost != null && F.avg_cost < F.threshold;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
       const pnl = F.eq - F.start;
@@ -3069,12 +3069,12 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       const cb = F.cost_by || {};
       const row = (n,k) => cb[k] ? `<tr><td>${n}</td><td class="r">${fpct(cb[k][0])}</td><td class="r">${cb[k][1]}</td></tr>` : "";
       $("flipCost").innerHTML = `<thead><tr><th>Maliyet kalemi</th><th class="r">Ortalama</th><th class="r">Emir</th></tr></thead><tbody>` +
-        row("Giriş (mum kapanışına göre)","giris") + row("Dönüş çıkışı (kapanışa göre)","flip_cikis") + row("Stop çıkışı (stop seviyesine göre)","stop") +
+        row("Giriş (mum kapanışına göre)","giris") + row("Dönüş çıkışı (kapanışa göre)","flip_cikis") + row("Stop çıkışı (stop seviyesine göre)","stop") + row("TP (limit, kaymasız)","tp") +
         `<tr><td>Defterde yarım poz. emir etkisi</td><td class="r">${fpct(F.impact)}</td><td class="r"></td></tr>` +
         (F.current && F.current.pos ? `<tr><td colspan="3"><b>Açık kâğıt pozisyon:</b> ${F.current.pos==1?"LONG":"SHORT"} · giriş ${F.current.entry.toLocaleString("tr-TR")} · stop ${Number(F.current.stop).toLocaleString("tr-TR")} · ${money(F.current.notional,false)}</td></tr>` : "") +
         `</tbody>`;
       $("flipTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Yön</th><th class="r">Giriş</th><th class="r">Çıkış</th><th class="r">Pozisyon</th><th>Neden</th><th class="r">K/Z</th><th class="r">Bakiye</th></tr></thead><tbody>` +
-        (F.trades.length ? F.trades.map(t => `<tr><td>${fmtTime(t.c)}</td><td>${t.dir==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${t.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(t.notional,false)}</td><td>${t.why==="stop"?"Stop (çizgi)":"SuperTrend dönüşü"}</td><td class="r ${cls(t.pnl)}"><b>${money(t.pnl)}</b></td><td class="r">${money(t.eq,false)}</td></tr>`).join("")
+        (F.trades.length ? F.trades.map(t => `<tr><td>${fmtTime(t.c)}</td><td>${t.dir==1?'<span class="badge b-tp">▲ LONG</span>':'<span class="badge b-sl">▼ SHORT</span>'}</td><td class="r">${t.entry.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{maximumFractionDigits:1})}</td><td class="r">${money(t.notional,false)}</td><td>${t.why==="tp" ? "🎯 TP (teminatta %" + (F.tp_roe||50) + ")" : t.why==="stop" ? (t.pnl>0 ? "Takip eden stop · kâr alındı" : "Takip eden stop") : "SuperTrend dönüşü"}</td><td class="r ${cls(t.pnl)}"><b>${money(t.pnl)}</b></td><td class="r">${money(t.eq,false)}</td></tr>`).join("")
           : `<tr><td class="empty" colspan="8">Henüz kapanan kâğıt işlem yok</td></tr>`) + "</tbody>";
       if (window.Chart){
         const line = css("--accent"), grid = css("--line"), ink2 = css("--ink2");
