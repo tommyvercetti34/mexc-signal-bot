@@ -1086,6 +1086,8 @@ FLIP_MODES = {
     "risk": "Stop SuperTrend çizgisinde ve çizgiyi TAKİP ediyor; stop olursa kayıp ≈ bakiyenin %{riskp}",
     "stop": "Tüm teminatla pozisyon + sabit stop (bakiyenin %{riskp})",
     "trail": "Tüm teminatla pozisyon, stop SuperTrend çizgisinde ve çizgiyi TAKİP ediyor",
+    "riskre": "risk gibi; stop/TP sonrası SuperTrend hâlâ aynı yöndeyse sonraki mum kapanışında AYNI yöne tekrar gir",
+    "kapanis": "Büyüklük risk gibi ama mum içi stop YOK: sadece SuperTrend dönünce (mum kapanışı) çık + ters aç",
 }
 
 
@@ -1156,9 +1158,11 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode, slip=None):
         cur = dirs[i]
         flipped = np.isfinite(prev) and np.isfinite(cur) and cur != prev
         prev = cur
-        if pos and mode in ("risk", "trail") and np.isfinite(line[i]):   # iz suren stop: cizgi lehe gittikce stop da gelir
+        if pos and mode in ("risk", "trail", "riskre") and np.isfinite(line[i]):   # iz suren stop: cizgi lehe gittikce stop da gelir
             stop = max(stop, line[i]) if pos == 1 else min(stop, line[i])
-        if not flipped:
+        reenter = (mode == "riskre" and not flipped and not pos and n > 0
+                   and np.isfinite(cur) and np.isfinite(line[i]))
+        if not flipped and not reenter:
             continue
         if pos:
             close_at(C[i])
@@ -1166,13 +1170,13 @@ def flip_sim2(bot, d, line, dirs, taker, start, end, mode, slip=None):
         e = C[i] * (1 + want * SLIP)
         base = eq if RS_FLIP_COMPOUND else RS_FLIP_MARGIN
         cap = min(base, eq) * lev
-        if mode == "risk":
+        if mode in ("risk", "riskre", "kapanis"):
             dist = abs(e - line[i]) / e if np.isfinite(line[i]) else 0
             if dist <= 0.0002:
                 continue
             risk_usd = RS_FLIP_RISK * base / RS_FLIP_MARGIN
             notional = min(risk_usd / dist, cap)
-            stop = line[i]
+            stop = line[i] if mode != "kapanis" else np.nan
         elif mode == "trail":                    # tum teminatla pozisyon, stop SuperTrend cizgisinde ve takip ediyor
             if not np.isfinite(line[i]):
                 continue

@@ -50,6 +50,8 @@ FLIP_POLL_SEC = _env("FLIP_POLL_SEC", 3.0, float)
 FLIP_REPORT_HOURS = _env("FLIP_REPORT_HOURS", 6.0, float)
 FLIP_TRADE_MSGS = _env("FLIP_TRADE_MSGS", False, bool)
 FLIP_ENTER_ON_START = _env("FLIP_ENTER_ON_START", True, bool)   # baslangicta mevcut yonde hemen gir
+FLIP_EXIT = _env("FLIP_EXIT", "stop").lower()          # stop: mum ici cizgi stopu | kapanis: sadece SuperTrend donunce cik
+FLIP_REENTER = _env("FLIP_REENTER", False, bool)          # stop/TP sonrasi SuperTrend ayni yondeyse sonraki kapanista tekrar gir
 FLIP_TP_ROE = _env("FLIP_TP_ROE", 50.0, float)            # teminatta % kar olunca limit emirle kapat (0 = kapali)
 LIGHTER_URL = _env("LIGHTER_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
 LIGHTER_MARKET = _env("LIGHTER_MARKET", "")                # bos = otomatik bul
@@ -344,6 +346,11 @@ def on_bar(bot, df, book_src, t_close):
         if S["pos"] and np.isfinite(ln) and not flipped:  # iz suren stop
             S["stop"] = max(S["stop"], ln) if S["pos"] == 1 else min(S["stop"], ln)
         if not flipped:
+            if FLIP_REENTER and not S["pos"] and not S["halted"] and S["trades"] and np.isfinite(ln):
+                _open(bot, book_src.book(), cur, ln, close, t_close)   # cizgi hala ayni renkte: trende geri don
+                if S["pos"]:
+                    bot.log.info("Flip tekrar giris: %s · %.1f · stop %.1f", "LONG" if cur == 1 else "SHORT", S["entry"], S["stop"])
+                    _save(bot, remote=True)
             return
         S["last_flip"] = {"t": int((t_close or time.time()) * 1000), "dir": cur, "close": close, "line": ln,
                           "src": CANDLE_SRC.get("name"), "own": CANDLE_SRC.get("own", 0)}
@@ -379,7 +386,7 @@ def check_stop(bot, book_src):
             return False
         bids, asks = book
         best = bids[0][0] if S["pos"] == 1 else asks[0][0]
-        hit = (S["pos"] == 1 and best <= S["stop"]) or (S["pos"] == -1 and best >= S["stop"])
+        hit = FLIP_EXIT != "kapanis" and ((S["pos"] == 1 and best <= S["stop"]) or (S["pos"] == -1 and best >= S["stop"]))
         if hit:
             _close(bot, book, "stop", S["stop"], None)
         elif FLIP_TP_ROE > 0:
