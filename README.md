@@ -305,3 +305,12 @@ Tüm veri iki yarıya bölünür, her yarı ayrı raporlanır. Ayarlar: `RS_FUND
 
 Bot saatte bir hacimce ilk 30 coinin fiyat, 24s hacim, açık pozisyon (OI) ve anlık fonlama oranını kaydeder;
 günde bir Gist'e `snap_YYYY-MM.csv` olarak yazar. Kapatmak için `SNAPSHOT=false`.
+
+## Lighter kâğıt takip (FLIP_LIVE=true)
+
+`flip_live.py` dosyası main.py ile aynı klasörde olmalı. 1 dk BTC SuperTrend(7,2) gir-çık stratejisini gerçek para
+kullanmadan izler; dolumları Lighter'ın gerçek emir defterinden hesaplar, stopu birkaç saniyede bir kontrol eder.
+Ayarlar: `FLIP_SYMBOL` (BTC), `FLIP_ST_PERIOD` (7), `FLIP_ST_MULT` (2), `FLIP_BALANCE` (500), `FLIP_LEV` (25),
+`FLIP_RISK_PCT` (1), `FLIP_MAX_DD_PCT` (20, acil fren), `FLIP_REPORT_HOURS` (6), `FLIP_TRADE_MSGS` (false),
+`FLIP_RESET` (true = sıfırdan başlat). Anlık rapor: `https://<servis>.onrender.com/flip`.
+Backtestteki kâr/zarar eşiği emir başı ~%0,003 maliyet; rapor ölçülen maliyeti bu eşikle karşılaştırır.

@@ -228,6 +228,15 @@ class _HealthHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         key = parse_qs(url.query).get("key", [""])[0]
         try:
+            if url.path == "/flip":                   # Lighter kagit takip anlik raporu
+                if DASHBOARD_KEY and key != DASHBOARD_KEY:
+                    return self._send(403, "Yetkisiz: ?key=... gerekli".encode(), "text/plain; charset=utf-8")
+                try:
+                    import flip_live
+                    txt = flip_live.report_text() if flip_live.S else "Kâğıt takip kapalı (FLIP_LIVE=true değil)"
+                except Exception as e:
+                    txt = f"Rapor alınamadı: {e}"
+                return self._send(200, txt.encode(), "text/plain; charset=utf-8")
             if url.path in ("/dashboard", "/dashboard/", "/api/data"):
                 if DASHBOARD_KEY and key != DASHBOARD_KEY:
                     return self._send(403, "Yetkisiz: ?key=... gerekli".encode(), "text/plain; charset=utf-8")
@@ -2582,6 +2591,13 @@ def main():
     start_health_server()
     if TRACK_TRADES:
         load_trades()
+    try:                                          # Lighter kagit takip (FLIP_LIVE=true ise ayri is parcaciginda)
+        import flip_live
+        if flip_live.start(sys.modules[__name__], create_exchange):
+            log.info("Lighter kagit takip basladi (%s 1dk, SuperTrend %s,%s)", flip_live.FLIP_SYMBOL,
+                     flip_live.FLIP_ST_PERIOD, flip_live.FLIP_ST_MULT)
+    except ImportError:
+        log.warning("flip_live.py bulunamadi; kagit takip devre disi")
 
     ex = None
     consecutive_failures = 0
