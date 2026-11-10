@@ -43,6 +43,7 @@ FLIP_ST_MULT = _env("FLIP_ST_MULT", 2.0, float)
 FLIP_BALANCE = _env("FLIP_BALANCE", 500.0, float)
 FLIP_LEV = _env("FLIP_LEV", 25.0, float)
 FLIP_RISK_PCT = _env("FLIP_RISK_PCT", 1.0, float)
+FLIP_SIZING = _env("FLIP_SIZING", "risk").lower()        # risk | full (tum teminat x kaldirac)
 FLIP_FEE = _env("FLIP_FEE", 0.0, float)                    # taker komisyon (Lighter standart: 0)
 FLIP_MAX_DD_PCT = _env("FLIP_MAX_DD_PCT", 20.0, float)
 FLIP_POLL_SEC = _env("FLIP_POLL_SEC", 3.0, float)
@@ -118,6 +119,41 @@ class LighterBook:
             if p > 0 and q > 0:
                 out.append((p, q))
         return out
+
+    def candles(self, n=300):
+        """Lighter 1 dk mumlari (kapanmis). Alan adlari/zaman birimi farkli olabilir: esnek ayristirma."""
+        if self.market_id is None:
+            self.resolve()
+        now_ms = int(time.time() * 1000)
+        rows = None
+        for unit in (1, 1000):                    # once milisaniye, olmazsa saniye
+            try:
+                j = self._get("/api/v1/candlesticks", market_id=self.market_id, resolution="1m",
+                              start_timestamp=(now_ms - (n + 5) * 60_000) // unit, end_timestamp=now_ms // unit,
+                              count_back=n)
+            except Exception:
+                continue
+            rows = j.get("candlesticks") or j.get("candles") or (j if isinstance(j, list) else None)
+            if rows:
+                break
+        if not rows:
+            raise RuntimeError("Lighter mum verisi bos")
+        out = []
+        for c in rows:
+            if isinstance(c, dict):
+                ts = c.get("timestamp", c.get("t", c.get("start_timestamp")))
+                o, h, l, cl = (c.get(k, c.get(k[0])) for k in ("open", "high", "low", "close"))
+            else:
+                ts, o, h, l, cl = c[:5]
+            ts = int(float(ts))
+            ts = ts * 1000 if ts < 10**12 else ts
+            out.append((ts, float(o), float(h), float(l), float(cl)))
+        df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close"]).drop_duplicates("ts")
+        df = df.sort_values("ts").reset_index(drop=True)
+        df = df[df["ts"] + 60_000 <= now_ms].reset_index(drop=True)
+        if len(df) < 50 or (df["high"] < df["low"]).any():
+            raise RuntimeError("Lighter mum verisi gecersiz")
+        return df
 
     def book(self):
         if self.market_id is None:
@@ -233,8 +269,11 @@ def _open(bot, book, direction, line, ref_price, t_ref, kind="giris"):
     dist = abs(best - line) / best
     if not np.isfinite(line) or dist <= 0.0002:
         return
-    risk_usd = S["eq"] * FLIP_RISK_PCT / 100
-    notional = min(risk_usd / dist, S["eq"] * FLIP_LEV)
+    if FLIP_SIZING == "full":                    # tum teminatla: bakiye x kaldirac (testte dusus %84-95)
+        notional = S["eq"] * FLIP_LEV
+    else:                                         # risk: stop olursa kayip bakiyenin FLIP_RISK_PCT'i
+        risk_usd = S["eq"] * FLIP_RISK_PCT / 100
+        notional = min(risk_usd / dist, S["eq"] * FLIP_LEV)
     fill, ok = walk(side_levels, notional)
     delay = int((time.time() - t_ref) * 1000) if t_ref else 0
     _record_order(kind, direction, ref_price, fill, (asks[0][0] - bids[0][0]) / 2 / mid, ok, delay)
@@ -353,7 +392,7 @@ def report_text():
     hours = (time.time() * 1000 - S["started"]) / 3600000
     pct = lambda x: f"%{x * 100:.4f}"
     lines = [f"🔁 LIGHTER KÂĞIT TAKİP · {FLIP_SYMBOL} 1 dk · SuperTrend({FLIP_ST_PERIOD},{FLIP_ST_MULT:g}) · "
-             f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x" + (f" · TP %{FLIP_TP_ROE:g}" if FLIP_TP_ROE > 0 else "") + (" · 🛑 ACİL FREN AKTİF" if S["halted"] else ""),
+             (f"TÜM TEMİNAT" if FLIP_SIZING == "full" else f"risk %{FLIP_RISK_PCT:g}") + f" · {FLIP_LEV:g}x" + (f" · TP %{FLIP_TP_ROE:g}" if FLIP_TP_ROE > 0 else "") + (" · 🛑 ACİL FREN AKTİF" if S["halted"] else ""),
              f"⏱ {hours:.1f} saat · {len(tr)} işlem · bakiye ${eq:,.2f} (başlangıç ${start:,.0f}, "
              f"{(eq / start - 1) * 100:+.1f}%) · zirveden düşüş %{(1 - eq / peak) * 100:.1f}"]
     od = [o for o in od if o["k"] != "baslangic"]       # baslangic girisi donus aninda degil: maliyete katilmaz
@@ -386,7 +425,28 @@ def report_text():
 
 
 # ---------------------------------------------------------------------------- dongu
-def _candles(bot, ex):
+CANDLE_SRC = {"name": None}
+
+
+def _candles(bot, ex, book_src=None):
+    """Sinyal mumlari: once Lighter (islem yapilan yer), olmazsa MEXC."""
+    if book_src is not None and CANDLE_SRC["name"] != "MEXC":
+        try:
+            df = book_src.candles()
+            if CANDLE_SRC["name"] != "Lighter":
+                CANDLE_SRC["name"] = "Lighter"
+                bot.log.info("Flip sinyal mumlari: Lighter")
+            return df
+        except Exception as e:
+            if CANDLE_SRC["name"] is None:
+                CANDLE_SRC["name"] = "MEXC"
+                bot.log.warning("Lighter mumlari alinamadi (%s); sinyal MEXC mumlarindan", e)
+                bot.send_telegram(f"⚠️ Lighter mum verisi alınamadı ({e}); sinyal MEXC mumlarından hesaplanacak. "
+                                  "Fiyat farkı yüzünden dönüşler grafikle birebir örtüşmeyebilir.")
+    return _candles_mexc(bot, ex)
+
+
+def _candles_mexc(bot, ex):
     sym = f"{FLIP_SYMBOL}/USDT:USDT"
     raw = bot.with_retry(ex.fetch_ohlcv, sym, "1m", limit=300, desc=f"flip ohlcv {sym}")
     if not raw:
@@ -410,14 +470,15 @@ def run(bot, ex_factory):
     try:
         mid = book_src.resolve()
         b, a = book_src.book()
+        ex = ex_factory()
+        _candles(bot, ex, book_src)
         bot.send_telegram(f"🔁 Lighter kâğıt takip başladı: {FLIP_SYMBOL} (piyasa #{mid}) · en iyi alış {b[0][0]:,.1f} / "
                           f"satış {a[0][0]:,.1f} · bakiye ${S['eq']:,.2f} · SuperTrend({FLIP_ST_PERIOD},{FLIP_ST_MULT:g}) · "
-                          f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x · acil fren %{FLIP_MAX_DD_PCT:g}")
+                          f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x · acil fren %{FLIP_MAX_DD_PCT:g} · sinyal mumları: {CANDLE_SRC['name']}")
     except Exception as e:
         bot.send_telegram(f"⚠️ Lighter kâğıt takip başlatılamadı (emir defterine erişilemiyor): {e}")
         log.exception("Lighter erisim hatasi: %s", e)
         return
-    ex = ex_factory()
     while True:
         try:
             now = time.time()
@@ -430,7 +491,7 @@ def run(bot, ex_factory):
                     log.warning("Flip stop kontrolu hatasi: %s", e)
                 time.sleep(min(FLIP_POLL_SEC, max(0.2, nxt - time.time())))
             t_close = int(time.time() // 60) * 60.0         # biten mumun kapanis ani
-            df = _candles(bot, ex)
+            df = _candles(bot, ex, book_src)
             if df is not None and df["ts"].iloc[-1] != S.get("last_bar"):
                 S["last_bar"] = int(df["ts"].iloc[-1])
                 on_bar(bot, df, book_src, t_close)
