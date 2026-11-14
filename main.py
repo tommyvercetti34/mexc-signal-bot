@@ -152,6 +152,9 @@ SIGNAL_COOLDOWN_MIN = _env("SIGNAL_COOLDOWN_MIN", 60, int)  # ayni coin icin en 
 TRACK_TRADES = _env("TRACK_TRADES", True, bool)           # acik sinyalleri izle, TP/SL olunca mesaj at
 MONITOR_INTERVAL_SEC = _env("MONITOR_INTERVAL_SEC", 60, int)  # kac sn'de bir kontrol edilsin
 MAX_TRADE_HOURS = _env("MAX_TRADE_HOURS", 48, float)      # bu sureden sonra TP/SL olmazsa "suresi doldu" kapat
+EXPIRE_MODE = _env("EXPIRE_MODE", "close").lower()        # close: sure dolunca kapat | trail: karda ise kapatma, kari kilitle
+EXPIRE_LOCK = _env("EXPIRE_LOCK", 0.5, float)             # trail: acik karin bu kadari stopla kilitlenir (0.5 = yarisi)
+EXPIRE_EXT_X = _env("EXPIRE_EXT_X", 2.0, float)           # trail: en uzun sure = normal surenin bu kati
 ONE_TRADE_PER_SYMBOL = _env("ONE_TRADE_PER_SYMBOL", True, bool)  # acik islem varken ayni coine yeni sinyal verme
 STATE_FILE = _env("STATE_FILE", "trades.json")
 MAX_CLOSED_HISTORY = _env("MAX_CLOSED_HISTORY", 2000, int)  # dashboard icin saklanan kapanmis islem sayisi
@@ -940,6 +943,40 @@ def close_market(s, px, outcome="EXPIRED", taker=None):
     taker = FEE_TAKER if taker is None else taker
     _st_close(s, 1.0, px, taker)
     s.update(closed=True, exit=px, outcome=outcome)
+
+
+def expire_or_extend(s, px, mode=None, lock=None):
+    """Sure doldu. Zarardaysa (veya mod 'close' ise) piyasadan kapat -> True.
+    'trail' modunda karda ise kapatma: stopu acik karin 'lock' kadarina cek, takip eden stopla devam -> False."""
+    mode = EXPIRE_MODE if mode is None else mode
+    lock = EXPIRE_LOCK if lock is None else lock
+    avg, _ = st_avg(s)
+    sg = s["sign"]
+    if mode == "trail" and sg * (px - avg) > 0:
+        s["extended"], s["best"] = True, px
+        new = avg + lock * (px - avg)
+        if sg * (new - s["sl"]) > 0:
+            s["sl"] = new
+        return False
+    close_market(s, px)
+    return True
+
+
+def ext_trail(s, high, low, lock=None):
+    """Uzatilmis islemde: fiyat lehe yeni uc yaptikca stopu karin 'lock' kadarina tasi. Kapanis etiketini duzelt."""
+    if not s.get("extended"):
+        return
+    if s["closed"]:
+        if s["outcome"] in ("SL", "BE"):
+            s["outcome"] = "TRAIL"
+        return
+    lock = EXPIRE_LOCK if lock is None else lock
+    avg, _ = st_avg(s)
+    sg = s["sign"]
+    s["best"] = max(s["best"], high) if sg == 1 else min(s["best"], low)
+    new = avg + lock * (s["best"] - avg)
+    if sg * (new - s["sl"]) > 0:
+        s["sl"] = new
 
 
 def st_result(s, fees=True):
@@ -2033,21 +2070,55 @@ def _apply_loaded(data, source):
     log.info("%s: %d acik, %d kapanmis islem yuklendi", source, len(TRADES["open"]), len(TRADES["closed"]))
 
 
+GIST_READ_OK = {"ok": False}    # Gist basariyla okunmadan uzerine YAZILMAZ (gecmis islemler silinmesin)
+
+
+def _read_gist_trades():
+    """Gist'teki islem kaydi: dict, dosya yoksa/bossa {} ; okunamazsa istisna."""
+    r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=20)
+    r.raise_for_status()
+    f = r.json().get("files", {}).get(GIST_FILE)
+    if not f:
+        return {}
+    content = f.get("content", "")
+    if f.get("truncated") and f.get("raw_url"):
+        rr = requests.get(f["raw_url"], headers=_gist_headers(), timeout=30)
+        rr.raise_for_status()
+        content = rr.text
+    return json.loads(content) if content.strip() else {}
+
+
+def _merge_loaded(data):
+    """Gist gec okunduysa: Gist'teki gecmis + bu arada acilan/kapanan islemler birlesir (tekrar yok)."""
+    def key(t):
+        return (t.get("symbol"), t.get("opened_ms"), t.get("strategy"))
+    closed = {key(t): t for t in data.get("closed", [])}
+    for t in TRADES["closed"]:
+        closed[key(t)] = t
+    done = set(closed)
+    opn = {key(t): t for t in data.get("open", []) if key(t) not in done}
+    for t in TRADES["open"]:
+        opn[key(t)] = t
+    TRADES["closed"] = sorted(closed.values(), key=lambda t: t.get("closed_ms", 0))
+    TRADES["open"] = list(opn.values())
+    for k, v in data.get("stats", {}).items():
+        if isinstance(v, (int, float)) and k in TRADES["stats"]:
+            TRADES["stats"][k] = max(TRADES["stats"][k], v)
+    TRADES["started_ms"] = min(x for x in (data.get("started_ms"), TRADES.get("started_ms")) if x) \
+        if (data.get("started_ms") or TRADES.get("started_ms")) else None
+    log.info("Gist sonradan okundu ve birlestirildi: %d acik, %d kapanmis", len(TRADES["open"]), len(TRADES["closed"]))
+
+
 def load_trades():
     if _gist_enabled():
         try:
-            r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=20)
-            r.raise_for_status()
-            f = r.json().get("files", {}).get(GIST_FILE)
-            if f:
-                content = f.get("content", "")
-                if f.get("truncated") and f.get("raw_url"):
-                    content = requests.get(f["raw_url"], headers=_gist_headers(), timeout=30).text
-                if content.strip():
-                    _apply_loaded(json.loads(content), "Gist")
-                    return
+            data = _read_gist_trades()
+            GIST_READ_OK["ok"] = True
+            if data:
+                _apply_loaded(data, "Gist")
+                return
         except Exception as e:
-            log.error("Gist okunamadi, yerel dosya denenecek: %s", e)
+            log.error("Gist okunamadi, yerel dosya denenecek (Gist'e okunana kadar yazilmayacak): %s", e)
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -2057,6 +2128,17 @@ def load_trades():
 
 
 def _push_gist(payload):
+    if not GIST_READ_OK["ok"]:
+        try:                                       # acilista okunamadiysa once oku + birlestir, sonra yaz
+            data = _read_gist_trades()
+            with _trade_lock:
+                if data:
+                    _merge_loaded(data)
+                GIST_READ_OK["ok"] = True
+                payload = json.dumps(TRADES, ensure_ascii=False)
+        except Exception as e:
+            log.error("Gist hala okunamiyor; uzerine yazilmadi (gecmis korunuyor): %s", e)
+            return
     try:
         r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(),
                            json={"files": {GIST_FILE: {"content": payload}}}, timeout=30)
@@ -2098,6 +2180,7 @@ def dashboard_data():
                 "last_price": last, "opened_ms": t["opened_ms"], "margin": t.get("margin"),
                 "leverage": t.get("leverage", LEVERAGE), "strategy": t.get("strategy", "reversal"),
                 "pnl_pct": (sign * (last - avg) / avg * 100) if last else None,
+                "usd": _open_usd(t, st_, last),
             })
         return {
             "now_ms": int(time.time() * 1000),
@@ -2118,6 +2201,15 @@ def dashboard_data():
             "open": open_rows,
             "closed": list(TRADES["closed"]),
         }
+
+
+def _open_usd(t, s, last):
+    """Acik islemin anlik $ K/Z'si: realize (Hedef 1) + kalan pozisyonun piyasa degeri, giris/cikis komisyonu dahil."""
+    if not last or not t.get("margin"):
+        return None
+    unreal = sum(w * s["rem"] * s["sign"] * (last - e) / e for e, w, f in zip(s["entries"], s["weights"], s["filled"]) if f)
+    exit_fee = sum(w * s["rem"] for w, f in zip(s["weights"], s["filled"]) if f) * FEE_TAKER
+    return round(trade_usd(t, s["ret"] + unreal - s["fee"] - exit_fee), 2)
 
 
 def has_open_trade(symbol):
@@ -2264,6 +2356,7 @@ def _close_message(ex, t, now_ms):
         "SL": "❌ STOP OLDU",
         "BE": "⚪ GİRİŞTE KAPANDI (başa baş, zarar yok)",
         "EXPIRED": "⌛ SÜRE DOLDU (piyasadan kapatıldı)",
+        "TRAIL": "🔒 UZATMADA KÂR KİLİTLİ STOPLA KAPANDI",
     }.get(s["outcome"], s["outcome"])
     msg = (
         f"{head}\n"
@@ -2307,6 +2400,7 @@ def check_trade(ex, t):
                 elif kind == "BE_SET" and not s["tp1_done"]:
                     text = _be_message(ex, t, val)
                 events.append((kind, val, text))
+            ext_trail(s, h, l)
             t["last_checked_ms"] = int(ts) + 60_000
             if s["closed"]:
                 break
@@ -2315,8 +2409,20 @@ def check_trade(ex, t):
     max_h = t.get("max_hours", MAX_TRADE_HOURS)
     if not s["closed"] and max_h > 0 and now_ms - t["opened_ms"] > max_h * 3600_000 \
             and t.get("last_price"):
-        close_market(s, t["last_price"])
-        events.append(("EXPIRED", t["last_price"], None))
+        if s.get("extended"):
+            if now_ms - t["opened_ms"] > max_h * EXPIRE_EXT_X * 3600_000:
+                close_market(s, t["last_price"])              # uzatma da doldu
+                events.append(("EXPIRED", t["last_price"], None))
+        elif expire_or_extend(s, t["last_price"]):
+            events.append(("EXPIRED", t["last_price"], None))
+        else:
+            p = lambda v: fmt_price(ex, t["symbol"], v)
+            text = (f"⏳ SÜRE DOLDU AMA İŞLEM KÂRDA · kapatılmadı\n"
+                    f"📌 Coin: {t['coin']} | {t['direction']}\n"
+                    f"🔒 Stop kâra çekildi: {p(s['sl'])} (açık kârın %{EXPIRE_LOCK * 100:.0f} kadarı kilitli)\n"
+                    f"📈 Fiyat lehe gittikçe stop da takip edecek; en geç {max_h * (EXPIRE_EXT_X - 1):g} saat içinde kapanır\n"
+                    f"📅 {datetime.now(DISPLAY_TZ).strftime('%d.%m.%Y %H:%M')} TSİ")
+            events.append(("EXTENDED", t["last_price"], text))
     return events
 
 
@@ -2334,6 +2440,9 @@ def monitor_trades(ex):
                 if kind == "FILL":
                     remote = True
                     log.info("KADEME DOLDU %s %d/%d", t["symbol"], val + 1, len(s["entries"]))
+                elif kind == "EXTENDED":
+                    remote = True
+                    log.info("SURE UZATILDI (karda) %s stop %s", t["symbol"], s["sl"])
                 elif kind in ("TP1", "BE_SET"):
                     remote = True
                     log.info("%s %s", "HEDEF 1" if kind == "TP1" else "BASA BAS STOP", t["symbol"])
@@ -2346,7 +2455,7 @@ def monitor_trades(ex):
             avg, _ = st_avg(s)
             with _trade_lock:
                 stt = TRADES["stats"]
-                key = {"TP": "tp", "TP1_BE": "tp", "SL": "sl", "BE": "be", "EXPIRED": "expired"}.get(s["outcome"], "expired")
+                key = {"TP": "tp", "TP1_BE": "tp", "TRAIL": "tp", "SL": "sl", "BE": "be", "EXPIRED": "expired"}.get(s["outcome"], "expired")
                 stt[key] = stt.get(key, 0) + 1
                 stt["pnl_pct"] = round(stt.get("pnl_pct", 0.0) + net / ws * 100, 4)
                 TRADES["open"].remove(t)
@@ -2843,8 +2952,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   const price = v => v==null ? "—" : (v>=100 ? v.toLocaleString("tr-TR",{maximumFractionDigits:2}) : v>=1 ? v.toLocaleString("tr-TR",{maximumFractionDigits:4}) : v.toPrecision(5));
   const cls = v => v>0 ? "pos" : v<0 ? "neg" : "";
   const dur = ms => { const m=Math.floor(ms/60000), d=Math.floor(m/1440), h=Math.floor(m%1440/60), mm=m%60; return (d?d+"g ":"")+(h?h+"s ":"")+mm+"dk"; };
-  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ Hedef 2</span>' : o==="TP1_BE" ? '<span class="badge b-tp">✓ Hedef 1 + giriş</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : o==="BE" ? '<span class="badge b-exp">⚪ Başa baş</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
-  const isWin = o => o==="TP" || o==="TP1_BE";
+  const outBadge = o => o==="TP" ? '<span class="badge b-tp">✓ Hedef 2</span>' : o==="TP1_BE" ? '<span class="badge b-tp">✓ Hedef 1 + giriş</span>' : o==="SL" ? '<span class="badge b-sl">✕ Stop</span>' : o==="BE" ? '<span class="badge b-exp">⚪ Başa baş</span>' : o==="TRAIL" ? '<span class="badge b-tp">🔒 Uzatma · kâr kilitli</span>' : '<span class="badge b-exp">⌛ Süre doldu</span>';
+  const isWin = o => o==="TP" || o==="TP1_BE" || o==="TRAIL";
   const dirBadge = d => d==="LONG" ? '<span class="badge b-long">▲ LONG</span>' : '<span class="badge b-short">▼ SHORT</span>';
 
   function settings(){
@@ -2986,18 +3095,19 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     $("openCount").textContent = `(${open.length}${S.data.bot.max_open ? " / " + S.data.bot.max_open + " slot" : ""})`;
     if (!open.length){ $("openTbl").innerHTML = '<tr><td class="empty">Şu an açık işlem yok</td></tr>'; return; }
     const lev = S.data.bot.leverage;
-    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Strateji</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">Kaldıraçlı</th><th class="r">Süre</th></tr></thead><tbody>` +
+    $("openTbl").innerHTML = `<thead><tr><th>Açılış</th><th>Strateji</th><th>Coin</th><th>Yön</th><th class="r">Ort. giriş</th><th class="r">Son fiyat</th><th class="r">Stop</th><th class="r">Hedef 1</th><th class="r">Hedef 2</th><th>Kademe</th><th class="r">Anlık K/Z</th><th class="r">Kaldıraçlı</th><th class="r">$</th><th class="r">Süre</th></tr></thead><tbody>` +
       open.slice().sort((a,b)=>b.opened_ms-a.opened_ms).map(t => {
         const p = t.pnl_pct;
         return `<tr><td>${fmtTime(t.opened_ms)}</td><td>${esc((S.data.bot.strategy_names||{})[t.strategy] || "—")}</td><td><b>${esc(t.coin)}</b></td><td>${dirBadge(t.direction)}</td>
           <td class="r">${price(t.avg_entry)}</td><td class="r">${price(t.last_price)}</td><td class="r">${price(t.sl)}</td><td class="r">${t.tp1_done ? "✓ alındı" : price(t.tp1)}</td><td class="r">${price(t.tp)}</td>
           <td>${t.filled}/${t.levels}</td><td class="r ${cls(p)}">${p==null?"—":pct(p)}</td><td class="r ${cls(p)}">${p==null?"—":pct(p*(t.leverage||lev),1)}</td>
+          <td class="r ${cls(t.usd)}"><b>${t.usd==null?"—":money(t.usd)}</b></td>
           <td class="r">${dur(S.data.now_ms - t.opened_ms)}</td></tr>`;
       }).join("") + "</tbody>";
   }
 
   function renderClosed(rows){
-    const list = rows.filter(t => S.outcome==="ALL" || t.outcome===S.outcome || (S.outcome==="TP" && t.outcome==="TP1_BE")).sort((a,b)=>b.closed_ms-a.closed_ms);
+    const list = rows.filter(t => S.outcome==="ALL" || t.outcome===S.outcome || (S.outcome==="TP" && (t.outcome==="TP1_BE" || t.outcome==="TRAIL"))).sort((a,b)=>b.closed_ms-a.closed_ms);
     $("closedCount").textContent = `(${list.length})`;
     if (!list.length){ $("closedTbl").innerHTML = '<tr><td class="empty">Bu filtrede kapanan işlem yok</td></tr>'; return; }
     const lev = S.data.bot.leverage;

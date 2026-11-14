@@ -270,6 +270,11 @@ def fmt_params(fam, p):
 FILL_STATS = {}      # limit giris: sid -> [sinyal, dolan]
 
 
+RS_EXPIRE = os.getenv("RS_EXPIRE", "close").lower()            # close | trail (sure dolunca karda ise kapatma)
+RS_EXPIRE_LOCK = float(os.getenv("RS_EXPIRE_LOCK", "0.5"))
+RS_EXPIRE_EXT_X = float(os.getenv("RS_EXPIRE_EXT_X", "2"))
+
+
 def simulate(bot, symbol, d, sigs, p, max_bars):
     """Her sinyal: tek giris, stop = sl*ATR, Hedef1'de %50 kapat + stop girise, Hedef2'de kalan.
     Canli botun islem motoru (bot.process_bar) kullanilir."""
@@ -318,15 +323,20 @@ def simulate(bot, symbol, d, sigs, p, max_bars):
             bot.process_bar(s, (e if sign == 1 else H[fill_bar]), (L[fill_bar] if sign == 1 else e),
                             maker=RS_MAKER, taker=RS_TAKER)
         j = i0
-        for j in range(i0 + 1, min(len(d), i0 + 1 + max_bars)):
+        lim_bars = max_bars * (RS_EXPIRE_EXT_X if RS_EXPIRE == "trail" else 1)
+        for j in range(i0 + 1, min(len(d), i0 + 1 + int(lim_bars))):
             if s["closed"]:
                 j -= 1
                 break
             bot.process_bar(s, H[j], L[j], maker=RS_MAKER, taker=RS_TAKER)
+            bot.ext_trail(s, H[j], L[j], lock=RS_EXPIRE_LOCK)
             if s["closed"]:
                 break
+            if j - i0 >= max_bars and not s.get("extended"):
+                if bot.expire_or_extend(s, float(C[j]), mode=RS_EXPIRE, lock=RS_EXPIRE_LOCK):
+                    break
         if not s["closed"]:
-            if j - i0 >= max_bars:
+            if j - i0 >= int(lim_bars):
                 bot.close_market(s, float(C[j]), taker=RS_TAKER)
             else:
                 continue

@@ -236,6 +236,20 @@ def _save(bot, remote=False):
         pass
     if remote and bot._gist_enabled():
         def push():
+            if not _RD["ok"]:                      # acilista Gist okunamadiysa: once oku, gecmisi ezme
+                try:
+                    data = _fetch_remote(bot)
+                    _RD["ok"] = True
+                    if data and len(data.get("trades", [])) > len(S.get("trades", [])):
+                        with _lock:
+                            S.update(data)
+                            S["prev_dir"] = S["pos"] if S.get("pos") else None
+                            S["last_bar"] = None
+                        bot.log.warning("Flip: Gist sonradan okundu, kayitli gecmis geri yuklendi")
+                        return
+                except Exception as e:
+                    bot.log.warning("Flip: Gist hala okunamiyor, uzerine yazilmadi: %s", e)
+                    return
             try:
                 requests.patch(f"https://api.github.com/gists/{bot.GIST_ID}", headers=bot._gist_headers(),
                                json={"files": {STATE_FILE: {"content": payload}}}, timeout=30)
@@ -244,19 +258,32 @@ def _save(bot, remote=False):
         threading.Thread(target=push, daemon=True).start()
 
 
+_RD = {"ok": False}      # Gist basariyla okunmadan flip_state.json uzerine yazilmaz
+
+
+def _fetch_remote(bot):
+    """Gist'teki flip durumu: dict ya da None (dosya yok). Okunamazsa istisna."""
+    r = requests.get(f"https://api.github.com/gists/{bot.GIST_ID}", headers=bot._gist_headers(), timeout=30)
+    r.raise_for_status()
+    f = r.json().get("files", {}).get(STATE_FILE)
+    if not f:
+        return None
+    txt = f.get("content") or ""
+    if f.get("truncated") and f.get("raw_url"):
+        rr = requests.get(f["raw_url"], headers=bot._gist_headers(), timeout=60)
+        rr.raise_for_status()
+        txt = rr.text
+    return json.loads(txt) if txt.strip() else None
+
+
 def _load(bot):
     data = None
     if bot._gist_enabled():
         try:
-            r = requests.get(f"https://api.github.com/gists/{bot.GIST_ID}", headers=bot._gist_headers(), timeout=30)
-            f = r.json().get("files", {}).get(STATE_FILE) if r.status_code < 300 else None
-            if f:
-                txt = f.get("content") or ""
-                if f.get("truncated") and f.get("raw_url"):
-                    txt = requests.get(f["raw_url"], headers=bot._gist_headers(), timeout=60).text
-                data = json.loads(txt)
+            data = _fetch_remote(bot)
+            _RD["ok"] = True
         except Exception as e:
-            bot.log.warning("Flip durumu Gist'ten okunamadi: %s", e)
+            bot.log.warning("Flip durumu Gist'ten okunamadi (okunana kadar uzerine yazilmayacak): %s", e)
     if data is None and os.path.exists(STATE_FILE):
         try:
             data = json.load(open(STATE_FILE, encoding="utf-8"))
@@ -705,9 +732,80 @@ def run(bot, ex_factory):
             time.sleep(5)
 
 
+def balance_text():
+    """/bakiye cevabi: anlik bakiye + acik pozisyonun canli K/Z'si + son 24 saat."""
+    sm = summary()
+    if not sm.get("enabled", True) or not S:
+        return "Kâğıt takip henüz başlamadı."
+    with _lock:
+        tr = list(S["trades"])
+        eq, start, peak, halted = S["eq"], S["start_eq"], S["peak"], S["halted"]
+        cur = {"pos": S["pos"], "entry": S["entry"], "stop": S["stop"], "notional": S["notional"], "opened": S["opened"]}
+    up = sm.get("upnl") or 0.0
+    live = eq + up
+    lines = [f"💰 Bakiye: ${live:,.2f} ({(live / start - 1) * 100:+.2f}%)" + (" · 🛑 ACİL FREN AKTİF" if halted else ""),
+             f"   Kapanmış işlemlerle ${eq:,.2f} · başlangıç ${start:,.0f} · zirve ${peak:,.2f} "
+             f"(zirveden %{max(0.0, 1 - live / peak) * 100:.1f} aşağıda)"]
+    if cur["pos"]:
+        px = (LAST.get("bid") if cur["pos"] == 1 else LAST.get("ask")) or cur["entry"]
+        mins = (time.time() * 1000 - (cur["opened"] or time.time() * 1000)) / 60000
+        lines.append(f"📍 Açık {'LONG' if cur['pos'] == 1 else 'SHORT'}: giriş {cur['entry']:,.1f} · şimdi {px:,.1f} · "
+                     f"stop {cur['stop']:,.1f} · ${cur['notional']:,.0f} · {mins:.0f} dk · K/Z {up:+.2f}$")
+    else:
+        lines.append("📍 Açık pozisyon yok (bir sonraki sinyal bekleniyor)")
+    day = [t for t in tr if t["c"] >= time.time() * 1000 - 86400000]
+    if day:
+        p = np.array([t["pnl"] for t in day])
+        lines.append(f"🕐 Son 24 saat: {len(day)} işlem · {p.sum():+.2f}$ · kazanan %{(p > 0).mean() * 100:.0f}")
+    lines.append(f"Toplam {len(tr)} işlem · mum kaynağı: {CANDLE_SRC.get('name') or '?'}")
+    return "\n".join(lines)
+
+
+def tg_commands(bot):
+    """Telegram'dan komut dinle: /bakiye (/durum) ve /rapor. Sadece TELEGRAM_CHAT_ID'deki mesajlara cevap verir."""
+    token, chat = getattr(bot, "TELEGRAM_BOT_TOKEN", ""), str(getattr(bot, "TELEGRAM_CHAT_ID", ""))
+    if not token or not chat or getattr(bot, "DRY_RUN", False):
+        return
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    offset = None
+    try:                                           # eski mesajlari atla: en sondakinden sonrasini dinle
+        r = requests.get(url, params={"offset": -1, "timeout": 0}, timeout=15).json()
+        if r.get("result"):
+            offset = r["result"][-1]["update_id"] + 1
+    except Exception:
+        pass
+    warned = False
+    while True:
+        try:
+            params = {"timeout": 50, "allowed_updates": json.dumps(["message", "channel_post"])}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(url, params=params, timeout=65)
+            if r.status_code == 409:               # webhook ya da baska bir kopya dinliyor
+                if not warned:
+                    bot.log.warning("Telegram komutlari dinlenemiyor (409: baska bir dinleyici/webhook var)")
+                    warned = True
+                time.sleep(60)
+                continue
+            for u in r.json().get("result", []):
+                offset = u["update_id"] + 1
+                m = u.get("message") or u.get("channel_post") or {}
+                if str(m.get("chat", {}).get("id")) != chat and m.get("chat", {}).get("username") != chat.lstrip("@"):
+                    continue
+                cmd = (m.get("text") or "").strip().split()[0].split("@")[0].lower() if m.get("text") else ""
+                if cmd in ("/bakiye", "/durum", "/b"):
+                    bot.send_telegram(balance_text(), reply_to=m.get("message_id"))
+                elif cmd == "/rapor":
+                    bot.send_telegram(report_text(), reply_to=m.get("message_id"))
+        except Exception as e:
+            bot.log.debug("Telegram komut dongusu: %s", e)
+            time.sleep(5)
+
+
 def start(bot, ex_factory):
     if not FLIP_LIVE:
         return None
     th = threading.Thread(target=run, args=(bot, ex_factory), daemon=True, name="flip_live")
     th.start()
+    threading.Thread(target=tg_commands, args=(bot,), daemon=True, name="flip_tg_cmd").start()
     return th
