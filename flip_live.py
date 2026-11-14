@@ -325,7 +325,7 @@ def _close(bot, book, reason, ref_price, t_ref):
     S["peak"] = max(S["peak"], S["eq"])
     if FLIP_TRADE_MSGS:
         bot.send_telegram(f"🔁 Kâğıt {'LONG' if pos == 1 else 'SHORT'} kapandı ({reason}) {pnl:+.2f}$ · bakiye {S['eq']:.2f}$")
-    if S["eq"] <= S["peak"] * (1 - FLIP_MAX_DD_PCT / 100) and not S["halted"]:
+    if FLIP_MAX_DD_PCT > 0 and S["eq"] <= S["peak"] * (1 - FLIP_MAX_DD_PCT / 100) and not S["halted"]:
         S["halted"] = True
         bot.send_telegram(f"🛑 KÂĞIT TAKİP ACİL FREN: bakiye zirveden %{FLIP_MAX_DD_PCT:g} düştü "
                           f"({S['peak']:.2f}$ → {S['eq']:.2f}$). Yeni işlem açılmıyor. Sıfırlamak için FLIP_RESET=true.")
@@ -677,6 +677,17 @@ def _candles_mexc(bot, ex):
     return df if len(df) >= 50 else None
 
 
+def _maybe_unhalt(bot):
+    """Fren kapatildiysa (FLIP_MAX_DD_PCT=0) ya da genisletildiyse: gecmis korunarak islem acmaya devam."""
+    if S.get("halted") and (FLIP_MAX_DD_PCT <= 0 or S["eq"] > S["peak"] * (1 - FLIP_MAX_DD_PCT / 100)):
+        S["halted"] = False
+        bot.send_telegram(f"▶️ Kâğıt takip acil freni kaldırıldı · bakiye {S['eq']:.2f}$ ile devam ediliyor "
+                          f"(fren: {'kapalı' if FLIP_MAX_DD_PCT <= 0 else '%' + format(FLIP_MAX_DD_PCT, 'g')})")
+        _save(bot, remote=True)
+        return True
+    return False
+
+
 def run(bot, ex_factory):
     log = bot.log
     _load(bot)
@@ -685,6 +696,7 @@ def run(bot, ex_factory):
     if _env("FLIP_RESET", False, bool):
         S.clear()
         S.update(_new_state())
+    _maybe_unhalt(bot)
     book_src = LighterBook(log)
     try:
         mid = book_src.resolve()
@@ -693,7 +705,7 @@ def run(bot, ex_factory):
         _candles(bot, ex, book_src)
         bot.send_telegram(f"🔁 Lighter kâğıt takip başladı: {FLIP_SYMBOL} (piyasa #{mid}) · en iyi alış {b[0][0]:,.1f} / "
                           f"satış {a[0][0]:,.1f} · bakiye ${S['eq']:,.2f} · SuperTrend({FLIP_ST_PERIOD},{FLIP_ST_MULT:g}) · "
-                          f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x · acil fren %{FLIP_MAX_DD_PCT:g} · sinyal mumları: {CANDLE_SRC['name']}")
+                          f"risk %{FLIP_RISK_PCT:g} · {FLIP_LEV:g}x · acil fren {'kapalı' if FLIP_MAX_DD_PCT <= 0 else '%' + format(FLIP_MAX_DD_PCT, 'g')} · sinyal mumları: {CANDLE_SRC['name']}")
     except Exception as e:
         bot.send_telegram(f"⚠️ Lighter kâğıt takip başlatılamadı (emir defterine erişilemiyor): {e}")
         log.exception("Lighter erisim hatasi: %s", e)

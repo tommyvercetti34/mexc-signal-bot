@@ -3177,7 +3177,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
         tile("Kâğıt bakiye (canlı)", money(F.eq + up,false), `${money(pnl)} (${(pnl/F.start*100).toFixed(2)}%)` + (F.upnl != null ? ` · açık işlem ${money(F.upnl)}` : ""), cls(pnl)) +
         tile("Emir başı maliyet", fpct(F.avg_cost), F.avg_cost==null ? "henüz emir yok" : (ok ? "✅ eşiğin altında" : "❌ eşiğin üstünde") + ` · eşik ${fpct(F.threshold)}`, F.avg_cost==null ? "" : (ok ? "pos" : "neg")) +
         tile("İşlem", F.n_trades, F.win==null ? "" : `kazanan %${F.win.toFixed(0)}`) +
-        tile("Zirveden düşüş", "%" + F.dd.toFixed(1), `acil fren %${F.max_dd}`, F.dd > F.max_dd*0.75 ? "neg" : "") +
+        tile("Zirveden düşüş", "%" + F.dd.toFixed(1), (F.max_dd > 0 ? `acil fren %${F.max_dd}` : "acil fren kapalı"), F.max_dd > 0 && F.dd > F.max_dd*0.75 ? "neg" : "") +
         tile("Yarım spread", fpct(F.half_spread), F.delay_s==null ? "" : `gecikme ort. ${F.delay_s.toFixed(1)} sn`);
       const cb = F.cost_by || {};
       const row = (n,k) => cb[k] ? `<tr><td>${n}</td><td class="r">${fpct(cb[k][0])}</td><td class="r">${cb[k][1]}</td></tr>` : "";
