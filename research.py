@@ -54,7 +54,7 @@ RS_MIN_TRADES = _env("RS_MIN_TRADES", 25, int)         # egitimde en az islem (a
 RS_MIN_TEST_TRADES = _env("RS_MIN_TEST_TRADES", 30, int)  # dogrulamada en az islem (t-testi icin alt sinir)
 RS_MIN_T = _env("RS_MIN_T", 2.5, float)                # dogrulamada islem basi getirinin t-istatistigi (sans elemesi;
                                                        # 9 strateji birlikte test edildigi icin coklu test duzeltmeli)
-RS_EXCHANGE = _env("RS_EXCHANGE", "mexc").lower()       # mexc | binance (veri ve coin listesi bu borsadan)
+RS_EXCHANGE = _env("RS_EXCHANGE", os.getenv("DATA_EXCHANGE", "bybit")).lower()   # bybit | mexc | binance
 RS_MODE = _env("RS_MODE", "standard").lower()          # standard | long4h (sadece 4 saatlik stratejiler, uzun gecmis)
 RS_LONG_DAYS = _env("RS_LONG_DAYS", 730, int)           # long4h modunda kac gunluk 4s veri
 RS_SYMBOLS = _env("RS_SYMBOLS", "BTC,ETH,SOL,XRP,DOGE,ADA,LINK,AVAX,LTC,BCH,DOT,TRX,NEAR,ATOM,UNI,ETC,FIL,AAVE,XLM,BNB")
@@ -165,7 +165,7 @@ sig_reversal_filtered = _shared("reversal_f")
 sig_reversal_btc = _shared("reversal_btc")
 sig_supertrend = _shared("supertrend")
 sig_sweep = _shared("sweep")
-SIG_FN = {f: _shared(f) for f in ("ha_pb", "harmony", "impulse", "diverg", "ribbon", "tdseq", "cprofile")}              # HTF Sweep + CISD (yapisal stop d["struct_sl"] sutununa yazilir)
+SIG_FN = {f: _shared(f) for f in ("ha_pb", "harmony", "impulse", "diverg", "ribbon", "tdseq", "cprofile", "matrix")}              # HTF Sweep + CISD (yapisal stop d["struct_sl"] sutununa yazilir)
 
 
 def sig_reversal_raw(bot, d, p):
@@ -223,6 +223,10 @@ FAMILIES = [
      "max_hours": 24, "grid": {"mode": ["9q", "13"], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
     {"sid": "tdseq_1h", "key": "tdseq1h", "name": "TD Sequential (DGT) (1 saat)", "tf": 60, "fn": SIG_FN["tdseq"],
      "max_hours": 72, "grid": {"mode": ["9q", "13"], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "matrix_15m", "key": "matrix15m", "name": "Matrix VWMA (15 dk)", "tf": 15, "fn": SIG_FN["matrix"],
+     "max_hours": 24, "grid": {"fast": [12, 20], "slow": [20], "trend": ["lt", "off"], "tdrev": [1], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
+    {"sid": "matrix_1h", "key": "matrix1h", "name": "Matrix VWMA (1 saat)", "tf": 60, "fn": SIG_FN["matrix"],
+     "max_hours": 72, "grid": {"fast": [12, 20], "slow": [20], "trend": ["lt", "off"], "tdrev": [1], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
     {"sid": "cprofile_15m", "key": "cprofile15m", "name": "Mum profili (Zeiierman) (15 dk)", "tf": 15, "fn": SIG_FN["cprofile"],
      "max_hours": 24, "grid": {"bands": [7], "tp_r": [(1.0, 2.0), (1.5, 3.0)], "be": [0.0]}},
     {"sid": "cprofile_1h", "key": "cprofile1h", "name": "Mum profili (Zeiierman) (1 saat)", "tf": 60, "fn": SIG_FN["cprofile"],
@@ -459,14 +463,14 @@ def _slim(d):
     return d[[c for c in KEEP_COLS if c in d.columns]].copy()
 
 
-EXCHANGE_NAMES = {"mexc": "MEXC", "binance": "Binance"}
+EXCHANGE_NAMES = {"mexc": "MEXC", "binance": "Binance", "bybit": "Bybit"}
 
 
 def make_exchange(bot):
     """Arastirma verisinin cekilecegi borsa. binance = Binance USDT-M vadeli (binanceusdm)."""
     if RS_EXCHANGE == "binance":
         return bot.ccxt.binanceusdm({"enableRateLimit": True, "timeout": 20000})
-    return bot.create_exchange()
+    return bot.create_exchange(RS_EXCHANGE)
 
 
 def load_data_long4h(bot, ex, progress=None):

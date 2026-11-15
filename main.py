@@ -135,8 +135,11 @@ ACCOUNT_BALANCE = _env("ACCOUNT_BALANCE", 2000.0, float)  # hesap bakiyesi ($) -
 MAX_OPEN_TRADES = _env("MAX_OPEN_TRADES", 2, int)         # ayni anda en fazla kac islem
 SLOT_PCT = _env("SLOT_PCT", 0.0, float)                   # islem basina ayrilan bakiye %; 0 = 100 / MAX_OPEN_TRADES
 COMPOUND = _env("COMPOUND", True, bool)                   # kapanan islemlerin K/Z'si bakiyeye eklensin mi
-FEE_MAKER = _env("FEE_MAKER", 0.0, float)                 # limit emir komisyonu (MEXC standart %0)
-FEE_TAKER = _env("FEE_TAKER", 0.0002, float)              # market emir komisyonu (MEXC standart %0.02)
+DATA_EXCHANGE = _env("DATA_EXCHANGE", "bybit").lower()   # bybit | mexc  (coin listesi, mumlar, funding bu borsadan)
+EX_NAME = {"bybit": "Bybit", "mexc": "MEXC"}.get(DATA_EXCHANGE, DATA_EXCHANGE)
+_FEES = {"bybit": (0.0002, 0.00055), "mexc": (0.0, 0.0002)}.get(DATA_EXCHANGE, (0.0, 0.0002))
+FEE_MAKER = _env("FEE_MAKER", _FEES[0], float)            # limit emir komisyonu (Bybit %0.02, MEXC %0)
+FEE_TAKER = _env("FEE_TAKER", _FEES[1], float)            # market emir komisyonu (Bybit %0.055, MEXC %0.02)
 NOTIFY_ENTRY_FILLS = _env("NOTIFY_ENTRY_FILLS", True, bool)  # 2./3. kademe dolunca mesaj at
 
 # --- Grafik ---
@@ -378,13 +381,37 @@ def send_telegram_photo(png: bytes, caption: str):
 # ============================================================================
 # BORSA
 # ============================================================================
-def create_exchange():
-    ex = ccxt.mexc({
+def create_exchange(exchange_id=None):
+    eid = (exchange_id or DATA_EXCHANGE).lower()
+    cls = getattr(ccxt, eid)
+    ex = cls({
         "enableRateLimit": True,
         "timeout": 20000,
         "options": {"defaultType": "swap"},
     })
     return ex
+
+
+_EXTRA_EX = {}
+
+
+def exchange_for(ex, t):
+    """Islem hangi borsanin verisiyle acildiysa onunla takip edilir (Bybit'e geciste acik MEXC islemleri icin)."""
+    eid = t.get("exchange") or "mexc"
+    if eid == getattr(ex, "id", None):
+        return ex
+    if eid not in _EXTRA_EX:
+        try:
+            e2 = create_exchange(eid)
+            with_retry(e2.load_markets, desc=f"load_markets {eid}")
+            _EXTRA_EX[eid] = e2
+        except Exception as e:
+            log.warning("%s baglantisi kurulamadi, islem ana borsadan takip edilecek: %s", eid, e)
+            return ex
+    return _EXTRA_EX[eid]
+
+
+TRADFI_TYPES = {"stock", "commodity", "etf", "index", "forex", "fx", "metal", "metals", "equity", "tradfi"}
 
 
 def with_retry(fn, *args, desc="istek", **kwargs):
@@ -429,6 +456,7 @@ def get_top_symbols(ex, top_n=None):
         and m.get("base", "").upper() not in EXCLUDE_SYMBOLS
         and not m.get("base", "").upper().endswith("STOCK")     # hisse senedi kontratlari (SKHYSTOCK vb.)
         and m.get("base", "").upper() not in STOCK_BASES
+        and str((m.get("info") or {}).get("symbolType") or "").lower() not in TRADFI_TYPES   # Bybit hisse/emtia
     }
     tickers = with_retry(ex.fetch_tickers, desc="fetch_tickers") or {}
 
@@ -671,7 +699,7 @@ def render_chart(ex, symbol, df, sig):
 
     base = ex.markets.get(symbol, {}).get("base", symbol.split("/")[0]) if ex.markets else symbol
     dir_txt = "LONG" if sig["direction"] == "LONG" else "SHORT"
-    ax.set_title(f"{base}USDT · MEXC Futures · {sig.get('tf_label', TF_LABEL)} · {dir_txt}   |   ADX {sig['adx']:.1f}"
+    ax.set_title(f"{base}USDT · {EX_NAME} Futures · {sig.get('tf_label', TF_LABEL)} · {dir_txt}   |   ADX {sig['adx']:.1f}"
                  + (f"   |   {sig['strategy_name']}" if sig.get("strategy_name") else ""),
                  loc="left", fontsize=11, fontweight="bold", color="#333")
 
@@ -1534,10 +1562,12 @@ def fetch_funding_history(ex, symbol, since_ms=None, max_pages=40):
     """Gecmis fonlama odemeleri -> DataFrame(ts=odeme ani ms, fund). Yoksa None.
     MEXC: sayfa numarasiyla (en yeniden geriye); Binance: since ile ileri."""
     out = {}
-    if (getattr(ex, "id", "") or "").startswith("binance"):
+    eid = (getattr(ex, "id", "") or "")
+    if eid.startswith("binance") or eid == "bybit":
         since = since_ms or int((time.time() - 400 * 86400) * 1000)
+        lim = 200 if eid == "bybit" else 1000
         for _ in range(max_pages):
-            rows = with_retry(ex.fetch_funding_rate_history, symbol, since, 1000, desc=f"funding {symbol}")
+            rows = with_retry(ex.fetch_funding_rate_history, symbol, since, lim, desc=f"funding {symbol}")
             if not rows:
                 break
             new = 0
@@ -2300,10 +2330,29 @@ def register_trade(ex, symbol, sig, message_id):
         "message_id": message_id,
         "margin": sum(sig["margins"]) if sig.get("margins") else None,   # toplam butce teminati ($)
         "st_agree": sig.get("st_agree"),
+        "exchange": getattr(ex, "id", DATA_EXCHANGE),
     }
     with _trade_lock:
         TRADES["open"].append(trade)
         save_trades(remote=True)
+    _bybit_mirror("open", ex, trade)
+
+
+def _bybit_mirror(kind, ex, t, pos_cache=None):
+    """Bybit emir modulu aciksa kripto islemini borsada aynala (kagit takip etkilenmez)."""
+    if getattr(ex, "id", None) != "bybit" or t.get("exchange", "bybit") != "bybit":
+        return
+    try:
+        import exec_bybit
+        if not exec_bybit.API.get("api"):
+            return
+        sym_id = (ex.markets or {}).get(t["symbol"], {}).get("id") or t["symbol"].split("/")[0] + "USDT"
+        if kind == "open":
+            exec_bybit.crypto_open(sys.modules[__name__], t, sym_id)
+        else:
+            exec_bybit.crypto_sync(sys.modules[__name__], t, sym_id, pos_cache)
+    except Exception as e:
+        log.warning("Bybit aynalama hatasi (%s): %s", t.get("symbol"), e)
 
 
 def _ensure_state(t):
@@ -2498,11 +2547,19 @@ def monitor_trades(ex):
         return
     now_ms = int(time.time() * 1000)
     changed = remote = False
+    pos_cache = None
+    try:
+        import exec_bybit
+        if exec_bybit.API.get("api") and exec_bybit.S.get("crypto"):
+            pos_cache = exec_bybit.API["api"].positions()
+    except Exception:
+        pos_cache = None
     for t in list(TRADES["open"]):
         try:
-            events = check_trade(ex, t)
+            events = check_trade(exchange_for(ex, t), t)
             changed = True
             s = t["state"]
+            _bybit_mirror("sync", ex, t, pos_cache)
             for kind, val, text in events:
                 if kind == "FILL":
                     remote = True
@@ -2784,6 +2841,12 @@ def main():
                      flip_live.FLIP_ST_PERIOD, flip_live.FLIP_ST_MULT)
     except ImportError:
         log.warning("flip_live.py bulunamadi; kagit takip devre disi")
+    try:                                          # Bybit hisse kontratlarinda otomatik emir (EXEC_ENABLED, varsayilan demo)
+        import exec_bybit
+        if exec_bybit.start(sys.modules[__name__]):
+            log.info("Bybit emir modulu basladi (%s)", exec_bybit.MODE_TXT)
+    except ImportError:
+        pass
     try:                                          # BIST: test (RUN_BIST_RESEARCH) ve kagit takip (BIST_LIVE)
         import bist
         if bist.start(sys.modules[__name__]):
@@ -2815,7 +2878,7 @@ def main():
     if SEND_STARTUP_MESSAGE:
         extra =f", {len(TRADES['open'])} açık işlem takipte" if TRACK_TRADES and TRADES["open"] else ""
         strat = " + ".join(strategy_label(sid) for sid in ACTIVE_STRATEGIES)
-        send_telegram(f"🤖 Sinyal botu başlatıldı · {strat} · MEXC Futures{extra}.")
+        send_telegram(f"🤖 Sinyal botu başlatıldı · {strat} · {EX_NAME} Futures{extra}.")
 
     next_scan = datetime.now(timezone.utc) if RUN_SCAN_ON_START else next_scan_time()
     log.info("Ilk tarama: %s", next_scan.astimezone(DISPLAY_TZ).strftime("%H:%M:%S"))
@@ -2866,7 +2929,7 @@ def main():
                 log.warning("Borsa baglantisi sifirlaniyor")
                 ex, markets_loaded_at = None, 0.0
             if consecutive_failures == 5:
-                send_telegram("⚠️ Bot 5 kez üst üste tarama yapamadı. Logları kontrol et (MEXC erişimi / ağ).")
+                send_telegram(f"⚠️ Bot 5 kez üst üste tarama yapamadı. Logları kontrol et ({EX_NAME} erişimi / ağ).")
             if datetime.now(timezone.utc) >= next_scan:
                 next_scan = next_scan_time()      # basarisiz taramayi sonsuza dek tekrarlama
             time.sleep(min(60 * consecutive_failures, 300))
