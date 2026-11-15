@@ -2881,7 +2881,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sinyal Botu · Dashboard</title>
+<title>Bot Paneli</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root{
@@ -2950,7 +2950,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   <header>
     <div>
       <h1>Bot Paneli</h1>
-      <div class="sub" id="cfg">—</div>
+      <div class="sub" id="cfg" style="display:none"></div>
     </div>
     <span class="pill"><span class="dot" id="statusDot"></span><span id="statusTxt">Bağlanıyor…</span></span>
   </header>
@@ -2966,7 +2966,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   <div class="pane" data-pane="lighter">
   <div class="card offnote" id="flipOff">Lighter kâğıt takip kapalı ya da henüz veri yok (Render'da FLIP_LIVE=true).</div>
   <div class="card" id="flipCard" style="margin-bottom:16px;display:none">
-    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔁 Lighter kâğıt takip <small id="flipSub"></small></h2>
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔁 Lighter kâğıt takip <small id="flipSub" style="display:none"></small></h2>
     <div class="kpis" id="flipKpis" style="margin-bottom:12px"></div>
     <div class="grid2" style="margin-bottom:12px;grid-template-columns:3fr 2fr">
       <div><div class="chartbox"><canvas id="flipChart" aria-label="Kâğıt takip bakiye eğrisi"></canvas></div></div>
@@ -2980,7 +2980,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   <div class="pane" data-pane="bist">
   <div class="card offnote" id="bistOff">BIST kâğıt takip kapalı ya da henüz başlamadı (Render'da BIST_LIVE=true). Test sonuçları Telegram'a gelir.</div>
   <div class="card" id="bistCard" style="margin-bottom:16px;display:none">
-    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🇹🇷 BIST kâğıt takip <small id="bistSub"></small></h2>
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🇹🇷 BIST kâğıt takip <small id="bistSub" style="display:none"></small></h2>
     <div class="kpis" id="bistKpis" style="margin-bottom:12px"></div>
     <div class="tablewrap" style="margin-bottom:12px"><table id="bistPos"></table></div>
     <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="bistTbl"></table></div>
@@ -2999,7 +2999,6 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <label><input type="checkbox" id="fees" checked> Komisyon (~%0,06)</label>
   </div>
 
-  <h2 style="font-size:15px;margin:6px 0 10px;font-weight:620">📈 Uzun işlem · sinyal botu (MEXC stratejileri: kırılım, mum profili, SuperTrend 1s)</h2>
   <div class="kpis" id="kpis"></div>
 
   <div class="grid2">
@@ -3019,12 +3018,12 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-bottom:16px">
-    <h2>Sinyal botu (MEXC stratejileri) · açık işlemler <small id="openCount"></small></h2>
+    <h2>Açık işlemler <small id="openCount"></small></h2>
     <div class="tablewrap"><table id="openTbl"></table></div>
   </div>
 
   <div class="card">
-    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Sinyal botu · kapanan işlemler <small id="closedCount"></small>
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Kapanan işlemler <small id="closedCount"></small>
       <span class="spacer"></span>
       <span class="seg" id="ofilter"><button data-o="ALL" class="on">Tümü</button><button data-o="TP">Kârlı</button><button data-o="SL">Stop</button><button data-o="EXPIRED">Süre doldu</button></span>
     </h2>
@@ -3332,7 +3331,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       }
       const tp = B.equity - B.capital;
       $("bistKpis").innerHTML = tile("Toplam bakiye (canlı)", tl(B.equity), `${tls(tp)} (${(tp/B.capital*100).toFixed(2)}%)`, cls(tp)) + k +
-        tile("Dolu yer", `${B.open} / ${B.slots}`, `her işlem ${tl(B.trade_tl)}`);
+        tile("Dolu yer", `${B.open} / ${B.slots}`, `sıradaki işlem ${tl(B.trade_tl)}` + (B.compound ? " · kâr eklendikçe büyür" : ""));
       const px = v => v == null ? "—" : Number(v).toLocaleString("tr-TR",{minimumFractionDigits:2, maximumFractionDigits:2});
       $("bistPos").innerHTML = `<thead><tr><th>Defter</th><th>Hisse</th><th class="r">Lot</th><th class="r">Giriş</th><th class="r">Son</th><th class="r">Hedef</th><th class="r">Stop</th><th class="r">K/Z</th></tr></thead><tbody>` +
         (pos.length ? pos.map(x => x.pend ? `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td colspan="6">⏳ ${x.pend==="B"?"AL":"SAT"} emri sonraki açılışta</td></tr>` :

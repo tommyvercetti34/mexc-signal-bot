@@ -9,7 +9,8 @@ BIST botu: gun sonu (gunluk mum) + gun ici (1 saatlik mum) kagit takip ve walk-f
 - Sinyal mum kapanisinda, islem BIR SONRAKI mumun acilisinda (gun sonu: ertesi gun acilis).
 - Gun ici defter (15/30/60 dk): cikis = hedef (tp x ATR) / stop (sl x ATR) / ters sinyal / en fazla `maxd` islem gunu.
   Hedef gelmediyse pozisyon ertesi gune sarkar (maxd=1: ayni gun kapanista kapanir).
-- Sermaye: islem basina sabit BIST_TRADE_TL (20.000 TL), iki defter toplam en fazla BIST_SLOTS (5) hisse.
+- Sermaye: islem basina (bakiye / BIST_SLOTS); kar geldikce islem tutari buyur (BIST_COMPOUND=true).
+  Iki defter toplam en fazla BIST_SLOTS (5) hisse. BIST_COMPOUND=false: sabit BIST_TRADE_TL.
 - Komisyon BIST_FEE (varsayilan onbinde 1) + kayma BIST_SLIP (binde 0,5), alis ve satista ayri ayri.
 - Veri: Yahoo Finance (THYAO.IS ...), ~15 dk gecikmeli.
 - T+2 takas yok sayilir: satistan gelen para ayni gun yeni alimda kullanilir (toplam bakiye BIST_CAPITAL).
@@ -55,7 +56,8 @@ DEFAULT_SYMBOLS = ("AKBNK,ALARK,ASELS,ASTOR,BIMAS,CCOLA,EKGYO,ENKAI,EREGL,FROTO,
 BIST_SYMBOLS = [s.strip().upper() for s in _env("BIST_SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 BIST_BENCH = _env("BIST_BENCH", "XU100")
 BIST_CAPITAL = _env("BIST_CAPITAL", 100000.0, float)        # toplam sermaye (TL)
-BIST_TRADE_TL = _env("BIST_TRADE_TL", 20000.0, float)       # islem basina sabit tutar (TL)
+BIST_TRADE_TL = _env("BIST_TRADE_TL", 20000.0, float)       # BIST_COMPOUND=false iken islem basina sabit tutar
+BIST_COMPOUND = _env("BIST_COMPOUND", True, bool)           # true: islem tutari = (baslangic + gerceklesen kar) / yer
 BIST_SLOTS = _env("BIST_SLOTS", 5, int)                      # ayni anda en fazla hisse (iki defter ORTAK)
 BIST_FEE = _env("BIST_FEE", 0.0001, float)                   # spot komisyon (oran, tek yon): onbinde 1
 BIST_SLIP = _env("BIST_SLIP", 0.0005, float)                 # kayma (oran, tek yon)
@@ -402,9 +404,11 @@ def stats(trades):
             "low": float(np.mean([_net_dir(t[6], t[7], len(t) > 9 and t[9], fee=BIST_FEE_LOW) for t in trades])) * 100}
 
 
-def portfolio(trades, t_from=None, t_to=None, slots=None, notional=None, capital=None):
-    """Sabit tutarli portfoy: her islem `notional` TL, ayni anda en fazla `slots` hisse; dolu ise sinyal atlanir."""
+def portfolio(trades, t_from=None, t_to=None, slots=None, notional=None, capital=None, compound=None):
+    """Portfoy: ayni anda en fazla `slots` hisse; dolu ise sinyal atlanir. compound: islem tutari =
+    (baslangic + o ana kadar gerceklesen kar) / slots; degilse sabit `notional`."""
     slots, notional, capital = slots or BIST_SLOTS, notional or BIST_TRADE_TL, capital or BIST_CAPITAL
+    compound = BIST_COMPOUND if compound is None else compound
     tr = sorted(trades, key=lambda t: t[0])
     pnl, open_, curve, taken, skipped = 0.0, [], [], 0, 0
     peak, mdd = capital, 0.0
@@ -413,8 +417,8 @@ def portfolio(trades, t_from=None, t_to=None, slots=None, notional=None, capital
         nonlocal pnl, peak, mdd
         open_.sort(key=lambda x: x[0])
         while open_ and (upto is None or open_[0][0] <= upto):
-            ex_ts, ret = open_.pop(0)
-            pnl += notional * ret
+            ex_ts, ret, size = open_.pop(0)
+            pnl += size * ret
             eq = capital + pnl
             peak = max(peak, eq)
             mdd = max(mdd, 1 - eq / peak)
@@ -425,13 +429,17 @@ def portfolio(trades, t_from=None, t_to=None, slots=None, notional=None, capital
         if len(open_) >= slots:
             skipped += 1
             continue
-        open_.append((t[1], t[2]))
+        open_.append((t[1], t[2], (capital + pnl) / slots if compound else notional))
         taken += 1
     realize(None)
     years = max((t_to - t_from).days / 365.25, 1 / 365.25) if t_from is not None and t_to is not None else None
     final = capital + pnl
+    if years and compound:
+        yearly = ((final / capital) ** (1 / years) - 1) * 100 if final > 0 else -100.0
+    else:
+        yearly = (pnl / capital * 100 / years) if years else None
     return {"final": final, "ret": pnl / capital * 100, "mdd": mdd * 100, "taken": taken, "skipped": skipped,
-            "years": years, "yearly": (pnl / capital * 100 / years) if years else None, "curve": curve}
+            "years": years, "yearly": yearly, "curve": curve}
 
 
 def buy_hold(df, t_from, t_to):
@@ -562,8 +570,9 @@ def _exit_txt(p):
 
 def format_report(res):
     parts = [f"🇹🇷 BIST strateji testi bitti ({res.get('_secs', 0) / 60:.0f} dk)\n"
-             f"Sadece alış · işlem başı {_tl(BIST_TRADE_TL)}, aynı anda en fazla {BIST_SLOTS} hisse "
-             f"({_tl(BIST_CAPITAL)}) · komisyon %{BIST_FEE * 100:.2f} + kayma %{BIST_SLIP * 100:.2f} (her yön) · "
+             f"Başlangıç {_tl(BIST_CAPITAL)} · aynı anda en fazla {BIST_SLOTS} hisse · işlem başı "
+             + (f"bakiye/{BIST_SLOTS} (kâr eklendikçe büyür)" if BIST_COMPOUND else _tl(BIST_TRADE_TL)) + " · "
+             f"komisyon %{BIST_FEE * 100:.2f} + kayma %{BIST_SLIP * 100:.2f} (her yön) · "
              f"işlem sinyalden sonraki mumun açılışında.\n"
              f"Ayar ilk %{BIST_TRAIN_FRAC * 100:.0f}'lik dönemde seçildi, SON dönemde (hiç görmediği veri) sınandı.\n"
              f"'brüt' = komisyonsuz ve kaymasız, 'düşük kom.' = %{BIST_FEE_LOW * 100:.2f} komisyon + kayma ile işlem başı ortalama."]
@@ -687,6 +696,13 @@ def _new_state():
             "gi_marker": None, "gs_day": None, "started": time.time()}
 
 
+def _trade_size():
+    """Yeni islemin tutari: bilesikte (baslangic + gerceklesen kar) / yer sayisi."""
+    if not BIST_COMPOUND:
+        return BIST_TRADE_TL
+    return max(0.0, (BIST_CAPITAL + sum(b["realized"] for b in S["books"].values())) / BIST_SLOTS)
+
+
 def _n_open():
     return sum(len(b["pos"]) for b in S["books"].values())
 
@@ -724,7 +740,7 @@ def _apply(key, sym, st, evs, t, msgs):
     for kind, px, reason in evs:
         if kind == "B":
             unit = px * (1 + BIST_SLIP) * (1 + BIST_FEE)
-            qty = int(BIST_TRADE_TL // unit)
+            qty = int(_trade_size() // unit)
             if _n_open() >= BIST_SLOTS or qty <= 0:
                 st["pos"] = None
                 msgs.append(f"🇹🇷 BIST {BOOK_NAMES[key]} · ⏭ {sym} AL sinyali atlandı (aynı anda {BIST_SLOTS} hisse dolu)")
@@ -935,7 +951,7 @@ def summary_text(short=False):
         return "BIST kâğıt takip başlamadı."
     eq = _equity_live()
     lines = [f"🇹🇷 BIST kâğıt takip · {_tl(eq)} ({(eq / BIST_CAPITAL - 1) * 100:+.2f}%) · "
-             f"{_n_open()}/{BIST_SLOTS} hisse açık · işlem başı {_tl(BIST_TRADE_TL)}"]
+             f"{_n_open()}/{BIST_SLOTS} hisse açık · sıradaki işlem {_tl(_trade_size())}"]
     if not short:
         lines.append(f"Gün sonu: {BIST_DAILY if DAILY_ON else 'kapalı'}\n"
                      f"Gün içi: {(BIST_INTRA_TF + ' · ' + BIST_INTRA) if INTRA_ON else 'kapalı'}")
@@ -964,7 +980,7 @@ def api_data():
         out = {"enabled": True, "daily": BIST_DAILY if DAILY_ON else "kapalı",
                "intra": f"{BIST_INTRA_TF} · {BIST_INTRA}" if INTRA_ON else "kapalı",
                "capital": BIST_CAPITAL, "equity": _equity_live(), "slots": BIST_SLOTS, "open": _n_open(),
-               "trade_tl": BIST_TRADE_TL, "books": {}}
+               "trade_tl": _trade_size(), "compound": BIST_COMPOUND, "books": {}}
         for key in ("gs", "gi"):
             b = S["books"][key]
             out["books"][key] = {
@@ -980,7 +996,8 @@ def run(bot):
     _load(bot)
     bot.log.info("BIST kagit takip basladi: gun sonu %s | gun ici %s %s | %d hisse", BIST_DAILY, BIST_INTRA_TF,
                  BIST_INTRA, len(BIST_SYMBOLS))
-    bot.send_telegram(f"🇹🇷 BIST kâğıt takip başladı · {_tl(BIST_CAPITAL)} · işlem başı {_tl(BIST_TRADE_TL)}, "
+    bot.send_telegram(f"🇹🇷 BIST kâğıt takip başladı · {_tl(BIST_CAPITAL)} · işlem başı "
+                      + (f"bakiye/{BIST_SLOTS} (kâr eklendikçe büyür)" if BIST_COMPOUND else _tl(BIST_TRADE_TL)) + ", "
                       f"aynı anda en fazla {BIST_SLOTS} hisse · {len(BIST_SYMBOLS)} hisse izleniyor · /bist ile durum")
     while True:
         try:
