@@ -809,6 +809,13 @@ def refresh_snapshot(api):
         S["day_dirty"] = True
     de["im"] = max(de.get("im", 0.0), im_now)
     S["day_eq"] = de
+    hist = S.setdefault("eq_hist", [])                    # sermaye egrisi: 15 dk'da bir nokta (Gist'e saatte bir yazilir)
+    now_s = time.time()
+    if not hist or now_s - hist[-1][0] >= 900:
+        hist.append([int(now_s), round(eq, 2)])
+        del hist[:-4000]
+        if len(hist) % 4 == 1:
+            S["day_dirty"] = True
     if im_now > S.get("max_im", 0.0):                    # toplam K/Z % icin: bugune kadar girilen en yuksek teminat
         S["max_im"] = im_now
         S["day_dirty"] = True
@@ -819,7 +826,8 @@ def refresh_snapshot(api):
                  "tf": EXEC_TF, "data": EXEC_DATA, "margin": eq / EXEC_SLOTS, "positions": rows,
                  "pend": S.get("pend") or {}, "log": S.get("log", [])[-80:], "next_scan": nxt,
                  "start_eq": S.setdefault("start_eq", eq), "day_start_eq": de["eq"], "day_pnl": eq - de["eq"],
-                 "day_im": de["im"], "im_now": im_now, "max_im": S.get("max_im", 0.0)})
+                 "day_im": de["im"], "im_now": im_now, "max_im": S.get("max_im", 0.0),
+                 "eq_hist": hist + [[int(now_s), round(eq, 2)]]})
 
 
 def api_data():

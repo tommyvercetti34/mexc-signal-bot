@@ -3092,6 +3092,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="tablewrap" style="margin-bottom:12px"><table id="bybitPos"></table></div>
     <h2 style="font-size:14px;margin:4px 0 8px">Son olaylar</h2>
     <div class="tablewrap" style="max-height:360px;overflow-y:auto"><table id="bybitLog"></table></div>
+    <h2 style="font-size:14px;margin:16px 0 8px">Sermaye eğrisi <small id="bybitEqNote"></small></h2>
+    <div class="chartbox"><canvas id="bybitEqChart" aria-label="Bybit sermaye eğrisi"></canvas></div>
   </div>
   </div>
 
@@ -3492,7 +3494,28 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       $("bybitLog").innerHTML = `<thead><tr><th style="width:120px">Zaman</th><th>Olay</th></tr></thead><tbody>` +
         (L.length ? L.map(x => `<tr><td>${fmtTime(x.t*1000)}</td><td style="white-space:pre-wrap">${String(x.m).replace(/[<>&]/g, c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</td></tr>`).join("")
           : `<tr><td class="empty" colspan="2">Henüz olay yok</td></tr>`) + "</tbody>";
+      drawBybitEq(Y, usd);
     }catch(e){ /* opsiyonel */ }
+  }
+
+  let bybitEqChart = null;
+  function drawBybitEq(Y, usd){
+    const H = (Y.eq_hist || []).map(([t, v]) => ({x: t * 1000, y: v}));
+    const st = Y.start_eq || (H[0] && H[0].y) || 0;
+    $("bybitEqNote").textContent = st ? `(başlangıç ${usd(st)})` : "";
+    if (!window.Chart || !H.length) return;
+    if (H[0].y !== st) H.unshift({x: H[0].x, y: st});
+    const line = css("--accent"), grid = css("--line"), ink2 = css("--ink2");
+    const cfg = {type:"line",
+      data:{datasets:[{data:H, borderColor:line, backgroundColor:line, borderWidth:2, pointRadius:0, pointHoverRadius:5, fill:false, tension:0}]},
+      options:{responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
+        interaction:{mode:"index", intersect:false},
+        scales:{x:{type:"linear", grid:{display:false}, ticks:{color:ink2, maxTicksLimit:6, callback:v=>fmtTime(v)}},
+                y:{grid:{color:grid}, ticks:{color:ink2, callback:v=>"$"+Number(v).toLocaleString("tr-TR")}}},
+        plugins:{legend:{display:false}, tooltip:{callbacks:{title:i=>fmtTime(i[0].raw.x),
+          label:i=>{const v=i.raw.y, d=v-st; return [`Hesap: ${usd(v)}`, `Başlangıçtan: ${(d>=0?"+":"")}${usd(d)}`];}}}}}};
+    if (bybitEqChart) { bybitEqChart.data.datasets[0].data = H; bybitEqChart.update("none"); return; }
+    bybitEqChart = new Chart($("bybitEqChart"), cfg);
   }
 
   // ---- Sekmeler (secim adres cubugunda #uzun / #bybit / #bist olarak saklanir)
