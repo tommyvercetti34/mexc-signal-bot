@@ -611,9 +611,12 @@ def run(bot):
                           f"kademeli giriş · emir: "
                           f"{'sinyalden hemen sonra' if EXEC_FILL == 'hemen' else 'ABD açılışında'} · "
                           f"strateji {EXEC_SPEC} · /bybit")
-    except Exception as e:
+    except BybitError as e:
         bot.send_telegram(f"⚠️ Bybit {MODE_TXT} bağlantısı kurulamadı: {e}\n"
                           f"Anahtarın demo modunda oluşturulduğundan ve 'Contract - Trade' yetkisi olduğundan emin ol.")
+    except Exception as e:
+        bot.send_telegram(f"⚠️ Bybit modülü başlarken hata: {e}\n"
+                          f"(GitHub'daki bist.py en son sürüm mü? ABD hisse listesi ve veri fonksiyonu oradan geliyor.)")
     while True:
         try:
             with _lock:
@@ -629,6 +632,9 @@ def run(bot):
 
 def start(bot):
     if not EXEC_ENABLED:
+        return False
+    if not hasattr(bist, "US_SYMBOLS") or not hasattr(bist, "Bars"):
+        bot.send_telegram("⚠️ Bybit modülü başlamadı: GitHub'daki bist.py eski sürüm. En son gönderilen bist.py'yi yükle.")
         return False
     if EXEC_MODE == "real" and not EXEC_CONFIRM_REAL:
         bot.send_telegram("⚠️ EXEC_MODE=real ama EXEC_CONFIRM_REAL=evet yok: güvenlik için demo hesapla çalışılıyor.")

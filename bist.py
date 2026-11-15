@@ -16,6 +16,7 @@ BIST botu: gun sonu (gunluk mum) + gun ici (1 saatlik mum) kagit takip ve walk-f
 - T+2 takas yok sayilir: satistan gelen para ayni gun yeni alimda kullanilir (toplam bakiye BIST_CAPITAL).
 
 Test : Render'da RUN_BIST_RESEARCH=true   (sonuc Telegram'a gelir)
+ABD  : Render'da RUN_US_RESEARCH=true     (en buyuk 100 ABD hissesi, ayni motor)
 Canli: Render'da BIST_LIVE=true            (kagit takip, Telegram'da /bist)
 """
 
@@ -61,6 +62,25 @@ DEFAULT_SYMBOLS = ("AEFES,AGROT,AHGAZ,AKBNK,AKCNS,AKSA,AKSEN,ALARK,ALFAS,ALTNY,A
                    "TUPRS,TURSG,ULKER,VAKBN,VESBE,VESTL,YEOTK,YKBNK,ZOREN")
 BIST_SYMBOLS = [s.strip().upper() for s in _env("BIST_SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 BIST_BENCH = _env("BIST_BENCH", "XU100")
+
+# ---- ABD hisseleri testi (RUN_US_RESEARCH=true). Ayarlar is parcacigina ozel: BIST canli takibini etkilemez ----
+RUN_US_RESEARCH = _env("RUN_US_RESEARCH", False, bool)
+US_DEFAULT = ("AAPL,MSFT,NVDA,AMZN,GOOGL,META,AVGO,TSLA,BRK-B,JPM,LLY,V,UNH,XOM,MA,COST,HD,PG,JNJ,WMT,NFLX,ABBV,BAC,"
+              "CRM,ORCL,CVX,KO,MRK,AMD,PEP,TMO,ADBE,LIN,ACN,CSCO,MCD,ABT,WFC,DIS,INTU,IBM,GE,TXN,QCOM,AMGN,CAT,VZ,PM,"
+              "NOW,ISRG,DHR,SPGI,GS,AXP,NEE,PFE,RTX,UNP,LOW,CMCSA,T,BKNG,HON,UBER,AMAT,BLK,PGR,SYK,COP,ELV,TJX,LMT,"
+              "SCHW,BSX,ETN,C,MS,VRTX,PLD,ADP,MDT,CB,PANW,REGN,MU,ADI,SBUX,GILD,BMY,DE,LRCX,KLAC,MMC,SO,CI,ANET,NKE,"
+              "UPS,INTC,PLTR")
+US_SYMBOLS = [s.strip().upper() for s in _env("US_SYMBOLS", US_DEFAULT).split(",") if s.strip()]
+US_CFG = {"market": "us", "symbols": US_SYMBOLS, "bench": _env("US_BENCH", "SPY"), "suffix": "",
+          "fee": _env("US_FEE", 0.0, float), "slip": _env("US_SLIP", 0.0003, float),
+          "sfee": _env("US_SHORT_FEE", 0.0, float), "title": "🇺🇸 ABD hisse", "short_label": "açığa satış",
+          "ccy": "$"}
+_TL = threading.local()                         # is parcacigina ozel pazar ayari (bos = BIST)
+
+
+def _c(key, default):
+    cfg = getattr(_TL, "cfg", None)
+    return cfg.get(key, default) if cfg else default
 BIST_CAPITAL = _env("BIST_CAPITAL", 100000.0, float)        # toplam sermaye (TL)
 BIST_TRADE_TL = _env("BIST_TRADE_TL", 20000.0, float)       # BIST_COMPOUND=false iken islem basina sabit tutar
 BIST_COMPOUND = _env("BIST_COMPOUND", True, bool)           # true: islem tutari = (baslangic + gerceklesen kar) / yer
@@ -90,9 +110,10 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 # ============================================================================
 
 
-def fetch(sym, interval="1d", rng="10y", retries=3):
+def fetch(sym, interval="1d", rng="10y", retries=3, suffix=None):
     """Yahoo Finance'ten BIST mumlari. sym: 'THYAO' ya da 'XU100'. Index Istanbul saati (mum ACILIS zamani)."""
-    ticker = sym if "." in sym or sym.startswith("^") else f"{sym}.IS"
+    suffix = _c("suffix", ".IS") if suffix is None else suffix
+    ticker = sym if "." in sym or sym.startswith("^") or not suffix else f"{sym}{suffix}"
     last_err = None
     for k in range(retries):
         for host in ("query1", "query2"):
@@ -284,8 +305,8 @@ def sig_params(p):
 
 
 def _net(entry, exit_, fee=None, slip=None):
-    fee = BIST_FEE if fee is None else fee
-    slip = BIST_SLIP if slip is None else slip
+    fee = _c("fee", BIST_FEE) if fee is None else fee
+    slip = _c("slip", BIST_SLIP) if slip is None else slip
     return exit_ * (1 - slip) * (1 - fee) / (entry * (1 + slip) * (1 + fee)) - 1
 
 
@@ -293,8 +314,9 @@ def _net_dir(entry, exit_, short=False, fee=None):
     """Long: spot komisyonu. Short (VIOP, kaldiracsiz: teminat = pozisyon degeri): VIOP komisyonu."""
     if not short:
         return _net(entry, exit_, fee=fee)
-    fee = BIST_VIOP_FEE if fee is None else fee
-    return (entry * (1 - BIST_SLIP) * (1 - fee) - exit_ * (1 + BIST_SLIP) * (1 + fee)) / entry
+    fee = _c("sfee", BIST_VIOP_FEE) if fee is None else fee
+    slip = _c("slip", BIST_SLIP)
+    return (entry * (1 - slip) * (1 - fee) - exit_ * (1 + slip) * (1 + fee)) / entry
 
 
 def _gross(t):
@@ -501,13 +523,13 @@ def research(progress=None):
     results = {}
     for tf in RESEARCH_TFS:
         dd = {}
-        for i, s in enumerate(BIST_SYMBOLS):
+        for i, s in enumerate(_c("symbols", BIST_SYMBOLS)):
             d = fetch(s, tf, TF_RANGE[tf], retries=2)
             if d is not None and len(d) > WARMUP + 100:
                 dd[s] = d
             time.sleep(0.3)
         say(f"BIST {tf}: {len(dd)} hisse verisi")
-        bench = fetch(BIST_BENCH, tf, TF_RANGE[tf])
+        bench = fetch(_c("bench", BIST_BENCH), tf, TF_RANGE[tf], suffix=_c("suffix", ".IS"))
         if len(dd) < 5:
             results[tf] = {"error": f"veri yok ({len(dd)} hisse)"}
             continue
@@ -581,10 +603,12 @@ def _exit_txt(p):
 
 
 def format_report(res):
-    parts = [f"🇹🇷 BIST strateji testi bitti ({res.get('_secs', 0) / 60:.0f} dk)\n"
-             f"Başlangıç {_tl(BIST_CAPITAL)} · aynı anda en fazla {BIST_SLOTS} hisse · işlem başı "
+    ccy = _c("ccy", "TL")
+    money = (lambda x: "$" + f"{x:,.0f}") if ccy == "$" else _tl
+    parts = [f"{_c('title', '🇹🇷 BIST')} strateji testi bitti ({res.get('_secs', 0) / 60:.0f} dk)\n"
+             f"Başlangıç {money(BIST_CAPITAL)} · aynı anda en fazla {BIST_SLOTS} hisse · işlem başı "
              + (f"bakiye/{BIST_SLOTS} (kâr eklendikçe büyür)" if BIST_COMPOUND else _tl(BIST_TRADE_TL)) + " · "
-             f"komisyon %{BIST_FEE * 100:.2f} + kayma %{BIST_SLIP * 100:.2f} (her yön) · "
+             f"komisyon %{_c('fee', BIST_FEE) * 100:.2f} + kayma %{_c('slip', BIST_SLIP) * 100:.2f} (her yön) · "
              f"işlem sinyalden sonraki mumun açılışında.\n"
              f"Ayar ilk %{BIST_TRAIN_FRAC * 100:.0f}'lik dönemde seçildi, SON dönemde (hiç görmediği veri) sınandı.\n"
              f"'brüt' = komisyonsuz ve kaymasız, 'düşük kom.' = %{BIST_FEE_LOW * 100:.2f} komisyon + kayma ile işlem başı ortalama."]
@@ -599,7 +623,7 @@ def format_report(res):
         lines = [f"\n━━ {TF_NAMES[tf]} ━━",
                  f"{r['n_sym']} hisse · veri {r['t0']:{fmt}} → {r['t1']:{fmt}} · doğrulama {r['split']:{fmt}} sonrası "
                  f"({days} gün)",
-                 f"Aynı dönemde al-tut: {BIST_BENCH} {_f(r['bench_test'])}% · hisselerin ortalaması {_f(r['ew_test'])}%"]
+                 f"Aynı dönemde al-tut: {_c('bench', BIST_BENCH)} {_f(r['bench_test'])}% · hisselerin ortalaması {_f(r['ew_test'])}%"]
         if tf in ("30m", "15m"):
             lines.append("⚠️ Ücretsiz veri bu zaman diliminde sadece son 60 günü veriyor: sonuç kısa döneme dayanıyor, "
                          "temkinli oku.")
@@ -609,7 +633,8 @@ def format_report(res):
         rows = longs + [("_ind", r["ind"])] + ([("_hdr", None)] if shorts else []) + shorts
         for fam, x in rows:
             if fam == "_hdr":
-                lines.append(f"\n🔻 SHORT tarafı (VİOP, kaldıraçsız; komisyon %{BIST_VIOP_FEE * 100:.2f} + kayma, "
+                lines.append(f"\n🔻 SHORT tarafı ({_c('short_label', 'VİOP')}, kaldıraçsız; "
+                             f"komisyon %{_c('sfee', BIST_VIOP_FEE) * 100:.2f} + kayma, "
                              f"SAT sinyalinde short aç, AL sinyali/hedef/stop/gün sınırında kapat):")
                 continue
             te, pt = x["test"], x["pf_test"]
@@ -627,7 +652,7 @@ def format_report(res):
                          f"   DOĞRULAMA: {te['n']} işlem · kazanan %{te['win']:.0f} · ort {_f(te['avg'], 2)}% "
                          f"(brüt {_f(te['gross'], 2)}%, düşük kom. {_f(te['low'], 2)}%) · t {te['t']:.1f} · "
                          f"PF {_f(te['pf'], 2, False)} · ort {te['bars']:.0f} mum\n"
-                         f"   {_tl(BIST_CAPITAL)} → {_tl(pt['final'])} (dönemde {_f(pt['ret'])}%{yr}) · "
+                         f"   {money(BIST_CAPITAL)} → {money(pt['final'])} (dönemde {_f(pt['ret'])}%{yr}) · "
                          f"en büyük düşüş %{pt['mdd']:.1f}" + (f" · {pt['skipped']} sinyal yer yok diye atlandı"
                                                              if pt["skipped"] else ""))
             if ok and fam != "_ind":
@@ -637,14 +662,20 @@ def format_report(res):
                     winners[key] = cand
         c = r.get("combo")
         if c:
-            lines.append(f"\n🔀 En iyi long + en iyi short BİRLİKTE (ortak {BIST_SLOTS} yer): {_tl(BIST_CAPITAL)} → "
-                         f"{_tl(c['final'])} (dönemde {_f(c['ret'])}%) · en büyük düşüş %{c['mdd']:.1f}")
+            lines.append(f"\n🔀 En iyi long + en iyi short BİRLİKTE (ortak {BIST_SLOTS} yer): {money(BIST_CAPITAL)} → "
+                         f"{money(c['final'])} (dönemde {_f(c['ret'])}%) · en büyük düşüş %{c['mdd']:.1f}")
         parts.append("\n".join(lines))
     tail = ["\n━━ SONUÇ ━━",
             f"✅ = doğrulamada anlamlı kâr (t ≥ {BIST_MIN_T:g}) VE al-tut'u geçti · 🟡 = kâr anlamlı ama al-tut'u geçemedi "
             f"ya da umut verici · ❌ = geçmedi",
-            "Not: TL bazlı. Enflasyon yüzünden hisseler zaten yükseliyor; asıl ölçü al-tut'u geçmek."]
-    if winners:
+            ("Not: dolar bazlı. Test bugünkü en büyük 100 ABD hissesiyle yapıldı: geçmişte bunların kazanan olacağı belli "
+             "değildi, sonuçlar (al-tut dahil) olduğundan iyi görünür." if _c("market", "tr") == "us" else
+             "Not: TL bazlı. Enflasyon yüzünden hisseler zaten yükseliyor; asıl ölçü al-tut'u geçmek.")]
+    if winners and _c("market", "tr") == "us":
+        tail.append("✅ Geçen strateji var: Tradier / TradeStation kâğıt hesabına bağlanıp gerçek kurumda sanal parayla "
+                    "denenebilir. Geçenler: " + " | ".join(f"{'SHORT ' if k.startswith('short_') else ''}{v[2]}: {v[1]}"
+                                                         for k, v in winners.items()))
+    elif winners:
         env = []
         if "1d" in winners:
             env.append(f"BIST_DAILY={winners['1d'][1]}")
@@ -675,6 +706,25 @@ def run_and_report(bot):
     except Exception as e:
         log.exception("BIST arastirma hatasi: %s", e)
         bot.send_telegram(f"⚠️ BIST testi çalıştırılamadı: {e}")
+
+
+def run_us_and_report(bot):
+    """ABD hisseleri testi: ayni motor, ABD ayarlari (sadece bu is parcaciginda gecerli)."""
+    _TL.cfg = US_CFG
+    try:
+        bot.send_telegram(f"🇺🇸 ABD hisse strateji testi başladı: {len(US_SYMBOLS)} hisse · {', '.join(RESEARCH_TFS)} · "
+                          f"long + short · komisyon %{US_CFG['fee'] * 100:.2f}, kayma %{US_CFG['slip'] * 100:.2f}. "
+                          f"30-120 dk sürebilir...")
+        res = research()
+        for part in format_report(res):
+            for chunk in _chunks(part):
+                bot.send_telegram(chunk)
+        log.info("ABD arastirma bitti:\n%s", "\n".join(format_report(res)))
+    except Exception as e:
+        log.exception("ABD arastirma hatasi: %s", e)
+        bot.send_telegram(f"⚠️ ABD testi çalıştırılamadı: {e}")
+    finally:
+        _TL.cfg = None
 
 
 def _chunks(text, n=3800):
@@ -1024,6 +1074,9 @@ def start(bot):
     started = False
     if RUN_BIST_RESEARCH:
         threading.Thread(target=run_and_report, args=(bot,), daemon=True, name="bist_research").start()
+        started = True
+    if RUN_US_RESEARCH:
+        threading.Thread(target=run_us_and_report, args=(bot,), daemon=True, name="us_research").start()
         started = True
     if BIST_LIVE:
         threading.Thread(target=run, args=(bot,), daemon=True, name="bist_live").start()
