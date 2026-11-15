@@ -3476,15 +3476,18 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       $("bybitSub").textContent = Y.error ? `⚠️ ${Y.error}` : `${Y.mode} · strateji ${Y.spec} · ${Y.data==="bybit" ? "7/24, "+Y.tf+" mum" : "hisse günlük verisi"} · sonraki tarama ${nx}`;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
       const up = (Y.positions||[]).reduce((a,p)=>a+p.upnl,0), ch = Y.equity - (Y.start_eq||Y.equity);
-      $("bybitKpis").innerHTML = tile("Hesap değeri", usd(Y.equity||0), `başlangıçtan ${usds(ch)}`, cls(ch)) +
-        tile("Açık K/Z", usds(up), `${(Y.positions||[]).length} pozisyon`, cls(up)) +
-        tile("Dolu yer", `${Y.used} / ${Y.slots}`, "hisse + kripto + elle") +
-        tile("Teminat / işlem", usd(Y.margin||0), `× ${Y.lev}x = ${usd((Y.margin||0)*Y.lev)} pozisyon`);
+      const pct = (v, base) => base > 0 ? ((v>=0?"+":"") + (100*v/base).toLocaleString("tr-TR",{maximumFractionDigits:2}) + "%") : "—";
+      const dp = Y.day_pnl || 0, dim = Y.day_im || 0, imNow = Y.im_now || 0;
+      $("bybitKpis").innerHTML = tile("Hesap değeri", usd(Y.equity||0), `başlangıç ${usd(Y.start_eq||0)}`) +
+        tile("Bugün", `${usds(dp)} <span style="font-size:15px">(${pct(dp, dim)})</span>`, `girilen ${usd(dim)} teminata göre`, cls(dp)) +
+        tile("Açık K/Z", `${usds(up)} <span style="font-size:15px">(${pct(up, imNow)})</span>`, `${(Y.positions||[]).length} pozisyon · teminat ${usd(imNow)}`, cls(up)) +
+        tile("Toplam K/Z", `${usds(ch)} <span style="font-size:15px">(${pct(ch, Y.max_im||0)})</span>`, `tüm günler · girilen ${usd(Y.max_im||0)} teminata göre`, cls(ch)) +
+        tile("Dolu yer", `${Y.used} / ${Y.slots}`, "hisse + kripto + elle");
       const kindTxt = k => k==="hisse" ? "📈 Hisse (bot)" : k==="kripto" ? "🪙 Kripto (bot)" : "🖐 Elle";
       const P = Y.positions || [];
-      $("bybitPos").innerHTML = `<thead><tr><th>Kontrat</th><th>Tür</th><th>Yön</th><th class="r">Miktar</th><th class="r">Giriş</th><th class="r">Son</th><th class="r">K/Z</th></tr></thead><tbody>` +
-        (P.length ? P.map(p => `<tr><td><b>${p.sym.replace("USDT","")}</b></td><td>${kindTxt(p.kind)}</td><td>${dirBadge(p.side==="Buy" ? "LONG" : "SHORT")}</td><td class="r">${p.size}</td><td class="r">${p.avg.toLocaleString("tr-TR")}</td><td class="r">${p.mark.toLocaleString("tr-TR")}</td><td class="r ${cls(p.upnl)}"><b>${usds(p.upnl)}</b></td></tr>`).join("")
-          : `<tr><td class="empty" colspan="7">Açık pozisyon yok</td></tr>`) + "</tbody>";
+      $("bybitPos").innerHTML = `<thead><tr><th>Kontrat</th><th>Tür</th><th>Yön</th><th class="r">Miktar</th><th class="r">Giriş</th><th class="r">Son</th><th class="r">Çıkış bölgesi</th><th class="r">Teminat</th><th class="r">K/Z</th></tr></thead><tbody>` +
+        (P.length ? P.map(p => `<tr><td><b>${p.sym.replace("USDT","")}</b></td><td>${kindTxt(p.kind)}</td><td>${dirBadge(p.side==="Buy" ? "LONG" : "SHORT")}</td><td class="r">${p.size}</td><td class="r">${p.avg.toLocaleString("tr-TR")}</td><td class="r">${p.mark.toLocaleString("tr-TR")}</td><td class="r">${p.exit ? "&lt; " + Number(p.exit).toLocaleString("tr-TR",{maximumFractionDigits:2}) : "—"}</td><td class="r">${p.im ? usd(p.im) : "—"}</td><td class="r ${cls(p.upnl)}"><b>${usds(p.upnl)}</b> <span style="font-size:12px">(${pct(p.upnl, p.im)})</span></td></tr>`).join("")
+          : `<tr><td class="empty" colspan="9">Açık pozisyon yok</td></tr>`) + "</tbody>";
       const L = (Y.log||[]).slice().reverse();
       $("bybitLog").innerHTML = `<thead><tr><th style="width:120px">Zaman</th><th>Olay</th></tr></thead><tbody>` +
         (L.length ? L.map(x => `<tr><td>${fmtTime(x.t*1000)}</td><td style="white-space:pre-wrap">${String(x.m).replace(/[<>&]/g, c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</td></tr>`).join("")

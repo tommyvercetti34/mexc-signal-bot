@@ -176,7 +176,8 @@ class Bybit:
             size = float(p.get("size") or 0)
             if size > 0:
                 out[p["symbol"]] = {"size": size, "side": p.get("side"), "avg": float(p.get("avgPrice") or 0),
-                                    "upnl": float(p.get("unrealisedPnl") or 0), "mark": float(p.get("markPrice") or 0)}
+                                    "upnl": float(p.get("unrealisedPnl") or 0), "mark": float(p.get("markPrice") or 0),
+                                    "im": float(p.get("positionIM") or 0)}
         return out
 
     def set_leverage(self, symbol, lev):
@@ -341,6 +342,9 @@ def scan(bot, api, now_et, fetcher=None):
             continue
         sig_day = max(sig_day, d.index[-1].date()) if sig_day else d.index[-1].date()
         n_ok += 1
+        lvl = _exit_level(d, fam, p)
+        if lvl and sym in S["mine"]:
+            S["mine"][sym]["exit_lvl"] = lvl
         ent, ex = bist.SIG[fam](d, SP)
         X = bist.Bars(d)
         j = X.n - 1
@@ -350,7 +354,7 @@ def scan(bot, api, now_et, fetcher=None):
             k = _recent_entry(ent, ex, EXEC_CATCHUP)
             sig_ts = X.idx[k].isoformat() if k is not None else None
             if k is not None and S.get("used_sig", {}).get(sym) != sig_ts:      # ayni sinyal bir kez kullanilir
-                buys.append({"sym": sym, "score": float(X.vr[k]) - (j - k) * 0.01, "atr": float(X.atr[j]),
+                buys.append({"sym": sym, "lvl": lvl, "score": float(X.vr[k]) - (j - k) * 0.01, "atr": float(X.atr[j]),
                              "close": float(X.c[j]), "age": j - k, "sig": sig_ts})
     S["pend"] = {"sell": sells, "buy": sorted(buys, key=lambda b: -b["score"]), "day": today.isoformat(),
                  "tp": P["tp"], "sl": P["sl"]}
@@ -376,6 +380,20 @@ def _kline_df(rows, now_ms, tf_ms):
     return df.drop(columns="ts")
 
 
+def _exit_level(d, fam, p):
+    """Matrix+ SAT bolgesi: kapanis trend cizgisi - swk*ATR(100) altina inerse (hacim onayiyla) SAT gelir."""
+    if fam != "mplus":
+        return None
+    try:
+        c, h, l = d["close"].to_numpy(float), d["high"].to_numpy(float), d["low"].to_numpy(float)
+        mid = bist.liq_mid(c, int(p.get("hlen", 50)))[-1]
+        a = bist._atr(h, l, c, 100)[-1]
+        v = float(mid - float(p.get("swk", 1.0)) * a)
+        return v if math.isfinite(v) and v > 0 else None
+    except Exception:
+        return None
+
+
 def scan_live(bot, api, now_ms=None):
     """7/24: Bybit kontratlarinin kendi mumlariyla, her mum kapanisinda. Aktif (likit) hisse kontratlari."""
     now_ms = now_ms or int(time.time() * 1000)
@@ -399,6 +417,9 @@ def scan_live(bot, api, now_ms=None):
             continue
         n_ok += 1
         last_bar = max(last_bar or d.index[-1], d.index[-1])
+        lvl = _exit_level(d, fam, p)
+        if lvl and sym in S["mine"]:
+            S["mine"][sym]["exit_lvl"] = lvl
         ent, ex = bist.SIG[fam](d, SP)
         X = bist.Bars(d)
         j = X.n - 1
@@ -408,7 +429,7 @@ def scan_live(bot, api, now_ms=None):
             k = _recent_entry(ent, ex, EXEC_CATCHUP)
             sig_ts = X.idx[k].isoformat() if k is not None else None
             if k is not None and S.get("used_sig", {}).get(sym) != sig_ts:      # ayni sinyal bir kez kullanilir
-                buys.append({"sym": sym, "score": float(X.vr[k]) - (j - k) * 0.01, "atr": float(X.atr[j]),
+                buys.append({"sym": sym, "lvl": lvl, "score": float(X.vr[k]) - (j - k) * 0.01, "atr": float(X.atr[j]),
                              "close": float(X.c[j]), "age": j - k, "sig": sig_ts})
     S["pend"] = {"sell": sells, "buy": sorted(buys, key=lambda b: -b["score"]), "day": "live", "tp": P["tp"], "sl": P["sl"]}
     S["bar_ts"] = (now_ms // tf_ms) * tf_ms
@@ -480,14 +501,23 @@ def execute(bot, api, now_et):
             if q <= 0:
                 msgs.append(f"🤖 Bybit · {sym.replace('USDT', '')} AL atlandı (miktar borsanın alt sınırının altında)")
                 continue
-            S["mine"][sym] = {"qty": q, "entry": px, "t": time.time(), "ladder_open": len(EXEC_LADDER) > 1}
+            S["mine"][sym] = {"qty": q, "entry": px, "t": time.time(), "ladder_open": len(EXEC_LADDER) > 1,
+                              "exit_lvl": b.get("lvl")}
             if b.get("sig"):
                 S.setdefault("used_sig", {})[sym] = b["sig"]
             pos[sym] = {"size": 0, "side": "Buy", "avg": px, "upnl": 0, "mark": px}   # yer sayimi icin
             msgs.append(f"🤖 Bybit {MODE_TXT} · 🟢 AL {sym.replace('USDT', '')} · teminat ~{margin:,.0f} USDT × "
                         f"{EXEC_LEVERAGE}x · kademeler: {txt}"
-                        + (f" · hedef {tp:,.2f}" if tp else "") + (f" · stop {sl:,.2f}" if sl else ""))
+                        + (f" · hedef {tp:,.2f}" if tp else "") + (f" · stop {sl:,.2f}" if sl else "")
+                        + (f" · çıkış: kapanış ~{b['lvl']:,.2f} altına inerse (hacim onaylı SAT)" if b.get("lvl") else ""))
         except Exception as e:
+            if "110126" in str(e):                         # hisse kontrati sozlesmesi imzalanmamis: bir kez uyar
+                if not S.get("agree_warned"):
+                    S["agree_warned"] = True
+                    msgs.append(f"⚠️ Bybit {sym.replace('USDT', '')} alınamadı: hisse kontratları için Bybit'te "
+                                f"sözleşme onayı gerekiyor. Bybit'te (demo modda) {sym} kontratını aç, çıkan "
+                                f"sözleşmeyi onayla. Onaydan sonra sinyaller otomatik alınır; bu uyarı tekrar gelmez.")
+                continue
             msgs.append(f"⚠️ Bybit AL {sym} başarısız: {e}")
     S["pend"] = {}
     S["exec_day"] = now_et.date().isoformat()
@@ -556,7 +586,8 @@ def status_text(api=None):
         p = pos.get(sym)
         if p:
             lines.append(f"   • {sym.replace('USDT', '')} {qty_str(p['size'])} · giriş {m['entry']:,.2f} · şimdi "
-                         f"{p['mark']:,.2f} · {p['upnl']:+,.2f} USDT")
+                         f"{p['mark']:,.2f} · {p['upnl']:+,.2f} USDT"
+                         + (f" · çıkış bölgesi < {m['exit_lvl']:,.2f}" if m.get("exit_lvl") else ""))
     pend = S.get("pend") or {}
     if pend.get("buy") or pend.get("sell"):
         lines.append("⏳ Bekleyen: " + " ".join([f"AL {b['sym'].replace('USDT', '')}" for b in pend.get("buy", [])] +
@@ -767,14 +798,28 @@ def refresh_snapshot(api):
     for sym, p in pos.items():
         kind = "hisse" if sym in S.get("mine", {}) else ("kripto" if sym in bot_syms else "elle")
         rows.append({"sym": sym, "kind": kind, "side": p["side"], "size": p["size"], "avg": p["avg"],
-                     "mark": p["mark"], "upnl": p["upnl"]})
+                     "mark": p["mark"], "upnl": p["upnl"],
+                     "exit": (S.get("mine", {}).get(sym) or {}).get("exit_lvl"), "im": p.get("im", 0)})
+    # gunluk K/Z: TR saatiyle gun basindaki hesap degerine gore; % = bugun kullanilan teminata (girilen miktar) gore
+    today = datetime.now(bist.TZ).date().isoformat()
+    im_now = sum(p.get("im", 0) for p in pos.values())
+    de = S.get("day_eq") or {}
+    if de.get("d") != today:
+        de = {"d": today, "eq": eq, "im": 0.0}
+        S["day_dirty"] = True
+    de["im"] = max(de.get("im", 0.0), im_now)
+    S["day_eq"] = de
+    if im_now > S.get("max_im", 0.0):                    # toplam K/Z % icin: bugune kadar girilen en yuksek teminat
+        S["max_im"] = im_now
+        S["day_dirty"] = True
     tf_ms = TF_MS.get(EXEC_TF, 86_400_000)
     nxt = (int(time.time() * 1000) // tf_ms + 1) * tf_ms + 60_000 if EXEC_DATA == "bybit" else None
     SNAP.update({"enabled": True, "error": None, "ts": time.time(), "mode": MODE_TXT, "equity": eq,
                  "slots": EXEC_SLOTS, "used": _used_slots(pos), "lev": EXEC_LEVERAGE, "spec": EXEC_SPEC,
                  "tf": EXEC_TF, "data": EXEC_DATA, "margin": eq / EXEC_SLOTS, "positions": rows,
                  "pend": S.get("pend") or {}, "log": S.get("log", [])[-80:], "next_scan": nxt,
-                 "start_eq": S.setdefault("start_eq", eq)})
+                 "start_eq": S.setdefault("start_eq", eq), "day_start_eq": de["eq"], "day_pnl": eq - de["eq"],
+                 "day_im": de["im"], "im_now": im_now, "max_im": S.get("max_im", 0.0)})
 
 
 def api_data():
@@ -819,6 +864,8 @@ def run(bot):
             if msgs:
                 _save(bot)
             refresh_snapshot(api)
+            if S.pop("day_dirty", False):
+                _save_quiet(bot)
         except Exception as e:
             bot.log.exception("Bybit dongu hatasi: %s", e)
         time.sleep(60)
