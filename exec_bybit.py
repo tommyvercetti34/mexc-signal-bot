@@ -59,11 +59,24 @@ EXEC_SCAN_ET = _env("EXEC_SCAN_ET", "16:30")                  # ABD saatiyle sin
 EXEC_OPEN_ET = _env("EXEC_OPEN_ET", "09:32")                  # EXEC_FILL=acilis iken ABD saatiyle emir zamani
 EXEC_FILL = _env("EXEC_FILL", "hemen").lower()                # hemen: sinyalden hemen sonra (kontrat 7/24) | acilis
 EXEC_DATA = _env("EXEC_DATA", "bybit").lower()                # bybit: kontratin kendi 7/24 mumlari | yahoo: hissenin gunluk verisi
-EXEC_TF = _env("EXEC_TF", "D").upper()                        # bybit verisinde mum: D | 240 | 60
+EXEC_TF = _env("EXEC_TF", "D").upper().strip()                # bybit verisinde mum: D | 240 | 60 | 30 | 15 | 5 ...
+EXEC_TF = {"15M": "15", "30M": "30", "5M": "5", "1M": "1", "3M": "3", "1H": "60", "2H": "120", "4H": "240",
+           "6H": "360", "12H": "720", "1D": "D", "GÜNLÜK": "D"}.get(EXEC_TF, EXEC_TF)
 EXEC_MIN_TURNOVER = _env("EXEC_MIN_TURNOVER", 1_000_000.0, float)   # aktif kontrat: son 24 saat islem hacmi (USDT)
 EXEC_MIN_BARS = _env("EXEC_MIN_BARS", 150, int)                # sinyal icin en az mum
 EXEC_CATCHUP = _env("EXEC_CATCHUP_BARS", 5, int)               # son N mumda AL verip henuz SAT vermemis hisse de alinir
-TF_MS = {"D": 86_400_000, "240": 14_400_000, "60": 3_600_000}
+TF_MS = {"D": 86_400_000, **{str(m): m * 60_000 for m in (1, 3, 5, 15, 30, 60, 120, 240, 360, 720)}}
+if EXEC_TF not in TF_MS:
+    logging.warning("Gecersiz EXEC_TF=%r, gunluk (D) kullaniliyor", EXEC_TF)
+    EXEC_TF = "D"
+
+
+def tf_text(tf=None):
+    tf = tf or EXEC_TF
+    if tf == "D":
+        return "günlük"
+    m = TF_MS[tf] // 60_000
+    return f"{m // 60} saatlik" if m >= 60 else f"{m} dakikalık"
 STATE_FILE = "exec_state.json"
 REAL = EXEC_MODE == "real" and EXEC_CONFIRM_REAL
 BASE = "https://api.bybit.com" if REAL else "https://api-demo.bybit.com"
@@ -399,7 +412,7 @@ def scan_live(bot, api, now_ms=None):
                              "close": float(X.c[j]), "age": j - k, "sig": sig_ts})
     S["pend"] = {"sell": sells, "buy": sorted(buys, key=lambda b: -b["score"]), "day": "live", "tp": P["tp"], "sl": P["sl"]}
     S["bar_ts"] = (now_ms // tf_ms) * tf_ms
-    tf_txt = {"D": "günlük", "240": "4 saatlik", "60": "1 saatlik"}.get(EXEC_TF, EXEC_TF)
+    tf_txt = tf_text()
     close_t = last_bar + timedelta(milliseconds=tf_ms) if last_bar is not None else None
     msg = (f"🤖 Bybit {MODE_TXT} · {tf_txt} mum kapanışı ({close_t:%d.%m %H:%M} · {n_ok}/{len(active)} aktif kontrat):"
            if last_bar is not None else f"🤖 Bybit {MODE_TXT} · tarama: uygun veri yok ({len(active)} aktif kontrat)")
@@ -407,6 +420,8 @@ def scan_live(bot, api, now_ms=None):
             + (f"\n🔴 SAT: {', '.join(x.replace('USDT', '') for x in sells)}" if sells else "")
             + ("" if buys or sells else "\nYeni sinyal yok."))
     _note(msg)
+    if not buys and not sells and tf_ms < 4 * 3_600_000:   # kisa mumlarda "sinyal yok" mesaji Telegram'a gitmez (/bybit'te gorunur)
+        return None
     return msg
 
 
@@ -488,7 +503,7 @@ def step(bot, api, now=None, fetcher=None):
         now_ms = int(now_et.timestamp() * 1000)
         cur = (now_ms // tf_ms) * tf_ms                    # son kapanan mumun bittigi an
         if S.get("bar_ts") != cur and now_ms - cur >= 60_000:   # kapanistan 1 dk sonra (borsa mumu yazsin)
-            out = [scan_live(bot, api, now_ms)]
+            out = [m for m in [scan_live(bot, api, now_ms)] if m]
             if S.get("pend"):
                 out += execute(bot, api, now_et)
             return out
@@ -776,7 +791,7 @@ def run(bot):
         if EXEC_DATA == "bybit":
             turn = api.turnovers()
             n = sum(1 for s_ in insts if turn.get(s_, 0) >= EXEC_MIN_TURNOVER)
-            mode = (f"7/24 tarama · Bybit {EXEC_TF} mumları · aktif kontratlar (24s hacim ≥ "
+            mode = (f"7/24 tarama · Bybit {tf_text()} mumlar · aktif kontratlar (24s hacim ≥ "
                     f"{EXEC_MIN_TURNOVER:,.0f} USDT)")
         else:
             n = len(_universe(insts))
