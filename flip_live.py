@@ -809,9 +809,26 @@ def tg_commands(bot):
                     bot.send_telegram(balance_text(), reply_to=m.get("message_id"))
                 elif cmd == "/rapor":
                     bot.send_telegram(report_text(), reply_to=m.get("message_id"))
+                elif cmd in EXTRA_CMDS:
+                    try:
+                        bot.send_telegram(EXTRA_CMDS[cmd](), reply_to=m.get("message_id"))
+                    except Exception as e:
+                        bot.send_telegram(f"⚠️ {cmd} hatası: {e}", reply_to=m.get("message_id"))
         except Exception as e:
             bot.log.debug("Telegram komut dongusu: %s", e)
             time.sleep(5)
+
+
+EXTRA_CMDS = {}                                            # diger moduller (BIST) komut ekler: "/bist" -> fonksiyon
+_CMD = {"started": False}
+
+
+def start_commands(bot):
+    """Telegram komut dinleyicisini bir kez baslat (tek getUpdates dinleyicisi olmali)."""
+    if _CMD["started"]:
+        return
+    _CMD["started"] = True
+    threading.Thread(target=tg_commands, args=(bot,), daemon=True, name="flip_tg_cmd").start()
 
 
 def start(bot, ex_factory):
@@ -819,5 +836,5 @@ def start(bot, ex_factory):
         return None
     th = threading.Thread(target=run, args=(bot, ex_factory), daemon=True, name="flip_live")
     th.start()
-    threading.Thread(target=tg_commands, args=(bot,), daemon=True, name="flip_tg_cmd").start()
+    start_commands(bot)
     return th

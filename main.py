@@ -231,6 +231,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         key = parse_qs(url.query).get("key", [""])[0]
         try:
+            if url.path == "/api/bist":
+                if DASHBOARD_KEY and key != DASHBOARD_KEY:
+                    return self._send(403, b"{}", "application/json")
+                try:
+                    import bist
+                    payload = bist.api_data()
+                except Exception as e:
+                    payload = {"enabled": False, "error": str(e)}
+                return self._send(200, json.dumps(payload, ensure_ascii=False, default=float).encode(),
+                                  "application/json; charset=utf-8")
             if url.path == "/api/flip":
                 if DASHBOARD_KEY and key != DASHBOARD_KEY:
                     return self._send(403, b"{}", "application/json")
@@ -1403,6 +1413,58 @@ def td_arrays(d, params):
     return l, s, stop
 
 
+def matrix_arrays(d, params):
+    """Matrix VWMA (TradingView 'Matrix+' indikatorumuzun bot hali). Bulut = VWMA(ohlc4, fast) - SMA(ohlc4, slow).
+    trend='lt': sinyal sadece likidite trendi (EMA50(SMA50(close))) yonunde; ters ise fiyat trend cizgisini gecince basilir.
+    tdrev=1: TD Sequential 9'dan sonraki 15 mum icinde bulut donerse trende karsi da hemen sinyal.
+    Ayni yone ust uste sinyal yok (arada ters donus olmali). Stop = son 12 mum dibi/tepesi, risk 0.75-3 ATR."""
+    O, H, L, C, V, A = (d[c].to_numpy().astype(float) for c in ("open", "high", "low", "close", "volume", "atr"))
+    n = len(C)
+    src = (O + H + L + C) / 4.0
+    fl, sl_ = int(params.get("fast", 12)), int(params.get("slow", 20))
+    pv = pd.Series(src * V).rolling(fl).sum().to_numpy()
+    vv = pd.Series(V).rolling(fl).sum().to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fast = np.where(vv > 0, pv / vv, np.nan)
+    slow = pd.Series(src).rolling(sl_).mean().to_numpy()
+    mid = pd.Series(C).rolling(50).mean().ewm(span=50, adjust=False).mean().to_numpy()
+    use_trend, tdrev, rev_bars = str(params.get("trend", "lt")) == "lt", int(params.get("tdrev", 1)), 15
+    l, s, stop = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    state, shown, tu, td_ = 0, 0, 0, 0
+    last9u = last9d = -10**9
+    al_up_p = al_dn_p = False
+    for i in range(n):
+        if i >= 4:
+            tu = tu + 1 if C[i] > C[i - 4] else 0
+            td_ = td_ + 1 if C[i] < C[i - 4] else 0
+            if tu == 9:
+                last9u = i
+            if td_ == 9:
+                last9d = i
+        if not (np.isfinite(fast[i]) and np.isfinite(slow[i])):
+            continue
+        new = 1 if fast[i] > slow[i] else -1 if fast[i] < slow[i] else state
+        buy, sell = new == 1 and state != 1, new == -1 and state != -1
+        state = new
+        ok_up = (not use_trend) or (np.isfinite(mid[i]) and C[i] > mid[i])
+        ok_dn = (not use_trend) or (np.isfinite(mid[i]) and C[i] < mid[i])
+        al_up, al_dn = state == 1 and ok_up, state == -1 and ok_dn
+        raw_b = (al_up and not al_up_p) or (tdrev and buy and i - last9d <= rev_bars)
+        raw_s = (al_dn and not al_dn_p) or (tdrev and sell and i - last9u <= rev_bars)
+        al_up_p, al_dn_p = al_up, al_dn
+        sig = 0
+        if raw_b and shown != 1:
+            sig, shown = 1, 1
+        elif raw_s and shown != -1:
+            sig, shown = -1, -1
+        elif buy or sell:
+            shown = 0
+        if sig and A[i] > 0 and i > 0:
+            (l if sig == 1 else s)[i] = True
+            stop[i] = _swing_stop(L, H, A, i, sig, lb=12, C=C)
+    return l, s, stop
+
+
 def candle_profile_arrays(d, params):
     """Rolling Candle Profile (Zeiierman) 'fiyat baskisi' modu yaklasik: son 60 mum, yeniye artan agirlik.
     Mum basina alim baskisi = (kapanis - dip), satim = (tepe - kapanis). Baskinlik = (A-S)/(A+S) >= 0.25;
@@ -1598,7 +1660,7 @@ def needs_funding(spec):
 
 STRUCT_FAMILIES = {"sweep": None, "ha_pb": ha_pullback_arrays, "harmony": harmony_arrays, "impulse": impulse_arrays,
                    "diverg": divergence_arrays, "ribbon": ribbon_arrays, "tdseq": td_arrays,
-                   "cprofile": candle_profile_arrays, "fundrev": fundrev_arrays}
+                   "cprofile": candle_profile_arrays, "fundrev": fundrev_arrays, "matrix": matrix_arrays}
 STRUCT_REASONS = {
     "ha_pb": "📈 Heikin Ashi trend içi geri çekilme bitti (HA EMA50 {side}, ilk {col} HA mumu)",
     "harmony": "📈 Aşırı uzamadan sonra kapanışla teyitli toparlanma (Reversal Pressure)",
@@ -1608,6 +1670,7 @@ STRUCT_REASONS = {
     "tdseq": "📈 TD Sequential tükenme sayımı tamamlandı",
     "cprofile": "📈 Mum profili baskınlığı + yükselen EMA21 (Candle Profile)",
     "fundrev": "📈 Fonlama aşırı ({side}) ve fiyat dönüşü: kalabalığın tersine",
+    "matrix": "📈 Matrix VWMA bulutu döndü (likidite trendi / TD 9 teyitli)",
 }
 
 
@@ -1701,6 +1764,10 @@ STRAT_DEFS = {
                     "params": {'mode': '9q', 'tp_r': [1.0, 2.0], 'be': 0.0}},
     "tdseq_1h": {"family": "tdseq", "tf": 60, "name": "TD Sequential", "max_hours": 72,
                     "params": {'mode': '9q', 'tp_r': [1.0, 2.0], 'be': 0.0}},
+    "matrix_15m": {"family": "matrix", "tf": 15, "name": "Matrix VWMA", "max_hours": 24,
+                   "params": {'fast': 12, 'slow': 20, 'trend': 'lt', 'tdrev': 1, 'tp_r': [1.5, 3.0], 'be': 0.0}},
+    "matrix_1h": {"family": "matrix", "tf": 60, "name": "Matrix VWMA", "max_hours": 72,
+                  "params": {'fast': 12, 'slow': 20, 'trend': 'lt', 'tdrev': 1, 'tp_r': [1.5, 3.0], 'be': 0.0}},
     "cprofile_15m": {"family": "cprofile", "tf": 15, "name": "Mum profili", "max_hours": 24,
                     "params": {'bands': 7, 'tp_r': [1.5, 3.0], 'be': 0.0}},
     "cprofile_1h": {"family": "cprofile", "tf": 60, "name": "Mum profili", "max_hours": 72,
@@ -2717,6 +2784,12 @@ def main():
                      flip_live.FLIP_ST_PERIOD, flip_live.FLIP_ST_MULT)
     except ImportError:
         log.warning("flip_live.py bulunamadi; kagit takip devre disi")
+    try:                                          # BIST: test (RUN_BIST_RESEARCH) ve kagit takip (BIST_LIVE)
+        import bist
+        if bist.start(sys.modules[__name__]):
+            log.info("BIST modulu basladi (test=%s, canli=%s)", bist.RUN_BIST_RESEARCH, bist.BIST_LIVE)
+    except ImportError:
+        pass
 
     ex = None
     consecutive_failures = 0
@@ -2895,6 +2968,13 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       <div class="tablewrap"><table id="flipCost"></table></div>
     </div>
     <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="flipTbl"></table></div>
+  </div>
+
+  <div class="card" id="bistCard" style="margin-bottom:16px;display:none">
+    <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🇹🇷 BIST kâğıt takip <small id="bistSub"></small></h2>
+    <div class="kpis" id="bistKpis" style="margin-bottom:12px"></div>
+    <div class="tablewrap" style="margin-bottom:12px"><table id="bistPos"></table></div>
+    <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="bistTbl"></table></div>
   </div>
 
   <h2 style="font-size:15px;margin:6px 0 10px;font-weight:620">📡 Sinyal botu (MEXC stratejileri: kırılım, mum profili, SuperTrend 1s) <small style="font-weight:400;color:var(--muted)">· Lighter kâğıt takipten ayrı</small></h2>
@@ -3205,8 +3285,45 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     }catch(e){ /* kagit takip opsiyonel */ }
   }
 
+  // ---- BIST kagit takip
+  const tl = v => Number(v).toLocaleString("tr-TR",{maximumFractionDigits:0}) + " TL";
+  const tls = v => (v>=0?"+":"") + tl(v);
+  async function loadBist(){
+    try{
+      const r = await fetch("/api/bist" + (KEY ? "?key="+encodeURIComponent(KEY) : ""), {cache:"no-store"});
+      if (!r.ok) return;
+      const B = await r.json();
+      const card = $("bistCard");
+      if (!B.enabled){ card.style.display = "none"; return; }
+      card.style.display = "block";
+      $("bistSub").textContent = `Gün sonu: ${B.daily} · Gün içi: ${B.intra} · sadece alış · ~15 dk gecikmeli veri`;
+      const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
+      let k = "", pos = [], trades = [], tot = 0, st = 0;
+      for (const key of ["gs","gi"]){
+        const b = B.books[key]; if (!b) continue;
+        tot += b.equity; st += b.start;
+        const p = b.equity - b.start, w = b.trades.filter(t=>t.pnl>0).length;
+        k += tile(b.name, tl(b.equity), `${tls(p)} (${(p/b.start*100).toFixed(2)}%) · ${b.trades.length} işlem` + (b.trades.length ? ` · kazanan %${(w/b.trades.length*100).toFixed(0)}` : ""), cls(p));
+        b.pos.forEach(x => pos.push({...x, book:b.name}));
+        b.pend.forEach(x => pos.push({sym:x.sym, book:b.name, pend:x.side}));
+        b.trades.forEach(t => trades.push({...t, book:b.name}));
+      }
+      $("bistKpis").innerHTML = tile("Toplam (canlı)", tl(tot), `${tls(tot-st)} (${((tot/st-1)*100).toFixed(2)}%)`, cls(tot-st)) + k;
+      $("bistPos").innerHTML = `<thead><tr><th>Defter</th><th>Hisse</th><th class="r">Lot</th><th class="r">Giriş</th><th class="r">Son</th><th class="r">K/Z</th></tr></thead><tbody>` +
+        (pos.length ? pos.map(x => x.pend ? `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td colspan="4">⏳ ${x.pend==="B"?"AL":"SAT"} emri açılışta</td></tr>` :
+          `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td class="r">${x.qty}</td><td class="r">${x.entry.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td class="r">${x.last.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td class="r ${cls(x.last-x.entry)}"><b>${tls(x.qty*(x.last-x.entry))}</b> (${((x.last/x.entry-1)*100).toFixed(2)}%)</td></tr>`).join("")
+          : `<tr><td class="empty" colspan="6">Açık pozisyon yok</td></tr>`) + "</tbody>";
+      trades.sort((a,b)=>b.t_out-a.t_out);
+      $("bistTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Defter</th><th>Hisse</th><th class="r">Lot</th><th class="r">Giriş</th><th class="r">Çıkış</th><th>Neden</th><th class="r">K/Z</th></tr></thead><tbody>` +
+        (trades.length ? trades.slice(0,200).map(t => `<tr><td>${fmtTime(t.t_out*1000)}</td><td>${t.book}</td><td><b>${t.sym}</b></td><td class="r">${t.qty}</td><td class="r">${t.entry.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td>${t.reason}</td><td class="r ${cls(t.pnl)}"><b>${tls(t.pnl)}</b> (${t.ret.toFixed(2)}%)</td></tr>`).join("")
+          : `<tr><td class="empty" colspan="8">Henüz kapanan BIST işlemi yok</td></tr>`) + "</tbody>";
+    }catch(e){ /* BIST opsiyonel */ }
+  }
+
   load();
   loadFlip();
+  loadBist();
+  setInterval(loadBist, 60000);
   setInterval(load, 60000);
   setInterval(loadFlip, 5000);
 })();
