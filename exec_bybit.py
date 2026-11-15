@@ -58,6 +58,11 @@ EXEC_UNIVERSE = _env("EXEC_UNIVERSE", "us100").lower()        # us100: en buyuk 
 EXEC_SCAN_ET = _env("EXEC_SCAN_ET", "16:30")                  # ABD saatiyle sinyal taramasi
 EXEC_OPEN_ET = _env("EXEC_OPEN_ET", "09:32")                  # EXEC_FILL=acilis iken ABD saatiyle emir zamani
 EXEC_FILL = _env("EXEC_FILL", "hemen").lower()                # hemen: sinyalden hemen sonra (kontrat 7/24) | acilis
+EXEC_DATA = _env("EXEC_DATA", "bybit").lower()                # bybit: kontratin kendi 7/24 mumlari | yahoo: hissenin gunluk verisi
+EXEC_TF = _env("EXEC_TF", "D").upper()                        # bybit verisinde mum: D | 240 | 60
+EXEC_MIN_TURNOVER = _env("EXEC_MIN_TURNOVER", 1_000_000.0, float)   # aktif kontrat: son 24 saat islem hacmi (USDT)
+EXEC_MIN_BARS = _env("EXEC_MIN_BARS", 150, int)                # sinyal icin en az mum
+TF_MS = {"D": 86_400_000, "240": 14_400_000, "60": 3_600_000}
 STATE_FILE = "exec_state.json"
 REAL = EXEC_MODE == "real" and EXEC_CONFIRM_REAL
 BASE = "https://api.bybit.com" if REAL else "https://api-demo.bybit.com"
@@ -127,6 +132,17 @@ class Bybit:
             if not cursor:
                 break
         return out
+
+    def klines(self, symbol, interval="D", limit=1000):
+        """Kapanmis+acik mumlar, eskiden yeniye: [(baslangic_ms, o, h, l, c, hacim)]."""
+        res = self.req("GET", "/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": interval,
+                                                   "limit": limit}, auth=False, public=True)
+        rows = [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in res.get("list", [])]
+        return sorted(rows)
+
+    def turnovers(self):
+        res = self.req("GET", "/v5/market/tickers", {"category": "linear"}, auth=False, public=True)
+        return {t["symbol"]: float(t.get("turnover24h") or 0) for t in res.get("list", [])}
 
     def last_price(self, symbol):
         res = self.req("GET", "/v5/market/tickers", {"category": "linear", "symbol": symbol}, auth=False, public=True)
@@ -319,7 +335,60 @@ def scan(bot, api, now_et, fetcher=None):
            + (f"\n🔴 SAT: {', '.join(s.replace('USDT', '') for s in sells)}" if sells else "")
            + ("" if buys or sells else "\nYeni sinyal yok."))
     _note(msg)
-    return msg if (buys or sells) else None
+    return msg
+
+
+def _kline_df(rows, now_ms, tf_ms):
+    import pandas as pd
+    rows = [r for r in rows if r[0] + tf_ms <= now_ms]                # sadece kapanmis mumlar
+    if not rows:
+        return None
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    df.index = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert(bist.TZ)
+    return df.drop(columns="ts")
+
+
+def scan_live(bot, api, now_ms=None):
+    """7/24: Bybit kontratlarinin kendi mumlariyla, her mum kapanisinda. Aktif (likit) hisse kontratlari."""
+    now_ms = now_ms or int(time.time() * 1000)
+    tf_ms = TF_MS.get(EXEC_TF, 86_400_000)
+    fam, p = bist.parse_spec(EXEC_SPEC)
+    SP, P = bist.sig_params(p), bist.exit_params(p)
+    for sym, m in list(S["mine"].items()):                # eski, dolmamis kademe emirlerini iptal et
+        if m.get("ladder_open") and time.time() - m["t"] > EXEC_LADDER_DAYS * 86400:
+            try:
+                api.cancel_all(sym)
+            except Exception:
+                pass
+            m["ladder_open"] = False
+    insts = api.stock_instruments()
+    turn = api.turnovers()
+    active = {s_: i for s_, i in insts.items() if turn.get(s_, 0) >= EXEC_MIN_TURNOVER or s_ in S["mine"]}
+    buys, sells, n_ok, last_bar = [], [], 0, None
+    for sym in active:
+        d = _kline_df(api.klines(sym, EXEC_TF), now_ms, tf_ms)
+        if d is None or len(d) < EXEC_MIN_BARS:
+            continue
+        n_ok += 1
+        last_bar = max(last_bar or d.index[-1], d.index[-1])
+        ent, ex = bist.SIG[fam](d, SP)
+        X = bist.Bars(d)
+        j = X.n - 1
+        if sym in S["mine"] and ex[j]:
+            sells.append(sym)
+        elif sym not in S["mine"] and ent[j]:
+            buys.append({"sym": sym, "score": float(X.vr[j]), "atr": float(X.atr[j]), "close": float(X.c[j])})
+    S["pend"] = {"sell": sells, "buy": sorted(buys, key=lambda b: -b["score"]), "day": "live", "tp": P["tp"], "sl": P["sl"]}
+    S["bar_ts"] = (now_ms // tf_ms) * tf_ms
+    tf_txt = {"D": "günlük", "240": "4 saatlik", "60": "1 saatlik"}.get(EXEC_TF, EXEC_TF)
+    close_t = last_bar + timedelta(milliseconds=tf_ms) if last_bar is not None else None
+    msg = (f"🤖 Bybit {MODE_TXT} · {tf_txt} mum kapanışı ({close_t:%d.%m %H:%M} · {n_ok}/{len(active)} aktif kontrat):"
+           if last_bar is not None else f"🤖 Bybit {MODE_TXT} · tarama: uygun veri yok ({len(active)} aktif kontrat)")
+    msg += ((f"\n🟢 AL: {', '.join(b['sym'].replace('USDT', '') for b in S['pend']['buy'])}" if buys else "")
+            + (f"\n🔴 SAT: {', '.join(x.replace('USDT', '') for x in sells)}" if sells else "")
+            + ("" if buys or sells else "\nYeni sinyal yok."))
+    _note(msg)
+    return msg
 
 
 def execute(bot, api, now_et):
@@ -393,6 +462,16 @@ def execute(bot, api, now_et):
 
 def step(bot, api, now=None, fetcher=None):
     now_et = (now or datetime.now(ET)).astimezone(ET)
+    if EXEC_DATA == "bybit":                               # 7/24: her mum kapanisinda tara, emri hemen gir
+        tf_ms = TF_MS.get(EXEC_TF, 86_400_000)
+        now_ms = int(now_et.timestamp() * 1000)
+        cur = (now_ms // tf_ms) * tf_ms                    # son kapanan mumun bittigi an
+        if S.get("bar_ts") != cur and now_ms - cur >= 60_000:   # kapanistan 1 dk sonra (borsa mumu yazsin)
+            out = [scan_live(bot, api, now_ms)]
+            if S.get("pend"):
+                out += execute(bot, api, now_et)
+            return out
+        return []
     hm = now_et.hour * 60 + now_et.minute
     today = now_et.date().isoformat()
     weekday = now_et.weekday() < 5
@@ -605,12 +684,18 @@ def run(bot):
     API["api"] = api
     try:
         eq = api.equity()
-        n = len(_universe(api.stock_instruments()))
+        insts = api.stock_instruments()
+        if EXEC_DATA == "bybit":
+            turn = api.turnovers()
+            n = sum(1 for s_ in insts if turn.get(s_, 0) >= EXEC_MIN_TURNOVER)
+            mode = (f"7/24 tarama · Bybit {EXEC_TF} mumları · aktif kontratlar (24s hacim ≥ "
+                    f"{EXEC_MIN_TURNOVER:,.0f} USDT)")
+        else:
+            n = len(_universe(insts))
+            mode = "sinyalden hemen sonra" if EXEC_FILL == "hemen" else "ABD açılışında"
         bot.send_telegram(f"🤖 Bybit {MODE_TXT} bağlandı · hesap {eq:,.2f} USDT · {n} hisse kontratı izleniyor · "
-                          f"en fazla {EXEC_SLOTS} pozisyon (hisse + kripto), teminat bakiye/{EXEC_SLOTS} × {EXEC_LEVERAGE}x, "
-                          f"kademeli giriş · emir: "
-                          f"{'sinyalden hemen sonra' if EXEC_FILL == 'hemen' else 'ABD açılışında'} · "
-                          f"strateji {EXEC_SPEC} · /bybit")
+                          f"en fazla {EXEC_SLOTS} pozisyon (hisse + kripto), teminat bakiye/{EXEC_SLOTS} × "
+                          f"{EXEC_LEVERAGE}x, kademeli giriş · {mode} · strateji {EXEC_SPEC} · /bybit")
     except BybitError as e:
         bot.send_telegram(f"⚠️ Bybit {MODE_TXT} bağlantısı kurulamadı: {e}\n"
                           f"Anahtarın demo modunda oluşturulduğundan ve 'Contract - Trade' yetkisi olduğundan emin ol.")
