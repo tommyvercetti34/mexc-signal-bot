@@ -10,7 +10,7 @@ BIST botu: gun sonu (gunluk mum) + gun ici (1 saatlik mum) kagit takip ve walk-f
 - Gun ici defter (15/30/60 dk): cikis = hedef (tp x ATR) / stop (sl x ATR) / ters sinyal / en fazla `maxd` islem gunu.
   Hedef gelmediyse pozisyon ertesi gune sarkar (maxd=1: ayni gun kapanista kapanir).
 - Sermaye: islem basina sabit BIST_TRADE_TL (20.000 TL), iki defter toplam en fazla BIST_SLOTS (5) hisse.
-- Komisyon BIST_FEE (varsayilan binde 1,5) + kayma BIST_SLIP (binde 0,5), alis ve satista ayri ayri.
+- Komisyon BIST_FEE (varsayilan onbinde 1) + kayma BIST_SLIP (binde 0,5), alis ve satista ayri ayri.
 - Veri: Yahoo Finance (THYAO.IS ...), ~15 dk gecikmeli.
 - T+2 takas yok sayilir: satistan gelen para ayni gun yeni alimda kullanilir (toplam bakiye BIST_CAPITAL).
 
@@ -57,12 +57,16 @@ BIST_BENCH = _env("BIST_BENCH", "XU100")
 BIST_CAPITAL = _env("BIST_CAPITAL", 100000.0, float)        # toplam sermaye (TL)
 BIST_TRADE_TL = _env("BIST_TRADE_TL", 20000.0, float)       # islem basina sabit tutar (TL)
 BIST_SLOTS = _env("BIST_SLOTS", 5, int)                      # ayni anda en fazla hisse (iki defter ORTAK)
-BIST_FEE = _env("BIST_FEE", 0.0015, float)                   # komisyon (oran, tek yon)
+BIST_FEE = _env("BIST_FEE", 0.0001, float)                   # spot komisyon (oran, tek yon): onbinde 1
 BIST_SLIP = _env("BIST_SLIP", 0.0005, float)                 # kayma (oran, tek yon)
-BIST_FEE_LOW = _env("BIST_FEE_LOW", 0.0004, float)           # raporda karsilastirma: dusuk komisyonlu hesap
+BIST_FEE_LOW = _env("BIST_FEE_LOW", 0.0, float)              # raporda karsilastirma: sifir komisyon (kayma dahil)
+BIST_SHORT_TEST = _env("BIST_SHORT_TEST", True, bool)        # testte short (VIOP, kaldiracsiz) tarafini da dene
+BIST_VIOP_FEE = _env("BIST_VIOP_FEE", 0.0003, float)         # VIOP komisyon (oran, tek yon): onbinde 3
 BIST_DAILY = _env("BIST_DAILY", "mplus:swk=1,vol=1,exit=sinyal,hlen=50")
 BIST_INTRA = _env("BIST_INTRA", "mplus:swk=0.75,vol=1,exit=sinyal,hlen=30,tp=0,sl=0,maxd=3")
 BIST_INTRA_TF = _env("BIST_INTRA_TF", "60m")                # 15m | 30m | 60m
+INTRA_ON = BIST_INTRA.strip().lower() not in ("off", "kapali", "kapalı", "0", "false")
+DAILY_ON = BIST_DAILY.strip().lower() not in ("off", "kapali", "kapalı", "0", "false")
 BIST_DELAY_MIN = _env("BIST_DELAY_MIN", 16, int)             # veri gecikmesi (dk)
 BIST_DAILY_YEARS = _env("BIST_DAILY_YEARS", 10, int)
 BIST_TRAIN_FRAC = _env("BIST_TRAIN_FRAC", 0.6, float)
@@ -227,6 +231,7 @@ def sig_st(d, p):
     ent = (dirs == 1) & (prev == -1)
     ex = (dirs == -1) & (prev == 1)
     ent[:n_ * 3] = False
+    ex[:n_ * 3] = False
     return ent, ex
 
 
@@ -274,6 +279,24 @@ def _net(entry, exit_, fee=None, slip=None):
     fee = BIST_FEE if fee is None else fee
     slip = BIST_SLIP if slip is None else slip
     return exit_ * (1 - slip) * (1 - fee) / (entry * (1 + slip) * (1 + fee)) - 1
+
+
+def _net_dir(entry, exit_, short=False, fee=None):
+    """Long: spot komisyonu. Short (VIOP, kaldiracsiz: teminat = pozisyon degeri): VIOP komisyonu."""
+    if not short:
+        return _net(entry, exit_, fee=fee)
+    fee = BIST_VIOP_FEE if fee is None else fee
+    return (entry * (1 - BIST_SLIP) * (1 - fee) - exit_ * (1 + BIST_SLIP) * (1 + fee)) / entry
+
+
+def _gross(t):
+    return (t[6] - t[7]) / t[6] if len(t) > 9 and t[9] else t[7] / t[6] - 1
+
+
+def mirror(d):
+    """Fiyat aynasi: short sinyalleri = aynalanmis seride long sinyalleri (tum gostergeler simetrik)."""
+    return pd.DataFrame({"open": -d["open"].values, "high": -d["low"].values, "low": -d["high"].values,
+                         "close": -d["close"].values, "volume": d["volume"].values}, index=d.index)
 
 
 class Bars:
@@ -340,8 +363,9 @@ def eng_signal(st, j, X, ent, ex):
         st["pend"] = {"side": "B", "atr": float(X.atr[j])}
 
 
-def backtest(d, ent, ex, P, sym="", X=None):
-    """Islemler: (giris_ts, cikis_ts, net, mum, sembol, acik_mi, giris_px, cikis_px, neden)."""
+def backtest(d, ent, ex, P, sym="", X=None, short=False):
+    """Islemler: (giris_ts, cikis_ts, net, mum, sembol, acik_mi, giris_px, cikis_px, neden, short_mu).
+    short=True: d, X ve sinyaller AYNALANMIS seriden gelir; fiyatlar geri cevrilir."""
     X = X or Bars(d)
     st = {"pos": None, "pend": None}
     out, ein = [], None
@@ -351,10 +375,15 @@ def backtest(d, ent, ex, P, sym="", X=None):
             if kind == "B":
                 ein = (j, px)
             else:
-                out.append((X.idx[ein[0]], X.idx[j], _net(ein[1], px), j - ein[0] + 1, sym, False, ein[1], px, reason))
+                e_, x_ = (-ein[1], -px) if short else (ein[1], px)
+                if short and reason == "SAT sinyali":
+                    reason = "AL sinyali"
+                out.append((X.idx[ein[0]], X.idx[j], _net_dir(e_, x_, short), j - ein[0] + 1, sym, False, e_, x_,
+                            reason, short))
         eng_signal(st, j, X, ent, ex)
     if st["pos"]:
-        out.append((X.idx[ein[0]], X.idx[-1], _net(ein[1], X.c[-1]), X.n - ein[0], sym, True, ein[1], X.c[-1], "açık"))
+        e_, x_ = (-ein[1], -X.c[-1]) if short else (ein[1], X.c[-1])
+        out.append((X.idx[ein[0]], X.idx[-1], _net_dir(e_, x_, short), X.n - ein[0], sym, True, e_, x_, "açık", short))
     return out
 
 
@@ -369,8 +398,8 @@ def stats(trades):
             "t": r.mean() / sd * math.sqrt(len(r)) if sd > 0 else 0.0,
             "pf": g / b if b > 0 else float("inf"), "sum": r.sum() * 100,
             "bars": float(np.mean([t[3] for t in trades])),
-            "gross": float(np.mean([t[7] / t[6] - 1 for t in trades])) * 100,
-            "low": float(np.mean([_net(t[6], t[7], fee=BIST_FEE_LOW) for t in trades])) * 100}
+            "gross": float(np.mean([_gross(t) for t in trades])) * 100,
+            "low": float(np.mean([_net_dir(t[6], t[7], len(t) > 9 and t[9], fee=BIST_FEE_LOW) for t in trades])) * 100}
 
 
 def portfolio(trades, t_from=None, t_to=None, slots=None, notional=None, capital=None):
@@ -468,22 +497,31 @@ def research(progress=None):
         split = t0 + (t1 - t0) * BIST_TRAIN_FRAC
         kind = "1d" if tf == "1d" else "intra"
         fams = {}
-        for fam, sgrid in SIG_GRIDS[kind].items():
+        dirs = [(False, dd, XS)]
+        if BIST_SHORT_TEST:
+            ddm = {s: mirror(d) for s, d in dd.items()}
+            dirs.append((True, ddm, {s: Bars(d) for s, d in ddm.items()}))
+        for (short, DD, XX), (fam, sgrid) in itertools.product(dirs, SIG_GRIDS[kind].items()):
             best = None
             for sp in sgrid:
-                sigs = {s: SIG[fam](d, sp) for s, d in dd.items()}
+                sigs = {s: SIG[fam](d, sp) for s, d in DD.items()}
                 for xp in EXIT_GRIDS[kind]:
                     tr = []
-                    for s, d in dd.items():
-                        tr += backtest(d, sigs[s][0], sigs[s][1], xp, sym=s, X=XS[s])
+                    for s, d in DD.items():
+                        tr += backtest(d, sigs[s][0], sigs[s][1], xp, sym=s, X=XX[s], short=short)
                     st = stats([t for t in tr if t[0] < split])
                     score = st["t"] if st["n"] >= BIST_MIN_TRADES else -99 + st["n"] / 1000
                     if best is None or score > best[0]:
                         best = (score, {**sp, **xp}, tr, st)
             _, p, tr, st_tr = best
             tst = [t for t in tr if t[0] >= split]
-            fams[fam] = {"p": p, "train": st_tr, "test": stats(tst), "pf_test": portfolio(tst, split, t1)}
-            say(f"BIST {tf} {fam}: secilen {spec_str(fam, p)}")
+            fams[fam + ("_short" if short else "")] = {"p": p, "train": st_tr, "test": stats(tst), "tst": tst,
+                                                       "pf_test": portfolio(tst, split, t1), "short": short}
+            say(f"BIST {tf} {fam}{' short' if short else ''}: secilen {spec_str(fam, p)}")
+        # en iyi long + en iyi short birlikte (ortak 5 yer)
+        bl = max((x for x in fams.values() if not x["short"]), key=lambda x: x["test"]["t"], default=None)
+        bs = max((x for x in fams.values() if x["short"]), key=lambda x: x["test"]["t"], default=None)
+        combo = portfolio(bl["tst"] + bs["tst"], split, t1) if bl and bs and bs["test"]["t"] > 0 else None
         ip = INDICATOR_DEFAULT[tf]
         xp = EXIT_GRIDS[kind][0] if kind == "1d" else {"tp": 0, "sl": 0, "maxd": 0}
         trd = []
@@ -493,7 +531,9 @@ def research(progress=None):
         tst = [t for t in trd if t[0] >= split]
         ind = {"p": {**ip, **xp}, "all": stats(trd), "test": stats(tst), "pf_test": portfolio(tst, split, t1)}
         ew = [x for x in (buy_hold(d, split, t1) for d in dd.values()) if x is not None]
-        results[tf] = {"fams": fams, "ind": ind, "t0": t0, "t1": t1, "split": split, "n_sym": len(dd),
+        for x in fams.values():
+            x.pop("tst", None)
+        results[tf] = {"fams": fams, "ind": ind, "combo": combo, "t0": t0, "t1": t1, "split": split, "n_sym": len(dd),
                        "bench_test": buy_hold(bench, split, t1), "ew_test": float(np.mean(ew)) if ew else None}
         del dd, XS
     results["_secs"] = time.time() - t_start
@@ -526,7 +566,7 @@ def format_report(res):
              f"({_tl(BIST_CAPITAL)}) · komisyon %{BIST_FEE * 100:.2f} + kayma %{BIST_SLIP * 100:.2f} (her yön) · "
              f"işlem sinyalden sonraki mumun açılışında.\n"
              f"Ayar ilk %{BIST_TRAIN_FRAC * 100:.0f}'lik dönemde seçildi, SON dönemde (hiç görmediği veri) sınandı.\n"
-             f"'brüt' = komisyonsuz, 'düşük kom.' = %{BIST_FEE_LOW * 100:.2f} komisyonla işlem başı ortalama."]
+             f"'brüt' = komisyonsuz ve kaymasız, 'düşük kom.' = %{BIST_FEE_LOW * 100:.2f} komisyon + kayma ile işlem başı ortalama."]
     winners = {}
     for tf in RESEARCH_TFS:
         r = res.get(tf, {})
@@ -543,14 +583,22 @@ def format_report(res):
             lines.append("⚠️ Ücretsiz veri bu zaman diliminde sadece son 60 günü veriyor: sonuç kısa döneme dayanıyor, "
                          "temkinli oku.")
         bh = max([x for x in (r["bench_test"], r["ew_test"]) if x is not None], default=0.0)
-        rows = list(r["fams"].items()) + [("_ind", r["ind"])]
+        longs = [(f, x) for f, x in r["fams"].items() if not x.get("short")]
+        shorts = [(f, x) for f, x in r["fams"].items() if x.get("short")]
+        rows = longs + [("_ind", r["ind"])] + ([("_hdr", None)] if shorts else []) + shorts
         for fam, x in rows:
+            if fam == "_hdr":
+                lines.append(f"\n🔻 SHORT tarafı (VİOP, kaldıraçsız; komisyon %{BIST_VIOP_FEE * 100:.2f} + kayma, "
+                             f"SAT sinyalinde short aç, AL sinyali/hedef/stop/gün sınırında kapat):")
+                continue
             te, pt = x["test"], x["pf_test"]
+            short = bool(x.get("short"))
             ok_t = te["n"] >= BIST_MIN_TRADES and te["t"] >= BIST_MIN_T
-            ok = ok_t and pt["ret"] > bh
+            ok = ok_t and (short or pt["ret"] > bh)
             mark = "✅" if ok else ("🟡" if ok_t or (te["t"] >= 1.5 and te["avg"] > 0) else "❌")
-            fam_name = FAM_NAMES.get(fam, "📐 İndikatörün kendi sinyalleri (optimizasyonsuz)")
-            fam_key = "mplus" if fam == "_ind" else fam
+            fam_key = "mplus" if fam == "_ind" else fam.replace("_short", "")
+            fam_name = (("SHORT · " if short else "") + FAM_NAMES[fam_key]) if fam != "_ind" else \
+                "📐 İndikatörün kendi sinyalleri (optimizasyonsuz)"
             yr = (f", yılda ~{_f(pt['yearly'])}%" if pt.get("yearly") is not None and days >= 180 else "")
             tr_line = (f"   eğitim: {x['train']['n']} işlem · ort {_f(x['train']['avg'], 2)}% · t {x['train']['t']:.1f}\n"
                        if "train" in x else "")
@@ -562,10 +610,14 @@ def format_report(res):
                          f"en büyük düşüş %{pt['mdd']:.1f}" + (f" · {pt['skipped']} sinyal yer yok diye atlandı"
                                                              if pt["skipped"] else ""))
             if ok and fam != "_ind":
-                cand = (te["t"], spec_str(fam, x["p"]), tf)
-                key = "1d" if tf == "1d" else "intra"
+                cand = (te["t"], spec_str(fam_key, x["p"]), tf)
+                key = ("short_" if short else "") + ("1d" if tf == "1d" else "intra")
                 if key not in winners or cand[0] > winners[key][0]:
                     winners[key] = cand
+        c = r.get("combo")
+        if c:
+            lines.append(f"\n🔀 En iyi long + en iyi short BİRLİKTE (ortak {BIST_SLOTS} yer): {_tl(BIST_CAPITAL)} → "
+                         f"{_tl(c['final'])} (dönemde {_f(c['ret'])}%) · en büyük düşüş %{c['mdd']:.1f}")
         parts.append("\n".join(lines))
     tail = ["\n━━ SONUÇ ━━",
             f"✅ = doğrulamada anlamlı kâr (t ≥ {BIST_MIN_T:g}) VE al-tut'u geçti · 🟡 = kâr anlamlı ama al-tut'u geçemedi "
@@ -577,7 +629,12 @@ def format_report(res):
             env.append(f"BIST_DAILY={winners['1d'][1]}")
         if "intra" in winners:
             env += [f"BIST_INTRA={winners['intra'][1]}", f"BIST_INTRA_TF={winners['intra'][2]}"]
-        tail.append("Canlı kâğıt takip için Render'a ekle:\n" + "\n".join(env) + "\nBIST_LIVE=true")
+        if env:
+            tail.append("Canlı kâğıt takip için Render'a ekle:\n" + "\n".join(env) + "\nBIST_LIVE=true")
+        sh = [f"{'gün sonu' if k.endswith('1d') else 'gün içi ' + v[2]}: {v[1]}" for k, v in winners.items()
+              if k.startswith("short_")]
+        if sh:
+            tail.append("🔻 Short tarafında geçen: " + " | ".join(sh) + "\n(Canlı short kâğıt takibini istersen ekleyebilirim.)")
     else:
         tail.append("Hiçbir strateji iki şartı birden geçemedi. Kâğıt takip açılabilir ama gerçek para önerilmez.")
     parts.append("\n".join(tail))
@@ -587,7 +644,8 @@ def format_report(res):
 def run_and_report(bot):
     try:
         bot.send_telegram(f"🇹🇷 BIST strateji testi başladı: {len(BIST_SYMBOLS)} hisse · {', '.join(RESEARCH_TFS)} · "
-                          f"3 strateji + hedef/stop/gün sınırı seçenekleri. 15-40 dk sürebilir...")
+                          f"3 strateji + hedef/stop/gün sınırı" + (" · long + short (VİOP)" if BIST_SHORT_TEST else "") +
+                          ". 20-60 dk sürebilir...")
         res = research()
         for part in format_report(res):
             for chunk in _chunks(part):
@@ -829,7 +887,7 @@ def step(bot, now=None, fetcher=None):
     tfm = TF_MIN.get(BIST_INTRA_TF, 60)
     eff = now - timedelta(minutes=BIST_DELAY_MIN)          # verinin ulastigi gercek zaman
     # ---- GUN ICI: her mum kapanisinda (10:00-18:00 seansi) ----
-    if 10 * 60 + BIST_DELAY_MIN <= hm <= 18 * 60 + 45:
+    if INTRA_ON and 10 * 60 + BIST_DELAY_MIN <= hm <= 18 * 60 + 45:
         mins = eff.hour * 60 + eff.minute
         marker = eff.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=mins - mins % tfm)
         marker = marker.isoformat()
@@ -845,7 +903,9 @@ def step(bot, now=None, fetcher=None):
     # ---- GUN SONU: aksam 18:50'den sonra gunluk kapanislarla sinyal; sabah acilista emirler ----
     today = now.date().isoformat()
     b = S["books"]["gs"]
-    if hm >= 18 * 60 + 50 and S.get("gs_day") != today:
+    if not DAILY_ON:
+        pass
+    elif hm >= 18 * 60 + 50 and S.get("gs_day") != today:
         data = fetcher(BIST_SYMBOLS, "1d", "2y")
         with _lock:
             before = {k: v["side"] for k, v in b["pend"].items()}
@@ -877,7 +937,8 @@ def summary_text(short=False):
     lines = [f"🇹🇷 BIST kâğıt takip · {_tl(eq)} ({(eq / BIST_CAPITAL - 1) * 100:+.2f}%) · "
              f"{_n_open()}/{BIST_SLOTS} hisse açık · işlem başı {_tl(BIST_TRADE_TL)}"]
     if not short:
-        lines.append(f"Gün sonu: {BIST_DAILY}\nGün içi ({BIST_INTRA_TF}): {BIST_INTRA}")
+        lines.append(f"Gün sonu: {BIST_DAILY if DAILY_ON else 'kapalı'}\n"
+                     f"Gün içi: {(BIST_INTRA_TF + ' · ' + BIST_INTRA) if INTRA_ON else 'kapalı'}")
     for key in ("gs", "gi"):
         b = S["books"][key]
         tr = b["trades"]
@@ -900,7 +961,8 @@ def api_data():
     with _lock:
         if not S:
             return {"enabled": False}
-        out = {"enabled": True, "daily": BIST_DAILY, "intra": f"{BIST_INTRA_TF} · {BIST_INTRA}",
+        out = {"enabled": True, "daily": BIST_DAILY if DAILY_ON else "kapalı",
+               "intra": f"{BIST_INTRA_TF} · {BIST_INTRA}" if INTRA_ON else "kapalı",
                "capital": BIST_CAPITAL, "equity": _equity_live(), "slots": BIST_SLOTS, "open": _n_open(),
                "trade_tl": BIST_TRADE_TL, "books": {}}
         for key in ("gs", "gi"):
