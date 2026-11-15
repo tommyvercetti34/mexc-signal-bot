@@ -51,8 +51,14 @@ def _env(name, default, cast=str):
 
 BIST_LIVE = _env("BIST_LIVE", False, bool)
 RUN_BIST_RESEARCH = _env("RUN_BIST_RESEARCH", False, bool)
-DEFAULT_SYMBOLS = ("AKBNK,ALARK,ASELS,ASTOR,BIMAS,CCOLA,EKGYO,ENKAI,EREGL,FROTO,GARAN,GUBRF,HEKTS,ISCTR,KCHOL,"
-                   "KRDMD,MGROS,OYAKC,PETKM,PGSUS,SAHOL,SASA,SISE,TAVHL,TCELL,THYAO,TOASO,TTKOM,TUPRS,YKBNK")
+# BIST 100 (Kasim 2026 civari; endeks her ceyrek degisir. Kesin liste icin BIST_SYMBOLS ile ver)
+DEFAULT_SYMBOLS = ("AEFES,AGROT,AHGAZ,AKBNK,AKCNS,AKSA,AKSEN,ALARK,ALFAS,ALTNY,ANSGR,ARCLK,ARDYZ,ASELS,ASTOR,AVPGY,BERA,"
+                   "BIMAS,BRSAN,BRYAT,BSOKE,BTCIM,CANTE,CCOLA,CIMSA,CWENE,DOAS,DOHOL,DSTKF,ECILC,EGEEN,EKGYO,ENERY,"
+                   "ENJSA,ENKAI,EREGL,EUPWR,EUREN,FENER,FROTO,GARAN,GESAN,GOLTS,GRSEL,GUBRF,HALKB,HEKTS,ISCTR,ISMEN,"
+                   "IZENR,KARSN,KCAER,KCHOL,KLRHO,KONTR,KONYA,KOZAA,KRDMD,KTLEV,LMKDC,MAGEN,MAVI,MGROS,MIATK,MPARK,"
+                   "OBAMS,ODAS,ODINE,OTKAR,OYAKC,PAHOL,PASEU,PETKM,PGSUS,PSGYO,QUAGR,REEDR,RGYAS,SAHOL,SARKY,SASA,SELEC,"
+                   "SISE,SKBNK,SMRTG,SOKM,TAVHL,TCELL,THYAO,TKFEN,TMSN,TOASO,TRALT,TRGYO,TRMET,TSKB,TTKOM,TTRAK,TUKAS,"
+                   "TUPRS,TURSG,ULKER,VAKBN,VESBE,VESTL,YEOTK,YKBNK,ZOREN")
 BIST_SYMBOLS = [s.strip().upper() for s in _env("BIST_SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 BIST_BENCH = _env("BIST_BENCH", "XU100")
 BIST_CAPITAL = _env("BIST_CAPITAL", 100000.0, float)        # toplam sermaye (TL)
@@ -308,6 +314,10 @@ class Bars:
         self.idx = d.index
         self.o, self.h, self.l, self.c = (d[k].values for k in ("open", "high", "low", "close"))
         self.atr = _atr(self.h, self.l, self.c, 14)
+        v = d["volume"].values
+        va = _sma(v, 20)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self.vr = np.nan_to_num(np.where(va > 0, v / va, 0.0))        # hacim / 20 mum ort. (oncelik puani)
         self.dord = np.array([t.date().toordinal() for t in d.index])
         newday = np.r_[True, self.dord[1:] != self.dord[:-1]]
         self.dayn = np.cumsum(newday)
@@ -362,7 +372,7 @@ def eng_signal(st, j, X, ent, ex):
         if ex[j]:
             st["pend"] = {"side": "S"}
     elif ent[j] and not st.get("pend"):
-        st["pend"] = {"side": "B", "atr": float(X.atr[j])}
+        st["pend"] = {"side": "B", "atr": float(X.atr[j]), "score": float(X.vr[j])}
 
 
 def backtest(d, ent, ex, P, sym="", X=None, short=False):
@@ -372,20 +382,22 @@ def backtest(d, ent, ex, P, sym="", X=None, short=False):
     st = {"pos": None, "pend": None}
     out, ein = [], None
     for j in range(WARMUP, X.n):
+        sc = st["pend"].get("score", 0.0) if st["pend"] else 0.0
         evs = eng_fill(st, j, X, P) + eng_check(st, j, X, P)
         for kind, px, reason in evs:
             if kind == "B":
-                ein = (j, px)
+                ein = (j, px, sc)
             else:
                 e_, x_ = (-ein[1], -px) if short else (ein[1], px)
                 if short and reason == "SAT sinyali":
                     reason = "AL sinyali"
                 out.append((X.idx[ein[0]], X.idx[j], _net_dir(e_, x_, short), j - ein[0] + 1, sym, False, e_, x_,
-                            reason, short))
+                            reason, short, ein[2]))
         eng_signal(st, j, X, ent, ex)
     if st["pos"]:
         e_, x_ = (-ein[1], -X.c[-1]) if short else (ein[1], X.c[-1])
-        out.append((X.idx[ein[0]], X.idx[-1], _net_dir(e_, x_, short), X.n - ein[0], sym, True, e_, x_, "açık", short))
+        out.append((X.idx[ein[0]], X.idx[-1], _net_dir(e_, x_, short), X.n - ein[0], sym, True, e_, x_, "açık", short,
+                    ein[2]))
     return out
 
 
@@ -409,7 +421,7 @@ def portfolio(trades, t_from=None, t_to=None, slots=None, notional=None, capital
     (baslangic + o ana kadar gerceklesen kar) / slots; degilse sabit `notional`."""
     slots, notional, capital = slots or BIST_SLOTS, notional or BIST_TRADE_TL, capital or BIST_CAPITAL
     compound = BIST_COMPOUND if compound is None else compound
-    tr = sorted(trades, key=lambda t: t[0])
+    tr = sorted(trades, key=lambda t: (t[0], -(t[10] if len(t) > 10 else 0.0)))   # ayni anda: hacmi guclu once
     pnl, open_, curve, taken, skipped = 0.0, [], [], 0, 0
     peak, mdd = capital, 0.0
 
@@ -490,7 +502,7 @@ def research(progress=None):
     for tf in RESEARCH_TFS:
         dd = {}
         for i, s in enumerate(BIST_SYMBOLS):
-            d = fetch(s, tf, TF_RANGE[tf])
+            d = fetch(s, tf, TF_RANGE[tf], retries=2)
             if d is not None and len(d) > WARMUP + 100:
                 dd[s] = d
             time.sleep(0.3)
@@ -654,7 +666,7 @@ def run_and_report(bot):
     try:
         bot.send_telegram(f"🇹🇷 BIST strateji testi başladı: {len(BIST_SYMBOLS)} hisse · {', '.join(RESEARCH_TFS)} · "
                           f"3 strateji + hedef/stop/gün sınırı" + (" · long + short (VİOP)" if BIST_SHORT_TEST else "") +
-                          ". 20-60 dk sürebilir...")
+                          ". Hisse sayısına göre 30-120 dk sürebilir...")
         res = research()
         for part in format_report(res):
             for chunk in _chunks(part):
@@ -764,12 +776,12 @@ def _apply(key, sym, st, evs, t, msgs):
 
 
 def process_book(key, data, spec, tf_min, closed_until):
-    """data: sembol -> mumlar (son mum yarim olabilir). Kapali mumlar motordan gecer; bekleyen emir varsa
-    sonraki (yarim) mumun acilisinda hemen doldurulur. Mesaj listesi doner."""
+    """data: sembol -> mumlar (son mum yarim olabilir). 1) Kapali mumlar motordan gecer. 2) Bekleyen emirler sonraki
+    (yarim) mumun acilisinda doldurulur; yer azsa hacmi en guclu sinyal once. Mesaj listesi doner."""
     fam, p = parse_spec(spec)
     P, SP = exit_params(p), sig_params(p)
     b = S["books"][key]
-    msgs = []
+    msgs, later = [], []
     for sym, d in data.items():
         if d is None or len(d) < WARMUP:
             continue
@@ -785,33 +797,34 @@ def process_book(key, data, spec, tf_min, closed_until):
         st = {"pos": b["pos"].get(sym), "pend": b["pend"].get(sym)}
         last = b["last_bar"].get(sym)
         ts_arr = np.array([t.timestamp() for t in closed.index])
-        if last is None:
-            js = [X.n - 1]                                 # ilk calisma: gecmisi isleme, sadece son mum
-        else:
-            js = [j for j in np.nonzero(ts_arr > last)[0][-300:]]
+        js = [X.n - 1] if last is None else list(np.nonzero(ts_arr > last)[0][-300:])   # ilk calisma: sadece son mum
         for j in js:
             t = float(ts_arr[j])
-            evs = eng_fill(st, j, X, P)
-            _apply(key, sym, st, evs, t, msgs)
-            evs = eng_check(st, j, X, P)
-            _apply(key, sym, st, evs, t, msgs)
+            _apply(key, sym, st, eng_fill(st, j, X, P), t, msgs)
+            _apply(key, sym, st, eng_check(st, j, X, P), t, msgs)
             eng_signal(st, j, X, ent, ex)
             b["last_bar"][sym] = t
-        # bekleyen emir: sonraki mum (yarim olsa da) acildiysa hemen doldur
-        if st["pend"]:
-            after = d[d.index > closed.index[-1]]
-            if len(after):
-                t = after.index[0].timestamp()
-                Xp = Bars(after.iloc[:1])
-                evs = eng_fill(st, 0, Xp, P, price=float(after["open"].iloc[0]))
-                _apply(key, sym, st, evs, t, msgs)
-        if st["pend"]:
-            b["pend"][sym] = st["pend"]
-        else:
-            b["pend"].pop(sym, None)
-        if st["pos"] is None:
-            b["pos"].pop(sym, None)
+        after = d[d.index > closed.index[-1]]
+        if st["pend"] and len(after):
+            later.append((sym, st, after))
+        _store(b, sym, st)
+    # 2) bekleyen emirler: once satislar (yer acar), sonra alislar hacim puanina gore
+    later.sort(key=lambda x: (x[1]["pend"]["side"] != "S", -x[1]["pend"].get("score", 0.0)))
+    for sym, st, after in later:
+        Xp = Bars(after.iloc[:1])
+        evs = eng_fill(st, 0, Xp, P, price=float(after["open"].iloc[0]))
+        _apply(key, sym, st, evs, after.index[0].timestamp(), msgs)
+        _store(b, sym, st)
     return msgs
+
+
+def _store(b, sym, st):
+    if st["pend"]:
+        b["pend"][sym] = st["pend"]
+    else:
+        b["pend"].pop(sym, None)
+    if st["pos"] is None:
+        b["pos"].pop(sym, None)
 
 
 def _save(bot, remote=False):
