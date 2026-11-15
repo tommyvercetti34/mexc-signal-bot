@@ -2935,6 +2935,13 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   .empty{color:var(--muted);text-align:center;padding:24px 8px}
   #flipCost td,#flipCost th{white-space:normal}
   .foot{color:var(--muted);font-size:12px;margin-top:18px;line-height:1.6}
+  .tabs{display:flex;gap:4px;margin:0 0 16px;border-bottom:1px solid var(--line);overflow-x:auto}
+  .tabs button{appearance:none;border:0;background:none;color:var(--ink2);font:inherit;font-size:14px;font-weight:560;padding:10px 14px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
+  .tabs button:hover{color:var(--ink)}
+  .tabs button.on{color:var(--accent);border-bottom-color:var(--accent)}
+  .pane{display:none}
+  .pane.on{display:block}
+  .offnote{color:var(--muted);font-size:14px;padding:28px;text-align:center}
   .warnbar{background:var(--warn-bg);color:var(--warn);border-radius:10px;padding:8px 12px;font-size:13px;margin-bottom:14px;display:none}
 </style>
 </head>
@@ -2942,7 +2949,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 <div class="wrap">
   <header>
     <div>
-      <h1>MEXC Sinyal Botu</h1>
+      <h1>Bot Paneli</h1>
       <div class="sub" id="cfg">—</div>
     </div>
     <span class="pill"><span class="dot" id="statusDot"></span><span id="statusTxt">Bağlanıyor…</span></span>
@@ -2950,16 +2957,14 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
 
   <div class="warnbar" id="persistWarn">⚠️ Kalıcı kayıt (GitHub Gist) ayarlı değil: Render'da yeni deploy yapıldığında işlem geçmişi sıfırlanır.</div>
 
-  <div class="controls">
-    <div class="seg" id="period">
-      <button data-d="1">Bugün</button><button data-d="7">7 gün</button><button data-d="30">30 gün</button><button data-d="0" class="on">Tümü</button>
-    </div>
-    <span class="spacer"></span>
-    <label>Bakiye $ <input type="number" id="bal" value="2000" min="1" step="100"></label>
-    <label>Teminat/işlem % <input type="number" id="mpct" value="10" min="0.5" max="100" step="0.5"></label>
-    <label><input type="checkbox" id="fees" checked> Komisyon (~%0,06)</label>
-  </div>
+  <nav class="tabs" id="tabs" role="tablist">
+    <button data-tab="lighter" role="tab">⚡ Lighter scalp</button>
+    <button data-tab="uzun" role="tab">📈 Uzun işlem</button>
+    <button data-tab="bist" role="tab">🇹🇷 BIST</button>
+  </nav>
 
+  <div class="pane" data-pane="lighter">
+  <div class="card offnote" id="flipOff">Lighter kâğıt takip kapalı ya da henüz veri yok (Render'da FLIP_LIVE=true).</div>
   <div class="card" id="flipCard" style="margin-bottom:16px;display:none">
     <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🔁 Lighter kâğıt takip <small id="flipSub"></small></h2>
     <div class="kpis" id="flipKpis" style="margin-bottom:12px"></div>
@@ -2970,6 +2975,10 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="flipTbl"></table></div>
   </div>
 
+  </div>
+
+  <div class="pane" data-pane="bist">
+  <div class="card offnote" id="bistOff">BIST kâğıt takip kapalı ya da henüz başlamadı (Render'da BIST_LIVE=true). Test sonuçları Telegram'a gelir.</div>
   <div class="card" id="bistCard" style="margin-bottom:16px;display:none">
     <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🇹🇷 BIST kâğıt takip <small id="bistSub"></small></h2>
     <div class="kpis" id="bistKpis" style="margin-bottom:12px"></div>
@@ -2977,7 +2986,20 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="tablewrap" style="max-height:340px;overflow-y:auto"><table id="bistTbl"></table></div>
   </div>
 
-  <h2 style="font-size:15px;margin:6px 0 10px;font-weight:620">📡 Sinyal botu (MEXC stratejileri: kırılım, mum profili, SuperTrend 1s) <small style="font-weight:400;color:var(--muted)">· Lighter kâğıt takipten ayrı</small></h2>
+  </div>
+
+  <div class="pane" data-pane="uzun">
+  <div class="controls">
+    <div class="seg" id="period">
+      <button data-d="1">Bugün</button><button data-d="7">7 gün</button><button data-d="30">30 gün</button><button data-d="0" class="on">Tümü</button>
+    </div>
+    <span class="spacer"></span>
+    <label>Bakiye $ <input type="number" id="bal" value="2000" min="1" step="100"></label>
+    <label>Teminat/işlem % <input type="number" id="mpct" value="10" min="0.5" max="100" step="0.5"></label>
+    <label><input type="checkbox" id="fees" checked> Komisyon (~%0,06)</label>
+  </div>
+
+  <h2 style="font-size:15px;margin:6px 0 10px;font-weight:620">📈 Uzun işlem · sinyal botu (MEXC stratejileri: kırılım, mum profili, SuperTrend 1s)</h2>
   <div class="kpis" id="kpis"></div>
 
   <div class="grid2">
@@ -3012,6 +3034,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   <div class="foot" id="foot">
     $ hesapları: her işleme <b>bakiye × teminat %</b> kadar sabit teminat ve botun kaldıracı varsayılır; kademeli girişlerde dolmayan kademeler hesaba katılmaz.
     Funding ve kayma dahil değildir. Sayfa her 60 saniyede yenilenir. Yatırım tavsiyesi değildir.
+  </div>
   </div>
 </div>
 
@@ -3244,8 +3267,8 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       if (!r.ok) return;
       const F = await r.json();
       const card = $("flipCard");
-      if (!F.enabled){ card.style.display = "none"; return; }
-      card.style.display = "block";
+      if (!F.enabled){ card.style.display = "none"; $("flipOff").style.display = "block"; return; }
+      card.style.display = "block"; $("flipOff").style.display = "none";
       const hrs = (Date.now() - F.started) / 3600000;
       const csrc = F.candles === "Lighter" ? "Lighter mumları" : F.candles === "Lighter işlemleri" ? `Lighter işlem mumları (${F.own_candles} dk)` : (F.own_candles ? `Lighter ${F.own_candles} dk + MEXC (işlem mumları ${F.trade_candles||0}/90 dk birikiyor)` : "MEXC mumları");
       $("flipSub").textContent = `${F.symbol} 1 dk · ${csrc} · SuperTrend(${F.st[0]},${F.st[1]}) · risk %${F.risk} · ${F.lev}x` + (F.tp_roe ? ` · TP %${F.tp_roe}` : "") + ` · ${hrs.toFixed(1)} saat` + (F.halted ? " · 🛑 ACİL FREN" : "");
@@ -3294,31 +3317,49 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       if (!r.ok) return;
       const B = await r.json();
       const card = $("bistCard");
-      if (!B.enabled){ card.style.display = "none"; return; }
-      card.style.display = "block";
-      $("bistSub").textContent = `Gün sonu: ${B.daily} · Gün içi: ${B.intra} · sadece alış · ~15 dk gecikmeli veri`;
+      if (!B.enabled){ card.style.display = "none"; $("bistOff").style.display = "block"; return; }
+      card.style.display = "block"; $("bistOff").style.display = "none";
+      $("bistSub").textContent = `Gün sonu: ${B.daily} · Gün içi: ${B.intra} · işlem başı ${tl(B.trade_tl)} · sadece alış · ~15 dk gecikmeli veri`;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
-      let k = "", pos = [], trades = [], tot = 0, st = 0;
+      let k = "", pos = [], trades = [];
       for (const key of ["gs","gi"]){
         const b = B.books[key]; if (!b) continue;
-        tot += b.equity; st += b.start;
-        const p = b.equity - b.start, w = b.trades.filter(t=>t.pnl>0).length;
-        k += tile(b.name, tl(b.equity), `${tls(p)} (${(p/b.start*100).toFixed(2)}%) · ${b.trades.length} işlem` + (b.trades.length ? ` · kazanan %${(w/b.trades.length*100).toFixed(0)}` : ""), cls(p));
+        const w = b.trades.filter(t=>t.pnl>0).length;
+        k += tile(b.name + " K/Z", tls(b.pnl), `${b.trades.length} işlem` + (b.trades.length ? ` · kazanan %${(w/b.trades.length*100).toFixed(0)}` : "") + ` · ${b.pos.length} açık`, cls(b.pnl));
         b.pos.forEach(x => pos.push({...x, book:b.name}));
         b.pend.forEach(x => pos.push({sym:x.sym, book:b.name, pend:x.side}));
         b.trades.forEach(t => trades.push({...t, book:b.name}));
       }
-      $("bistKpis").innerHTML = tile("Toplam (canlı)", tl(tot), `${tls(tot-st)} (${((tot/st-1)*100).toFixed(2)}%)`, cls(tot-st)) + k;
-      $("bistPos").innerHTML = `<thead><tr><th>Defter</th><th>Hisse</th><th class="r">Lot</th><th class="r">Giriş</th><th class="r">Son</th><th class="r">K/Z</th></tr></thead><tbody>` +
-        (pos.length ? pos.map(x => x.pend ? `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td colspan="4">⏳ ${x.pend==="B"?"AL":"SAT"} emri açılışta</td></tr>` :
-          `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td class="r">${x.qty}</td><td class="r">${x.entry.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td class="r">${x.last.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td class="r ${cls(x.last-x.entry)}"><b>${tls(x.qty*(x.last-x.entry))}</b> (${((x.last/x.entry-1)*100).toFixed(2)}%)</td></tr>`).join("")
-          : `<tr><td class="empty" colspan="6">Açık pozisyon yok</td></tr>`) + "</tbody>";
+      const tp = B.equity - B.capital;
+      $("bistKpis").innerHTML = tile("Toplam bakiye (canlı)", tl(B.equity), `${tls(tp)} (${(tp/B.capital*100).toFixed(2)}%)`, cls(tp)) + k +
+        tile("Dolu yer", `${B.open} / ${B.slots}`, `her işlem ${tl(B.trade_tl)}`);
+      const px = v => v == null ? "—" : Number(v).toLocaleString("tr-TR",{minimumFractionDigits:2, maximumFractionDigits:2});
+      $("bistPos").innerHTML = `<thead><tr><th>Defter</th><th>Hisse</th><th class="r">Lot</th><th class="r">Giriş</th><th class="r">Son</th><th class="r">Hedef</th><th class="r">Stop</th><th class="r">K/Z</th></tr></thead><tbody>` +
+        (pos.length ? pos.map(x => x.pend ? `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td colspan="6">⏳ ${x.pend==="B"?"AL":"SAT"} emri sonraki açılışta</td></tr>` :
+          `<tr><td>${x.book}</td><td><b>${x.sym}</b></td><td class="r">${x.qty}</td><td class="r">${px(x.entry)}</td><td class="r">${px(x.last)}</td><td class="r">${px(x.tp)}</td><td class="r">${px(x.sl)}</td><td class="r ${cls(x.last-x.entry)}"><b>${tls(x.qty*(x.last-x.entry))}</b> (${((x.last/x.entry-1)*100).toFixed(2)}%)</td></tr>`).join("")
+          : `<tr><td class="empty" colspan="8">Açık pozisyon yok</td></tr>`) + "</tbody>";
       trades.sort((a,b)=>b.t_out-a.t_out);
       $("bistTbl").innerHTML = `<thead><tr><th>Kapanış</th><th>Defter</th><th>Hisse</th><th class="r">Lot</th><th class="r">Giriş</th><th class="r">Çıkış</th><th>Neden</th><th class="r">K/Z</th></tr></thead><tbody>` +
         (trades.length ? trades.slice(0,200).map(t => `<tr><td>${fmtTime(t.t_out*1000)}</td><td>${t.book}</td><td><b>${t.sym}</b></td><td class="r">${t.qty}</td><td class="r">${t.entry.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td class="r">${t.exit.toLocaleString("tr-TR",{minimumFractionDigits:2})}</td><td>${t.reason}</td><td class="r ${cls(t.pnl)}"><b>${tls(t.pnl)}</b> (${t.ret.toFixed(2)}%)</td></tr>`).join("")
           : `<tr><td class="empty" colspan="8">Henüz kapanan BIST işlemi yok</td></tr>`) + "</tbody>";
     }catch(e){ /* BIST opsiyonel */ }
   }
+
+  // ---- Sekmeler (secim adres cubugunda #lighter / #uzun / #bist olarak saklanir)
+  const TABS = ["lighter","uzun","bist"];
+  function showTab(t){
+    if (!TABS.includes(t)) t = "uzun";
+    document.querySelectorAll("#tabs button").forEach(b => { const on = b.dataset.tab === t; b.classList.toggle("on", on); b.setAttribute("aria-selected", on); });
+    document.querySelectorAll(".pane").forEach(p => p.classList.toggle("on", p.dataset.pane === t));
+    try{ localStorage.setItem("tab", t); }catch(e){}
+    if (location.hash !== "#" + t) history.replaceState(null, "", location.pathname + location.search + "#" + t);
+    setTimeout(() => window.dispatchEvent(new Event("resize")), 30);   // gizliyken cizilen grafikleri boyutlandir
+  }
+  $("tabs").addEventListener("click", e => { const b = e.target.closest("button[data-tab]"); if (b) showTab(b.dataset.tab); });
+  let firstTab = location.hash.slice(1);
+  if (!TABS.includes(firstTab)) { try{ firstTab = localStorage.getItem("tab"); }catch(e){ firstTab = null; } }
+  showTab(firstTab || "lighter");
+  window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 
   load();
   loadFlip();
