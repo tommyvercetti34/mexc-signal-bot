@@ -3085,7 +3085,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
   </div>
 
   <div class="pane" data-pane="bybit">
-  <div class="card offnote" id="bybitOff">Bybit bağlantısı kapalı (Render'da EXEC_ENABLED=true ve demo anahtarları).</div>
+  <div class="card offnote" id="bybitOff">Bybit bağlantısı kapalı (Render'da EXEC_ENABLED=true ve API anahtarları).</div>
   <div class="card" id="bybitCard" style="margin-bottom:16px;display:none">
     <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🤖 Bybit <small id="bybitSub"></small></h2>
     <div class="kpis" id="bybitKpis" style="margin-bottom:12px"></div>
@@ -3475,7 +3475,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       const usd = v => Number(v).toLocaleString("tr-TR",{maximumFractionDigits:2}) + " $";
       const usds = v => (v>=0?"+":"") + usd(v);
       const nx = Y.next_scan ? new Date(Y.next_scan).toLocaleString("tr-TR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—";
-      $("bybitSub").textContent = Y.error ? `⚠️ ${Y.error}` : `${Y.mode} · strateji ${Y.spec} · ${Y.data==="bybit" ? "7/24, "+Y.tf+" mum" : "hisse günlük verisi"} · sonraki tarama ${nx}`;
+      $("bybitSub").textContent = Y.error ? `⚠️ ${Y.error}` : `${Y.mode ? Y.mode + " · " : ""}strateji ${Y.spec} · ${Y.data==="bybit" ? "7/24, "+Y.tf+" mum" : "hisse günlük verisi"} · sonraki tarama ${nx}`;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
       const up = (Y.positions||[]).reduce((a,p)=>a+p.upnl,0), ch = Y.equity - (Y.start_eq||Y.equity);
       const pct = (v, base) => base > 0 ? ((v>=0?"+":"") + (100*v/base).toLocaleString("tr-TR",{maximumFractionDigits:2}) + "%") : "—";

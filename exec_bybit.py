@@ -83,7 +83,8 @@ BASE = "https://api.bybit.com" if REAL else "https://api-demo.bybit.com"
 PUBLIC = "https://api.bybit.com"
 KEY = os.getenv("BYBIT_KEY" if REAL else "BYBIT_DEMO_KEY", "")
 SECRET = os.getenv("BYBIT_SECRET" if REAL else "BYBIT_DEMO_SECRET", "")
-MODE_TXT = "GERÇEK HESAP" if REAL else "demo hesap"
+MODE_TXT = ""                                                  # mesajlarda hesap turu yazilmaz
+MT = f" {MODE_TXT}" if MODE_TXT else ""
 
 
 # ============================================================================
@@ -362,7 +363,7 @@ def scan(bot, api, now_et, fetcher=None):
         S["scan_day"] = today.isoformat()
     S["sig_day"] = sig_day.isoformat() if sig_day else (S.get("sig_day") or "yok")
     when = "şimdi giriliyor" if EXEC_FILL == "hemen" else "ABD açılışında"
-    msg = (f"🤖 Bybit {MODE_TXT} · {sig_day:%d.%m} kapanışı sinyalleri ({n_ok}/{len(insts)} hisse) · {when}:"
+    msg = (f"🤖 Bybit{MT} · {sig_day:%d.%m} kapanışı sinyalleri ({n_ok}/{len(insts)} hisse) · {when}:"
            + (f"\n🟢 AL: {', '.join(b['sym'].replace('USDT', '') for b in S['pend']['buy'])}" if buys else "")
            + (f"\n🔴 SAT: {', '.join(s.replace('USDT', '') for s in sells)}" if sells else "")
            + ("" if buys or sells else "\nYeni sinyal yok."))
@@ -435,8 +436,8 @@ def scan_live(bot, api, now_ms=None):
     S["bar_ts"] = (now_ms // tf_ms) * tf_ms
     tf_txt = tf_text()
     close_t = last_bar + timedelta(milliseconds=tf_ms) if last_bar is not None else None
-    msg = (f"🤖 Bybit {MODE_TXT} · {tf_txt} mum kapanışı ({close_t:%d.%m %H:%M} · {n_ok}/{len(active)} aktif kontrat):"
-           if last_bar is not None else f"🤖 Bybit {MODE_TXT} · tarama: uygun veri yok ({len(active)} aktif kontrat)")
+    msg = (f"🤖 Bybit{MT} · {tf_txt} mum kapanışı ({close_t:%d.%m %H:%M} · {n_ok}/{len(active)} aktif kontrat):"
+           if last_bar is not None else f"🤖 Bybit{MT} · tarama: uygun veri yok ({len(active)} aktif kontrat)")
     msg += ((f"\n🟢 AL: {', '.join(b['sym'].replace('USDT', '') for b in S['pend']['buy'])}" if buys else "")
             + (f"\n🔴 SAT: {', '.join(x.replace('USDT', '') for x in sells)}" if sells else "")
             + ("" if buys or sells else "\nYeni sinyal yok."))
@@ -468,7 +469,7 @@ def execute(bot, api, now_et):
             api.market(sym, "Sell", qty_str(q), reduce_only=True)
             px = api.last_price(sym) or p["mark"]
             pnl = (px - mine["entry"]) * q
-            msgs.append(f"🤖 Bybit {MODE_TXT} · 🔴 SAT {sym.replace('USDT', '')} {qty_str(q)} @ ~{px:,.2f} · "
+            msgs.append(f"🤖 Bybit{MT} · 🔴 SAT {sym.replace('USDT', '')} {qty_str(q)} @ ~{px:,.2f} · "
                         f"{'✅' if pnl >= 0 else '🔻'} {pnl:+,.2f} USDT ({(px / mine['entry'] - 1) * 100:+.2f}%)")
             S["mine"].pop(sym, None)
         except Exception as e:
@@ -506,7 +507,7 @@ def execute(bot, api, now_et):
             if b.get("sig"):
                 S.setdefault("used_sig", {})[sym] = b["sig"]
             pos[sym] = {"size": 0, "side": "Buy", "avg": px, "upnl": 0, "mark": px}   # yer sayimi icin
-            msgs.append(f"🤖 Bybit {MODE_TXT} · 🟢 AL {sym.replace('USDT', '')} · teminat ~{margin:,.0f} USDT × "
+            msgs.append(f"🤖 Bybit{MT} · 🟢 AL {sym.replace('USDT', '')} · teminat ~{margin:,.0f} USDT × "
                         f"{EXEC_LEVERAGE}x · kademeler: {txt}"
                         + (f" · hedef {tp:,.2f}" if tp else "") + (f" · stop {sl:,.2f}" if sl else "")
                         + (f" · çıkış: kapanış ~{b['lvl']:,.2f} altına inerse (hacim onaylı SAT)" if b.get("lvl") else ""))
@@ -515,7 +516,7 @@ def execute(bot, api, now_et):
                 if not S.get("agree_warned"):
                     S["agree_warned"] = True
                     msgs.append(f"⚠️ Bybit {sym.replace('USDT', '')} alınamadı: hisse kontratları için Bybit'te "
-                                f"sözleşme onayı gerekiyor. Bybit'te (demo modda) {sym} kontratını aç, çıkan "
+                                f"sözleşme onayı gerekiyor. Bybit'te {sym} kontratını aç, çıkan "
                                 f"sözleşmeyi onayla. Onaydan sonra sinyaller otomatik alınır; bu uyarı tekrar gelmez.")
                 continue
             msgs.append(f"⚠️ Bybit AL {sym} başarısız: {e}")
@@ -560,12 +561,12 @@ def step(bot, api, now=None, fetcher=None):
 def status_text(api=None):
     api = api or API.get("api")
     if not api:
-        return "Bybit bağlantısı kapalı (EXEC_ENABLED=true ve demo anahtarları gerekli)."
+        return "Bybit bağlantısı kapalı (EXEC_ENABLED=true ve API anahtarları gerekli)."
     try:
         eq, pos = api.equity(), api.positions()
     except Exception as e:
         return f"⚠️ Bybit'e bağlanılamadı: {e}"
-    lines = [f"🤖 Bybit {MODE_TXT} · hesap {eq:,.2f} USDT · dolu yer {_used_slots(pos)}/{EXEC_SLOTS} · "
+    lines = [f"🤖 Bybit{MT} · hesap {eq:,.2f} USDT · dolu yer {_used_slots(pos)}/{EXEC_SLOTS} · "
              f"teminat/işlem ~{eq / EXEC_SLOTS:,.0f} USDT × {EXEC_LEVERAGE}x",
              f"Hisse stratejisi: {EXEC_SPEC}"]
     scans = [x for x in S.get("log", []) if "kapanış" in x["m"] or "tarama" in x["m"]]
@@ -638,7 +639,7 @@ def crypto_open(bot, t, sym_id):
                 return
             S["crypto"][_ckey(t)] = {"sym": sym_id, "side": side, "sl": s["sl"], "tp1": False, "t": time.time()}
             _save_quiet(bot)
-            bot.send_telegram(f"🤖 Bybit {MODE_TXT} · kripto {'🟢 LONG' if side == 'Buy' else '🔴 SHORT'} {sym_id} · "
+            bot.send_telegram(f"🤖 Bybit{MT} · kripto {'🟢 LONG' if side == 'Buy' else '🔴 SHORT'} {sym_id} · "
                               f"teminat ~{margin:,.0f} USDT × {EXEC_LEVERAGE}x · kademeler: {' + '.join(parts)} · "
                               f"stop {s['sl']:,.6g}")
         except Exception as e:
@@ -824,7 +825,7 @@ def refresh_snapshot(api):
     SNAP.update({"enabled": True, "error": None, "ts": time.time(), "mode": MODE_TXT, "equity": eq,
                  "slots": EXEC_SLOTS, "used": _used_slots(pos), "lev": EXEC_LEVERAGE, "spec": EXEC_SPEC,
                  "tf": EXEC_TF, "data": EXEC_DATA, "margin": eq / EXEC_SLOTS, "positions": rows,
-                 "pend": S.get("pend") or {}, "log": S.get("log", [])[-80:], "next_scan": nxt,
+                 "pend": S.get("pend") or {}, "log": [{**x, "m": str(x.get("m", "")).replace("Bybit demo hesap", "Bybit")} for x in S.get("log", [])[-80:]], "next_scan": nxt,
                  "start_eq": S.setdefault("start_eq", eq), "day_start_eq": de["eq"], "day_pnl": eq - de["eq"],
                  "day_im": de["im"], "im_now": im_now, "max_im": S.get("max_im", 0.0),
                  "eq_hist": hist + [[int(now_s), round(eq, 2)]]})
@@ -849,12 +850,12 @@ def run(bot):
         else:
             n = len(_universe(insts))
             mode = "sinyalden hemen sonra" if EXEC_FILL == "hemen" else "ABD açılışında"
-        bot.send_telegram(f"🤖 Bybit {MODE_TXT} bağlandı · hesap {eq:,.2f} USDT · {n} hisse kontratı izleniyor · "
+        bot.send_telegram(f"🤖 Bybit{MT} bağlandı · hesap {eq:,.2f} USDT · {n} hisse kontratı izleniyor · "
                           f"en fazla {EXEC_SLOTS} pozisyon (hisse + kripto), teminat bakiye/{EXEC_SLOTS} × "
                           f"{EXEC_LEVERAGE}x, kademeli giriş · {mode} · strateji {EXEC_SPEC} · /bybit")
     except BybitError as e:
-        bot.send_telegram(f"⚠️ Bybit {MODE_TXT} bağlantısı kurulamadı: {e}\n"
-                          f"Anahtarın demo modunda oluşturulduğundan ve 'Contract - Trade' yetkisi olduğundan emin ol.")
+        bot.send_telegram(f"⚠️ Bybit{MT} bağlantısı kurulamadı: {e}\n"
+                          f"Anahtarın doğru hesapta oluşturulduğundan ve 'Contract - Trade' yetkisi olduğundan emin ol.")
     except Exception as e:
         bot.send_telegram(f"⚠️ Bybit modülü başlarken hata: {e}\n"
                           f"(GitHub'daki bist.py en son sürüm mü? ABD hisse listesi ve veri fonksiyonu oradan geliyor.)")
