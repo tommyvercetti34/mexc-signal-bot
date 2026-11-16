@@ -3092,7 +3092,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="tablewrap" style="margin-bottom:12px"><table id="bybitPos"></table></div>
     <h2 style="font-size:14px;margin:4px 0 8px">Son olaylar</h2>
     <div class="tablewrap" style="max-height:360px;overflow-y:auto"><table id="bybitLog"></table></div>
-    <h2 style="font-size:14px;margin:16px 0 8px">Sermaye eğrisi <small id="bybitEqNote"></small></h2>
+    <h2 style="font-size:14px;margin:16px 0 8px">Sermaye eğrisi · sadece hisse <small id="bybitEqNote"></small></h2>
     <div class="chartbox"><canvas id="bybitEqChart" aria-label="Bybit sermaye eğrisi"></canvas></div>
   </div>
   </div>
@@ -3478,13 +3478,13 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       $("bybitSub").textContent = Y.error ? `⚠️ ${Y.error}` : `${Y.mode ? Y.mode + " · " : ""}strateji ${Y.spec} · ${Y.data==="bybit" ? "7/24, "+Y.tf+" mum" : "hisse günlük verisi"} · sonraki tarama ${nx}`;
       const tile = (lab, val, note, c="") => `<div class="tile"><div class="lab">${lab}</div><div class="val ${c}">${val}</div><div class="note">${note||""}</div></div>`;
       const SP = (Y.positions||[]).filter(p => p.kind !== "kripto");          // kripto islemler Uzun islem sekmesinde
-      const up = SP.reduce((a,p)=>a+p.upnl,0), ch = Y.equity - (Y.start_eq||Y.equity);
+      const up = SP.reduce((a,p)=>a+p.upnl,0), ch = (Y.stock_total != null ? Y.stock_total : Y.equity - (Y.start_eq||Y.equity));
       const pct = (v, base) => base > 0 ? ((v>=0?"+":"") + (100*v/base).toLocaleString("tr-TR",{maximumFractionDigits:2}) + "%") : "—";
       const dp = Y.day_pnl || 0, dim = Y.day_im || 0, imNow = SP.reduce((a,p)=>a+(p.im||0),0);
-      $("bybitKpis").innerHTML = tile("Hesap değeri", usd(Y.equity||0), `başlangıç ${usd(Y.start_eq||0)}`) +
-        tile("Bugün", `${usds(dp)} <span style="font-size:15px">(${pct(dp, dim)})</span>`, `girilen ${usd(dim)} teminata göre`, cls(dp)) +
+      $("bybitKpis").innerHTML = tile("Bybit hesap değeri", usd(Y.equity||0), `hesabın tamamı (kripto dahil) · başlangıç ${usd(Y.start_eq||0)}`) +
+        tile("Bugün", `${usds(dp)} <span style="font-size:15px">(${pct(dp, dim)})</span>`, `sadece hisse · girilen ${usd(dim)} teminata göre`, cls(dp)) +
         tile("Açık K/Z", `${usds(up)} <span style="font-size:15px">(${pct(up, imNow)})</span>`, `${SP.length} pozisyon · teminat ${usd(imNow)}`, cls(up)) +
-        tile("Toplam K/Z", `${usds(ch)} <span style="font-size:15px">(${pct(ch, Y.max_im||0)})</span>`, `tüm günler · girilen ${usd(Y.max_im||0)} teminata göre`, cls(ch)) +
+        tile("Toplam K/Z", `${usds(ch)} <span style="font-size:15px">(${pct(ch, Y.max_im||0)})</span>`, `sadece hisse · tüm günler · girilen ${usd(Y.max_im||0)} teminata göre`, cls(ch)) +
         tile("Dolu yer", `${Y.used} / ${Y.slots}`, "hisse + kripto + elle");
       const kindTxt = k => k==="hisse" ? "📈 Hisse (bot)" : k==="kripto" ? "🪙 Kripto (bot)" : "🖐 Elle";
       const P = SP;

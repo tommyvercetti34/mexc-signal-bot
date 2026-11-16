@@ -181,6 +181,20 @@ class Bybit:
                                     "im": float(p.get("positionIM") or 0)}
         return out
 
+    def closed_pnl(self, start_ms):
+        """Kapanan pozisyonlarin net K/Z'si (komisyon dahil), start_ms'den bugune (Bybit en fazla 7 gun pencere)."""
+        out, cursor = [], ""
+        for _ in range(20):
+            p = {"category": "linear", "startTime": int(start_ms), "limit": 100}
+            if cursor:
+                p["cursor"] = cursor
+            res = self.req("GET", "/v5/position/closed-pnl", p)
+            out += res.get("list", [])
+            cursor = res.get("nextPageCursor") or ""
+            if not cursor:
+                break
+        return out
+
     def set_leverage(self, symbol, lev):
         try:
             self.req("POST", "/v5/position/set-leverage", {"category": "linear", "symbol": symbol,
@@ -801,34 +815,81 @@ def refresh_snapshot(api):
         rows.append({"sym": sym, "kind": kind, "side": p["side"], "size": p["size"], "avg": p["avg"],
                      "mark": p["mark"], "upnl": p["upnl"],
                      "exit": (S.get("mine", {}).get(sym) or {}).get("exit_lvl"), "im": p.get("im", 0)})
-    # gunluk K/Z: TR saatiyle gun basindaki hesap degerine gore; % = bugun kullanilan teminata (girilen miktar) gore
-    today = datetime.now(bist.TZ).date().isoformat()
-    im_now = sum(p.get("im", 0) for p in pos.values())
+    # ---- sadece HISSE K/Z (kripto ayni hesapta ama bu sekmede sayilmaz) ----
+    now_s = time.time()
+    stocks = _stock_set(api)
+    _sync_closed(api, stocks, now_s)
+    spos = {k: v for k, v in pos.items() if k in stocks}
+    unreal = sum(v["upnl"] for v in spos.values())
+    im_now = sum(v.get("im", 0) for v in spos.values())
+    recs = S.get("spnl", {})
+    real_total = sum(r[1] for r in recs.values())
+    tz_today = datetime.now(bist.TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today, day_ms = tz_today.date().isoformat(), tz_today.timestamp() * 1000
+    real_today = sum(r[1] for r in recs.values() if r[0] >= day_ms)
     de = S.get("day_eq") or {}
-    if de.get("d") != today:
-        de = {"d": today, "eq": eq, "im": 0.0}
+    if de.get("d") != today or "su" not in de:
+        de = {"d": today, "eq": eq, "im": 0.0, "su": unreal}   # su: gun basindaki acik hisse K/Z'si
         S["day_dirty"] = True
     de["im"] = max(de.get("im", 0.0), im_now)
     S["day_eq"] = de
-    hist = S.setdefault("eq_hist", [])                    # sermaye egrisi: 15 dk'da bir nokta (Gist'e saatte bir yazilir)
-    now_s = time.time()
+    day_pnl = real_today + unreal - de["su"]
+    stock_total = real_total + unreal
+    if im_now > S.get("max_ims", 0.0):                   # toplam K/Z % icin: bugune kadar girilen en yuksek hisse teminati
+        S["max_ims"] = im_now
+        S["day_dirty"] = True
+    st_eq = S.setdefault("start_eq", eq)
+    hist = S.setdefault("sk_hist", [])                    # hisse sermaye egrisi: baslangic + hisse K/Z, 15 dk'da bir
     if not hist or now_s - hist[-1][0] >= 900:
-        hist.append([int(now_s), round(eq, 2)])
+        hist.append([int(now_s), round(st_eq + stock_total, 2)])
         del hist[:-4000]
         if len(hist) % 4 == 1:
             S["day_dirty"] = True
-    if im_now > S.get("max_im", 0.0):                    # toplam K/Z % icin: bugune kadar girilen en yuksek teminat
-        S["max_im"] = im_now
-        S["day_dirty"] = True
     tf_ms = TF_MS.get(EXEC_TF, 86_400_000)
     nxt = (int(time.time() * 1000) // tf_ms + 1) * tf_ms + 60_000 if EXEC_DATA == "bybit" else None
     SNAP.update({"enabled": True, "error": None, "ts": time.time(), "mode": MODE_TXT, "equity": eq,
                  "slots": EXEC_SLOTS, "used": _used_slots(pos), "lev": EXEC_LEVERAGE, "spec": EXEC_SPEC,
                  "tf": EXEC_TF, "data": EXEC_DATA, "margin": eq / EXEC_SLOTS, "positions": rows,
                  "pend": S.get("pend") or {}, "log": [{**x, "m": str(x.get("m", "")).replace("Bybit demo hesap", "Bybit")} for x in S.get("log", [])[-80:]], "next_scan": nxt,
-                 "start_eq": S.setdefault("start_eq", eq), "day_start_eq": de["eq"], "day_pnl": eq - de["eq"],
-                 "day_im": de["im"], "im_now": im_now, "max_im": S.get("max_im", 0.0),
-                 "eq_hist": hist + [[int(now_s), round(eq, 2)]]})
+                 "start_eq": st_eq, "day_pnl": day_pnl, "stock_total": stock_total, "stock_real": real_total,
+                 "day_im": de["im"], "im_now": im_now, "max_im": S.get("max_ims", 0.0),
+                 "eq_hist": hist + [[int(now_s), round(st_eq + stock_total, 2)]]})
+
+
+_STK = {"t": 0.0, "set": set()}
+
+
+def _stock_set(api):
+    """Bybit hisse kontratlari (saatte bir yenilenir); bizim/elle acilmis hisse pozisyonlari da dahil."""
+    if time.time() - _STK["t"] > 3600 or not _STK["set"]:
+        try:
+            _STK["set"] = set(api.stock_instruments())
+            _STK["t"] = time.time()
+        except Exception:
+            pass
+    return _STK["set"] | set(S.get("mine", {}))
+
+
+def _sync_closed(api, stocks, now_s):
+    """Kapanan hisse islemlerinin net K/Z'si 5 dk'da bir Bybit'ten cekilir (orderId ile tekrar sayilmaz)."""
+    if now_s - S.get("spnl_t", 0) < 300:
+        return
+    start = max(S.get("spnl_from", 0), (now_s - 6.9 * 86400) * 1000)
+    try:
+        rows = api.closed_pnl(start)
+    except Exception:
+        return
+    recs = S.setdefault("spnl", {})
+    newest = start
+    for r in rows:
+        sym, oid = r.get("symbol"), r.get("orderId")
+        t = float(r.get("updatedTime") or r.get("createdTime") or 0)
+        newest = max(newest, t)
+        if sym in stocks and oid and oid not in recs:
+            recs[oid] = [t, float(r.get("closedPnl") or 0), sym]
+            S["day_dirty"] = True
+    S["spnl_t"] = now_s
+    S["spnl_from"] = newest - 60_000
 
 
 def api_data():
